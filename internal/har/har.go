@@ -21,12 +21,46 @@
 //     were truncated during capture are exported as captured, with a
 //     "_mirageTruncated": true field on the content/postData object.
 //   - Endpoint is left empty by ToExchange; callers fill it with pathnorm.
+//
+// # Behaviour details
+//
+// Decisions this implementation made where the contract is silent:
+//
+//   - Decoding is tolerant of real-world files: a UTF-8 byte order mark,
+//     absent optional fields, -1 and fractional sizes and timings, numbers
+//     given as strings, null objects, and startedDateTime in any common
+//     ISO 8601 / RFC 3339 spelling (offset with or without a colon, any
+//     fraction length, a space instead of "T", no zone at all meaning UTC).
+//     Unknown fields, including Chrome's underscore fields, are ignored.
+//   - Bodies in HAR files are stored decoded. When a HAR response carries a
+//     Content-Encoding header, ToExchange moves it into
+//     Response.ContentEncoding and removes the header, which is the shape
+//     the proxy produces. A base64 body that is still gzip-compressed is
+//     decompressed. FromExchange puts the header back so the HAR reads like
+//     the original traffic.
+//   - Request.Host is the Host header (or the HTTP/2 :authority pseudo
+//     header) when present, otherwise the URL host. The Host header itself is
+//     not kept in Request.Header, as in net/http.
+//   - Header names are canonicalised (http.CanonicalHeaderKey); FromExchange
+//     writes headers sorted by name so output is deterministic.
+//   - Entries that are not HTTP(S) exchanges (data:, blob:, ws:,
+//     chrome-extension: URLs) cannot be converted: ToExchange returns an
+//     error wrapping ErrUnsupported, which importers should skip. See
+//     ToExchanges.
+//   - A params-only request body is re-encoded as
+//     application/x-www-form-urlencoded, or as multipart/form-data when the
+//     postData mimeType (or Content-Type header) names a boundary.
+//   - Exchange.Error round-trips through the response "_error" field that
+//     Chrome uses for failed requests.
 package har
 
 import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
-
-	"github.com/justinburger/mirage/internal/model"
 )
 
 // HAR is a decoded HAR document.
@@ -36,42 +70,192 @@ type HAR struct {
 
 // Log is the HAR log object.
 type Log struct {
-	Version string  `json:"version"`
-	Creator Creator `json:"creator"`
-	Entries []Entry `json:"entries"`
+	Version string   `json:"version"`
+	Creator Creator  `json:"creator"`
+	Browser *Creator `json:"browser,omitempty"`
+	Pages   []Page   `json:"pages,omitempty"`
+	Entries []Entry  `json:"entries"`
+	Comment string   `json:"comment,omitempty"`
 }
 
-// Creator identifies the producing application.
+// Creator identifies the producing application (also used for "browser").
 type Creator struct {
 	Name    string `json:"name"`
 	Version string `json:"version"`
+	Comment string `json:"comment,omitempty"`
 }
 
-// Entry is one HAR entry. The full HAR 1.2 shape (request, response, timings,
-// cache, serverIPAddress…) is defined by the implementation.
-type Entry struct {
-	// fields defined by the implementation
+// Decode reads a HAR document. The whole document is held in memory; use
+// DecodeEntries to process a large file one entry at a time.
+func Decode(r io.Reader) (*HAR, error) {
+	var entries []Entry
+	lg, err := DecodeEntries(r, func(_ int, e *Entry) error {
+		entries = append(entries, *e)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	lg.Entries = entries
+	return &HAR{Log: *lg}, nil
 }
 
-// Decode reads a HAR document.
-func Decode(r io.Reader) (*HAR, error) { panic("har: not implemented") }
-
-// ToExchange converts a HAR entry to an exchange.
-func ToExchange(e *Entry) (*model.Exchange, error) { panic("har: not implemented") }
-
-// FromExchange converts an exchange to a HAR entry.
-func FromExchange(ex *model.Exchange) Entry { panic("har: not implemented") }
-
-// Encoder streams a HAR document.
-type Encoder struct{}
-
-// NewEncoder starts a HAR document on w with the given creator version.
-func NewEncoder(w io.Writer, creatorVersion string) (*Encoder, error) {
-	panic("har: not implemented")
+// DecodeEntries reads a HAR document and calls fn for every entry in order,
+// without holding more than one entry in memory. It returns the log object
+// with Entries left empty. If fn returns an error, reading stops and that
+// error is returned (wrapped with the entry index). The *Entry passed to fn
+// is only valid during the call.
+func DecodeEntries(r io.Reader, fn func(index int, e *Entry) error) (*Log, error) {
+	br := bufio.NewReader(r)
+	if b, err := br.Peek(3); err == nil && bytes.Equal(b, []byte{0xEF, 0xBB, 0xBF}) {
+		_, _ = br.Discard(3)
+	}
+	d := &docDecoder{dec: json.NewDecoder(br), fn: fn}
+	lg, err := d.document()
+	if err != nil {
+		return nil, fmt.Errorf("har: %w", err)
+	}
+	return lg, nil
 }
 
-// Write appends one exchange as an entry.
-func (e *Encoder) Write(ex *model.Exchange) error { panic("har: not implemented") }
+// docDecoder walks the HAR document with json.Decoder tokens so that the
+// (possibly huge) entries array is never materialised.
+type docDecoder struct {
+	dec *json.Decoder
+	fn  func(int, *Entry) error
+}
 
-// Close finishes the document. It does not close the underlying writer.
-func (e *Encoder) Close() error { panic("har: not implemented") }
+// ErrNotHAR is returned (wrapped) when the input is valid JSON but has no
+// "log" object.
+var ErrNotHAR = errors.New("not a HAR document: no \"log\" object")
+
+func (d *docDecoder) document() (*Log, error) {
+	if err := d.expect('{'); err != nil {
+		return nil, err
+	}
+	var lg *Log
+	for d.dec.More() {
+		key, err := d.key()
+		if err != nil {
+			return nil, err
+		}
+		if key != "log" {
+			if err := d.skip(); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		l, err := d.log()
+		if err != nil {
+			return nil, err
+		}
+		if l != nil {
+			lg = l
+		}
+	}
+	if err := d.expect('}'); err != nil {
+		return nil, err
+	}
+	if lg == nil {
+		return nil, ErrNotHAR
+	}
+	return lg, nil
+}
+
+// log decodes the log object; it returns nil for JSON null.
+func (d *docDecoder) log() (*Log, error) {
+	tok, err := d.dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if tok == nil {
+		return nil, nil
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return nil, fmt.Errorf("\"log\" must be an object, got %v", tok)
+	}
+	lg := &Log{}
+	for d.dec.More() {
+		key, err := d.key()
+		if err != nil {
+			return nil, err
+		}
+		switch key {
+		case "version":
+			err = d.dec.Decode(&lg.Version)
+		case "creator":
+			err = d.dec.Decode(&lg.Creator)
+		case "browser":
+			err = d.dec.Decode(&lg.Browser)
+		case "pages":
+			err = d.dec.Decode(&lg.Pages)
+		case "comment":
+			err = d.dec.Decode(&lg.Comment)
+		case "entries":
+			err = d.entries()
+		default:
+			err = d.skip()
+		}
+		if err != nil {
+			return nil, fmt.Errorf("log.%s: %w", key, err)
+		}
+	}
+	if err := d.expect('}'); err != nil {
+		return nil, err
+	}
+	return lg, nil
+}
+
+func (d *docDecoder) entries() error {
+	tok, err := d.dec.Token()
+	if err != nil {
+		return err
+	}
+	if tok == nil {
+		return nil // "entries": null
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '[' {
+		return fmt.Errorf("expected an array, got %v", tok)
+	}
+	for i := 0; d.dec.More(); i++ {
+		var e Entry
+		if err := d.dec.Decode(&e); err != nil {
+			return fmt.Errorf("entry %d: %w", i, err)
+		}
+		if err := d.fn(i, &e); err != nil {
+			return fmt.Errorf("entry %d: %w", i, err)
+		}
+	}
+	return d.expect(']')
+}
+
+func (d *docDecoder) expect(want json.Delim) error {
+	tok, err := d.dec.Token()
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
+		return err
+	}
+	if got, ok := tok.(json.Delim); !ok || got != want {
+		return fmt.Errorf("expected %q, got %v", want, tok)
+	}
+	return nil
+}
+
+func (d *docDecoder) key() (string, error) {
+	tok, err := d.dec.Token()
+	if err != nil {
+		return "", err
+	}
+	s, ok := tok.(string)
+	if !ok {
+		return "", fmt.Errorf("expected an object key, got %v", tok)
+	}
+	return s, nil
+}
+
+func (d *docDecoder) skip() error {
+	var raw json.RawMessage
+	return d.dec.Decode(&raw)
+}

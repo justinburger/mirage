@@ -33,6 +33,42 @@
 //   - ListReplayJobs omits Series (it can be large); GetReplayJob includes it.
 //   - Schema changes go through a simple versioned migration table so later
 //     releases can migrate existing databases.
+//
+// # Implementation notes
+//
+// Connections. A file database is opened through two database/sql pools on
+// the same file: a writer pool limited to one connection (SQLite has a single
+// writer, so writers queue in Go instead of spinning on SQLITE_BUSY and every
+// write transaction starts with BEGIN IMMEDIATE) and a reader pool of several
+// query_only connections. In WAL mode readers never block the writer and the
+// writer never blocks readers, so a long IterateExchanges does not stall
+// capture. The special path ":memory:" gives every Open its own private
+// shared-cache in-memory database, served through one active connection (a
+// second, pinned connection only keeps the database alive), so operations are
+// serialised and always see committed data.
+//
+// Configuration objects (services, profiles, fault rules, replay jobs) keep
+// their complete JSON encoding in a data column, next to a few denormalised
+// scalar columns that carry uniqueness, ordering and lookups. The JSON is the
+// source of truth, so a field added to the model is persisted without a schema
+// change. Recordings and exchanges use real columns because SQL arithmetic and
+// filters run on them.
+//
+// Exchanges. Every field ListExchanges filters or displays is a scalar column
+// (indexed on recording_id with seq, endpoint, status and, partially, errors);
+// headers are JSON text and bodies are BLOB columns stored last in the row and
+// never selected by list queries. A body larger than 1 KiB is gzipped when
+// that saves space (flagged per row) and is transparently inflated on read.
+// Exchange IDs come from an AUTOINCREMENT key, so they are unique across
+// recordings and never reused.
+//
+// Timestamps are stored as Unix nanoseconds (the zero time.Time is stored as
+// 0), which limits the representable range to the years 1678-2262, and are
+// returned in UTC.
+//
+// Ordering of lists: services by name, profiles with "default" first and then
+// by name, fault rules by Order then Name, recordings and replay jobs newest
+// first.
 package store
 
 import (
@@ -90,100 +126,4 @@ type Store interface {
 	Close() error
 }
 
-// SQLite is the SQLite implementation of Store.
-type SQLite struct {
-	// implementation fields
-}
-
 var _ Store = (*SQLite)(nil)
-
-// Open opens (creating if needed) the database at path. The special path
-// ":memory:" opens a private in-memory database, used by tests across the
-// codebase.
-func Open(path string) (*SQLite, error) { panic("store: not implemented") }
-
-func (s *SQLite) ListServices(ctx context.Context) ([]model.Service, error) {
-	panic("store: not implemented")
-}
-func (s *SQLite) GetService(ctx context.Context, id string) (model.Service, error) {
-	panic("store: not implemented")
-}
-func (s *SQLite) PutService(ctx context.Context, svc model.Service) (model.Service, error) {
-	panic("store: not implemented")
-}
-func (s *SQLite) DeleteService(ctx context.Context, id string) error {
-	panic("store: not implemented")
-}
-func (s *SQLite) CreateRecording(ctx context.Context, r model.Recording) (model.Recording, error) {
-	panic("store: not implemented")
-}
-func (s *SQLite) ListRecordings(ctx context.Context) ([]model.Recording, error) {
-	panic("store: not implemented")
-}
-func (s *SQLite) GetRecording(ctx context.Context, id string) (model.Recording, error) {
-	panic("store: not implemented")
-}
-func (s *SQLite) UpdateRecording(ctx context.Context, r model.Recording) (model.Recording, error) {
-	panic("store: not implemented")
-}
-func (s *SQLite) DeleteRecording(ctx context.Context, id string) error {
-	panic("store: not implemented")
-}
-func (s *SQLite) AppendExchanges(ctx context.Context, recordingID string, exs []*model.Exchange) error {
-	panic("store: not implemented")
-}
-func (s *SQLite) ListExchanges(ctx context.Context, recordingID string, q model.ExchangeQuery) ([]model.ExchangeSummary, int64, error) {
-	panic("store: not implemented")
-}
-func (s *SQLite) GetExchange(ctx context.Context, id int64) (*model.Exchange, error) {
-	panic("store: not implemented")
-}
-func (s *SQLite) IterateExchanges(ctx context.Context, recordingID string, opts model.IterOptions, fn func(*model.Exchange) error) error {
-	panic("store: not implemented")
-}
-func (s *SQLite) EndpointStats(ctx context.Context, recordingID string) ([]model.EndpointStat, error) {
-	panic("store: not implemented")
-}
-func (s *SQLite) ListProfiles(ctx context.Context) ([]model.AnonymizationProfile, error) {
-	panic("store: not implemented")
-}
-func (s *SQLite) GetProfile(ctx context.Context, id string) (model.AnonymizationProfile, error) {
-	panic("store: not implemented")
-}
-func (s *SQLite) PutProfile(ctx context.Context, p model.AnonymizationProfile) (model.AnonymizationProfile, error) {
-	panic("store: not implemented")
-}
-func (s *SQLite) DeleteProfile(ctx context.Context, id string) error {
-	panic("store: not implemented")
-}
-func (s *SQLite) ListFaultRules(ctx context.Context) ([]model.FaultRule, error) {
-	panic("store: not implemented")
-}
-func (s *SQLite) GetFaultRule(ctx context.Context, id string) (model.FaultRule, error) {
-	panic("store: not implemented")
-}
-func (s *SQLite) PutFaultRule(ctx context.Context, r model.FaultRule) (model.FaultRule, error) {
-	panic("store: not implemented")
-}
-func (s *SQLite) DeleteFaultRule(ctx context.Context, id string) error {
-	panic("store: not implemented")
-}
-func (s *SQLite) ListReplayJobs(ctx context.Context) ([]model.ReplayJob, error) {
-	panic("store: not implemented")
-}
-func (s *SQLite) GetReplayJob(ctx context.Context, id string) (model.ReplayJob, error) {
-	panic("store: not implemented")
-}
-func (s *SQLite) PutReplayJob(ctx context.Context, j model.ReplayJob) (model.ReplayJob, error) {
-	panic("store: not implemented")
-}
-func (s *SQLite) DeleteReplayJob(ctx context.Context, id string) error {
-	panic("store: not implemented")
-}
-func (s *SQLite) GetSetting(ctx context.Context, key string) (string, error) {
-	panic("store: not implemented")
-}
-func (s *SQLite) PutSetting(ctx context.Context, key, value string) error {
-	panic("store: not implemented")
-}
-func (s *SQLite) Close() error { panic("store: not implemented") }
