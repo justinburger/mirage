@@ -1,0 +1,12 @@
+/bin/
+/dist/
+/mirage
+*.db
+*.db-shm
+*.db-wal
+*.test
+*.out
+*.prof
+coverage.*
+.DS_Store
+/tmp/
