@@ -135,6 +135,12 @@ type AnonymizationProfile struct {
 	RedactHeaders []string `json:"redact_headers"`
 	// Rules run before detectors, in order.
 	Rules []AnonymizationRule `json:"rules"`
+	// OpaqueBodies controls bodies the engine cannot inspect (binary content
+	// types, bodies still carrying a Content-Encoding, binary multipart
+	// parts): "keep" (default) stores them unchanged; "fill" replaces them
+	// with deterministic filler of identical length, so sizes stay realistic
+	// for load tests but no original bytes are kept.
+	OpaqueBodies string `json:"opaque_bodies"`
 	// Secret keys the HMAC behind hash/fake. The API never returns it; an
 	// empty secret on update keeps the stored one.
 	Secret    string    `json:"secret,omitempty"`
@@ -153,7 +159,7 @@ func DefaultAnonymizationProfile() AnonymizationProfile {
 	return AnonymizationProfile{
 		ID:          DefaultProfileID,
 		Name:        "Default",
-		Description: "Hashes credentials and session cookies and replaces common PII (emails, cards, SSNs, phone numbers, IPs, JWTs, AWS keys, IBANs) with consistent fake values.",
+		Description: "Hashes auth headers, session cookies and common credential fields (passwords, tokens, API keys), fakes person names, and replaces detected PII (emails, cards, SSNs, phone numbers, IPs, JWTs, AWS keys, IBANs) with consistent fake values.",
 		Detectors: []Detector{
 			DetectEmail, DetectCreditCard, DetectSSN, DetectPhone,
 			DetectIPv4, DetectIPv6, DetectJWT, DetectAWSKey, DetectIBAN,
@@ -164,8 +170,56 @@ func DefaultAnonymizationProfile() AnonymizationProfile {
 			"X-Api-Key", "X-Auth-Token", "X-Access-Token", "X-Csrf-Token",
 			"X-Forwarded-For", "X-Real-Ip", "Forwarded",
 		},
-		Rules: []AnonymizationRule{},
+		Rules:        defaultRules(),
+		OpaqueBodies: OpaqueKeep,
 	}
+}
+
+// Values of AnonymizationProfile.OpaqueBodies.
+const (
+	OpaqueKeep = "keep"
+	OpaqueFill = "fill"
+)
+
+// defaultRules are the credential and name rules of the built-in profile.
+// IDs are stable so later releases can recognise them.
+func defaultRules() []AnonymizationRule {
+	var rules []AnonymizationRule
+	add := func(id, name string, t RuleTarget, sel string, st Strategy, fake FakeKind) {
+		rules = append(rules, AnonymizationRule{
+			ID: "def-" + id, Name: name, Enabled: true, Target: t,
+			Selector: sel, Scope: ScopeBoth, Strategy: st, Fake: fake,
+		})
+	}
+	for _, k := range []string{"password", "passwd", "pass", "secret", "client_secret", "clientSecret", "pin", "cvv", "cvc"} {
+		add("json-"+k, "JSON "+k, TargetJSON, "$.."+k, StrategyRedact, "")
+	}
+	for _, k := range []string{"access_token", "accessToken", "refresh_token", "refreshToken", "id_token", "idToken", "api_key", "apiKey", "token", "session_id", "sessionId"} {
+		add("json-"+k, "JSON "+k, TargetJSON, "$.."+k, StrategyHash, "")
+	}
+	for _, k := range []string{"first_name", "firstName", "last_name", "lastName", "full_name", "fullName", "given_name", "family_name"} {
+		add("json-"+k, "JSON "+k, TargetJSON, "$.."+k, StrategyFake, FakeName)
+	}
+	for _, k := range []string{"password", "passwd", "client_secret", "secret", "pin"} {
+		add("form-"+k, "Form "+k, TargetForm, k, StrategyRedact, "")
+	}
+	for _, k := range []string{"access_token", "refresh_token", "api_key", "token"} {
+		add("form-"+k, "Form "+k, TargetForm, k, StrategyHash, "")
+	}
+	for _, k := range []string{"access_token", "api_key", "apikey", "key", "token", "signature", "sig", "password", "secret", "session", "sessionid"} {
+		add("query-"+k, "Query "+k, TargetQuery, k, StrategyHash, "")
+	}
+	return rules
+}
+
+// Redacted returns a copy safe to send to clients: Secret cleared and
+// HasSecret set when there was one.
+func (p AnonymizationProfile) Redacted() AnonymizationProfile {
+	if p.Secret != "" {
+		p.HasSecret = true
+	}
+	p.Secret = ""
+	return p
 }
 
 // WithDefaults returns a copy with zero-valued fields defaulted.
@@ -181,6 +235,9 @@ func (p AnonymizationProfile) WithDefaults() AnonymizationProfile {
 	}
 	if p.Rules == nil {
 		p.Rules = []AnonymizationRule{}
+	}
+	if p.OpaqueBodies == "" {
+		p.OpaqueBodies = OpaqueKeep
 	}
 	for i := range p.Rules {
 		r := &p.Rules[i]
@@ -203,6 +260,9 @@ func (p AnonymizationProfile) Validate() error {
 	var pr problems
 	if strings.TrimSpace(p.Name) == "" {
 		pr.add("name is required")
+	}
+	if p.OpaqueBodies != OpaqueKeep && p.OpaqueBodies != OpaqueFill {
+		pr.add("opaque_bodies %q must be keep or fill", p.OpaqueBodies)
 	}
 	if !validStrategy(p.DetectorStrategy) {
 		pr.add("detector_strategy %q is not a strategy", p.DetectorStrategy)

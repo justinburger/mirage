@@ -74,6 +74,30 @@ Rules:
   network beyond `httptest` and `127.0.0.1:0` listeners. Benchmarks for hot
   paths (`BenchmarkXxx`, `b.ReportAllocs()`).
 - `gofmt` and `go vet` clean.
+- Defaults and validation happen at the edges: the API, `config.Apply` and
+  `replay.Manager.Create` call `WithDefaults` then `Validate` before every
+  store write; the store does neither. Every consumer (`proxy.Apply`,
+  `virtual.OptionsFromService`, `fault.SetRules`, `anonymize.New`,
+  `replay.Run`) calls `WithDefaults` again; all `WithDefaults` are
+  idempotent.
+- A `ctx` passed to a manager method bounds that call only. Long-lived work
+  (listeners, capture workers, replay jobs, the SSE broadcaster) runs on the
+  owning component's root context, cancelled by its `Shutdown`.
+- Exchanges are owned by one goroutine at a time. The store returns fresh
+  objects and retains nothing after `AppendExchanges`; the virtual index
+  treats indexed exchanges as immutable.
+
+## Wiring (`internal/app`)
+
+Start: open store → `config.Apply` → `ops.LoadFaults` → metrics registry
+`Run` → `replay.Manager.Recover` → `proxy.Manager.Apply` for every enabled
+service → `api.Server.Run` + admin HTTP server.
+
+Shutdown (reverse): admin HTTP server → `replay.Manager.Shutdown` →
+`proxy.Manager.Shutdown` (drains captures) → stop the registry → `store.Close`.
+
+The `proxy.VirtualizerFactory` adapter returns an untyped nil interface on
+error (typed-nil trap).
 
 ## Performance principles
 

@@ -14,7 +14,7 @@ type Request struct {
 	Method   string      `json:"method"`
 	Scheme   string      `json:"scheme,omitempty"` // scheme the client used to reach Mirage
 	Host     string      `json:"host,omitempty"`   // Host header as received
-	Path     string      `json:"path"`             // escaped path, e.g. "/users/42"
+	Path     string      `json:"path"`             // always the escaped path (r.URL.EscapedPath()), e.g. "/users/42"
 	RawQuery string      `json:"raw_query,omitempty"`
 	Proto    string      `json:"proto,omitempty"`
 	Header   http.Header `json:"header,omitempty"`
@@ -24,8 +24,10 @@ type Request struct {
 	// even if Body was truncated.
 	BodySize      int64 `json:"body_size"`
 	BodyTruncated bool  `json:"body_truncated,omitempty"`
-	// ContentEncoding is the original Content-Encoding when the captured body
-	// was decoded. Header no longer carries Content-Encoding in that case.
+	// ContentEncoding is informational: non-empty means Body was already
+	// decoded from this encoding and Header no longer carries
+	// Content-Encoding. A body is still encoded only if Header still has a
+	// Content-Encoding other than identity.
 	ContentEncoding string `json:"content_encoding,omitempty"`
 }
 
@@ -52,21 +54,27 @@ type Response struct {
 type Exchange struct {
 	ID          int64  `json:"id"` // assigned by the store, unique across recordings
 	RecordingID string `json:"recording_id"`
-	Seq         int64  `json:"seq"` // 1-based order within the recording, assigned by the store
-	ServiceID   string `json:"service_id,omitempty"`
+	// Seq is the 1-based order in which the store persisted the exchange
+	// (roughly completion order). It is NOT chronological: use StartedAt for
+	// time order.
+	Seq       int64  `json:"seq"`
+	ServiceID string `json:"service_id,omitempty"`
 	// StartedAt is when the request arrived at Mirage. Replay uses the gaps
 	// between StartedAt values to reproduce the original traffic shape.
 	StartedAt time.Time `json:"started_at"`
-	// Duration is from request arrival until the upstream response body was
-	// fully read. TTFB is until response headers arrived.
+	// TTFB and Duration are measured from the moment the request is handed
+	// to the upstream transport (after any injected fault delay) until the
+	// response headers arrived / the last upstream body byte was read.
 	Duration Duration `json:"duration"`
 	TTFB     Duration `json:"ttfb"`
-	// Endpoint is the normalised endpoint, e.g. "GET /users/{id}".
+	// Endpoint is the normalised endpoint, e.g. "GET /users/{id}". It is
+	// always computed from the raw path before anonymization and is never
+	// recomputed from an anonymized path.
 	Endpoint string   `json:"endpoint"`
 	Request  Request  `json:"request"`
 	Response Response `json:"response"`
-	// Error is set when the upstream could not be reached or the round trip
-	// failed. Response.Status is then the status Mirage returned (502/504).
+	// Error is set only for upstream failures (no usable upstream response);
+	// Response.Status is then the status Mirage synthesised (502/504).
 	Error      string `json:"error,omitempty"`
 	Anonymized bool   `json:"anonymized"`
 }

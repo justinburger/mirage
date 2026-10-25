@@ -37,6 +37,10 @@ type SeriesPoint struct {
 	InFlight int64   `json:"in_flight"` // at the end of the second
 	BytesIn  int64   `json:"bytes_in"`
 	BytesOut int64   `json:"bytes_out"`
+	// CorrectedP95/P99 (replay only) are measured from each request's
+	// intended send time; omitted when not measured.
+	CorrectedP95 float64 `json:"corrected_p95,omitempty"`
+	CorrectedP99 float64 `json:"corrected_p99,omitempty"`
 }
 
 // CollectorKind distinguishes metric collectors.
@@ -68,6 +72,9 @@ type StatsSnapshot struct {
 	// Latency is cumulative since Since; Recent covers the last 10 seconds.
 	Latency LatencySummary `json:"latency"`
 	Recent  LatencySummary `json:"recent"`
+	// CorrectedLatency (replay only) is cumulative latency from intended send
+	// time (see ReplaySummary.CorrectedLatency); nil when not measured.
+	CorrectedLatency *LatencySummary `json:"corrected_latency,omitempty"`
 	// Endpoints are the busiest endpoints (cumulative), most requests first.
 	Endpoints []EndpointSummary `json:"endpoints,omitempty"`
 }

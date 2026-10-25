@@ -23,10 +23,12 @@ const (
 )
 
 // ReplayStage ramps the arrival rate linearly from the previous stage's
-// rate (or 0) to Rate over Duration.
+// rate (or 0) to Rate over Duration, or with Hold steps to Rate at once and
+// holds it for Duration.
 type ReplayStage struct {
 	Duration Duration `json:"duration"`
 	Rate     float64  `json:"rate"`
+	Hold     bool     `json:"hold,omitempty"`
 }
 
 // ReplayConfig configures a replay (load test) job.
@@ -40,27 +42,39 @@ type ReplayConfig struct {
 
 	// Speed compresses time in timeline mode (default 1).
 	Speed float64 `json:"speed,omitempty"`
+	// MaxGap (timeline) shortens idle gaps in the recording longer than
+	// MaxGap to MaxGap before Speed is applied, so overnight lulls in a
+	// capture do not stall a replay. 0 = keep gaps.
+	MaxGap Duration `json:"max_gap,omitempty"`
 	// Rate is the constant arrival rate in rate mode when Stages is empty.
 	Rate   float64       `json:"rate,omitempty"`
 	Stages []ReplayStage `json:"stages,omitempty"`
 
-	// Amplify sends each scheduled request this many times (default 1), so
-	// Amplify 10 is ten times the recorded traffic. Copies are spread evenly
-	// across the gap to the next request instead of firing in a burst.
+	// Amplify (timeline mode only) sends each scheduled request this many
+	// times (default 1), so Amplify 10 is ten times the recorded traffic.
+	// Copies are spread evenly across the gap to the next request instead of
+	// firing in a burst. In rate mode the rate already is the total send
+	// rate, so Validate rejects Amplify > 1 there and in max mode.
 	Amplify int `json:"amplify,omitempty"`
 	// ErrorAmplification oversamples requests whose recorded response was an
-	// error (see IsErrorStatus): 10 sends each of them ~10 times as often,
-	// raising the share of error-inducing traffic. Default 1.
+	// error (see IsErrorStatus): each is scheduled floor(k) times plus once
+	// more with probability frac(k), so 10 makes them ~10x as frequent and
+	// 0.5 halves them. In timeline mode the extra copies add load; in rate
+	// and max modes the sequence is consumed at the same rate/concurrency,
+	// so only the share of error-inducing traffic changes. Default 1.
 	ErrorAmplification float64 `json:"error_amplification,omitempty"`
 
-	// Concurrency caps in-flight requests (default 256). In max mode it is
-	// the number of workers.
+	// Concurrency caps in-flight requests (default 2048 for timeline and
+	// rate, so the open model is not silently throttled; 64 for max). In max
+	// mode it is the number of workers.
 	Concurrency int `json:"concurrency,omitempty"`
 	// Duration stops the job after this long. 0 = one pass through the
 	// recording (timeline, max). Required for rate mode unless Loop is false
 	// and MaxRequests is set.
 	Duration Duration `json:"duration,omitempty"`
-	// Loop repeats the recording until Duration or MaxRequests is reached.
+	// Loop (timeline and max) repeats the recording until Duration or
+	// MaxRequests is reached. Rate mode always cycles the recording until its
+	// stages, Duration or MaxRequests end.
 	Loop bool `json:"loop,omitempty"`
 	// MaxRequests stops after this many requests (0 = no cap).
 	MaxRequests int64 `json:"max_requests,omitempty"`
@@ -81,7 +95,9 @@ type ReplayConfig struct {
 
 	// ProfileID anonymizes every request on the fly with this profile before
 	// sending ("" = send as stored, which is already anonymized if the
-	// recording was captured with anonymization on).
+	// recording was captured with anonymization on). Leave it empty when the
+	// target is a Mirage virtual service built from the same anonymized
+	// recording, or requests will no longer match.
 	ProfileID string `json:"profile_id,omitempty"`
 	// VaryClones (with Amplify > 1 and a ProfileID) re-keys anonymization per
 	// copy so each copy carries different but consistent identities, instead
@@ -89,13 +105,21 @@ type ReplayConfig struct {
 	VaryClones bool `json:"vary_clones,omitempty"`
 	// CompareStatus counts responses whose status differs from the recording.
 	CompareStatus bool `json:"compare_status,omitempty"`
+	// Seed makes the run reproducible (error amplification sampling, any
+	// randomness). 0 = Create picks a random seed and stores it, so a
+	// re-run or clone reproduces the same schedule.
+	Seed uint64 `json:"seed,omitempty"`
 }
 
 // Defaults for zero-valued replay fields.
 const (
-	DefaultReplayConcurrency = 256
-	DefaultReplayTimeout     = 30 * time.Second
-	MaxReplayConcurrency     = 100000
+	DefaultReplayConcurrency    = 2048 // timeline and rate
+	DefaultReplayMaxConcurrency = 64   // max mode workers
+	DefaultReplayTimeout        = 30 * time.Second
+	MaxReplayConcurrency        = 100000
+	// MaxReplaySeries is the most per-second points a job keeps; longer runs
+	// merge adjacent points (halving resolution) to stay under it.
+	MaxReplaySeries = 7200
 )
 
 // WithDefaults returns a copy with zero-valued fields defaulted.
@@ -114,6 +138,9 @@ func (c ReplayConfig) WithDefaults() ReplayConfig {
 	}
 	if c.Concurrency == 0 {
 		c.Concurrency = DefaultReplayConcurrency
+		if c.Mode == ReplayMax {
+			c.Concurrency = DefaultReplayMaxConcurrency
+		}
 	}
 	if c.Timeout == 0 {
 		c.Timeout = Duration(DefaultReplayTimeout)
@@ -154,6 +181,12 @@ func (c ReplayConfig) Validate() error {
 	}
 	if c.Amplify < 1 || c.Amplify > 1000 {
 		p.add("amplify must be between 1 and 1000")
+	}
+	if c.Amplify > 1 && c.Mode != ReplayTimeline {
+		p.add("amplify applies to timeline mode only (in rate mode raise the rate instead)")
+	}
+	if c.MaxGap < 0 {
+		p.add("max_gap must not be negative")
 	}
 	if c.ErrorAmplification <= 0 || c.ErrorAmplification > 1000 {
 		p.add("error_amplification must be > 0 and <= 1000")
@@ -217,8 +250,11 @@ type ReplayJob struct {
 
 // ReplaySummary is the result of a replay run.
 type ReplaySummary struct {
-	// Planned is the number of requests the schedule will send (-1 when
-	// unbounded, e.g. loop until duration).
+	// Planned is the number of requests the schedule will send: exact for a
+	// single timeline/max pass (sum over items of copies × Amplify, with
+	// error items counted k times) and capped by MaxRequests; for rate mode
+	// the integral of the rate over the run; for duration-bounded loops an
+	// estimate from the pass rate; -1 when unknown.
 	Planned   int64 `json:"planned"`
 	Sent      int64 `json:"sent"`
 	Completed int64 `json:"completed"` // got a response (any status)
@@ -244,6 +280,11 @@ type ReplaySummary struct {
 	Elapsed          Duration       `json:"elapsed"`
 	// MaxLag is the worst observed delay between a request's intended and
 	// actual send time (scheduler or concurrency saturation).
-	MaxLag    Duration          `json:"max_lag"`
-	Endpoints []EndpointSummary `json:"endpoints"`
+	MaxLag Duration `json:"max_lag"`
+	// MaxInFlight is the peak number of concurrent requests. Saturated is
+	// true when every Concurrency slot was busy at least once, so lag and
+	// corrected latency include client-side queueing: raise Concurrency.
+	MaxInFlight int64             `json:"max_in_flight"`
+	Saturated   bool              `json:"saturated"`
+	Endpoints   []EndpointSummary `json:"endpoints"`
 }

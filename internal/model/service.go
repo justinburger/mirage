@@ -22,7 +22,10 @@ const (
 	// never contacts the upstream. Unmatched requests get Match.MissStatus.
 	ModeVirtualize Mode = "virtualize"
 	// ModeHybrid answers from the recording when it can and proxies misses to
-	// the upstream, recording them (and adding them to the live index).
+	// the upstream, recording them. Successful GET/HEAD/OPTIONS misses are
+	// also added to the live index, exactly as stored: with anonymize_capture
+	// on they then match only requests carrying the same anonymized values
+	// (for example replayed traffic) or via path_templates.
 	ModeHybrid Mode = "hybrid"
 )
 
@@ -144,12 +147,21 @@ type Service struct {
 	PreserveHost       bool       `json:"preserve_host"`
 	InsecureSkipVerify bool       `json:"insecure_skip_verify"`
 	TLS                *TLSConfig `json:"tls,omitempty"`
-	// Timeout bounds a whole upstream round trip. 0 = 60s.
+	// Timeout bounds the wait for the upstream's response headers
+	// (ResponseHeaderTimeout); bodies then stream until EOF or client
+	// disconnect. 0 = 60s.
 	Timeout Duration `json:"timeout"`
 	// MaxBodyBytes caps how much of each request/response body is captured.
 	// 0 = 1 MiB; -1 = do not capture bodies. Traffic is never truncated, only
 	// the captured copy.
 	MaxBodyBytes int64 `json:"max_body_bytes"`
+	// CaptureSample is the fraction (0..1] of requests captured in
+	// record/hybrid mode; 0 means 1 (everything). Decided before any
+	// buffering, so unsampled requests cost nothing extra.
+	CaptureSample float64 `json:"capture_sample,omitempty"`
+	// MaxCaptureBytes stops capturing (status error "capture limit
+	// reached") once the recording holds this many body bytes. 0 = no limit.
+	MaxCaptureBytes int64 `json:"max_capture_bytes,omitempty"`
 
 	Match   MatchConfig   `json:"match"`
 	Latency LatencyConfig `json:"latency"`
@@ -240,6 +252,15 @@ func (s Service) Validate() error {
 	if s.MaxBodyBytes < -1 {
 		p.add("max_body_bytes must be -1, 0 or positive")
 	}
+	if s.Mode == ModeHybrid && s.MaxBodyBytes == -1 {
+		p.add("hybrid mode needs captured bodies (max_body_bytes must not be -1)")
+	}
+	if s.CaptureSample < 0 || s.CaptureSample > 1 {
+		p.add("capture_sample must be between 0 and 1")
+	}
+	if s.MaxCaptureBytes < 0 {
+		p.add("max_capture_bytes must not be negative")
+	}
 	if s.Timeout < 0 {
 		p.add("timeout must not be negative")
 	}
@@ -294,12 +315,27 @@ type ServiceStatus struct {
 	// Captured counts exchanges written to the recording since start.
 	Captured int64 `json:"captured"`
 	// CaptureDropped counts exchanges dropped because the capture queue was
-	// full (the request itself was still served).
+	// full (by count or bytes); the request itself was still served.
 	CaptureDropped int64 `json:"capture_dropped"`
+	// CaptureSkipped counts exchanges not captured because the client went
+	// away before the upstream response finished, or sampling skipped them.
+	CaptureSkipped int64 `json:"capture_skipped"`
 	// VirtualHits/VirtualMisses count virtualization lookups since start.
 	VirtualHits   int64 `json:"virtual_hits"`
 	VirtualMisses int64 `json:"virtual_misses"`
+	// VirtualInjected counts responses swapped by error amplification.
+	VirtualInjected int64 `json:"virtual_injected"`
 	// IndexedExchanges is the size of the virtualization index (0 when not
 	// virtualizing).
 	IndexedExchanges int64 `json:"indexed_exchanges"`
+}
+
+// VirtualStats counts virtualization activity of one service since its
+// virtual index was built.
+type VirtualStats struct {
+	Indexed  int64            `json:"indexed"`
+	Hits     int64            `json:"hits"`
+	Misses   int64            `json:"misses"`
+	Injected int64            `json:"injected"`
+	ByLevel  map[string]int64 `json:"by_level"`
 }

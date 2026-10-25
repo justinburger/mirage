@@ -4,8 +4,9 @@ The admin server (default `127.0.0.1:8484`) serves the web UI at `/`, this
 JSON API under `/api/v1`, and Prometheus metrics at `/metrics`.
 
 Object shapes are the JSON forms of the types in `internal/model`; field
-names below are exact. Durations are Go duration strings (`"250ms"`,
-`"1m30s"`); on input a JSON number is also accepted and means milliseconds.
+names below are exact. Durations are ASCII Go duration strings (`"250ms"`,
+`"1m30s"`, `"125us"`); on input a JSON number is also accepted and means
+milliseconds.
 Timestamps are RFC 3339. Series timestamps (`t`) are Unix milliseconds.
 
 ## Conventions
@@ -13,7 +14,12 @@ Timestamps are RFC 3339. Series timestamps (`t`) are Unix milliseconds.
 - Errors: `{"error": "message", "problems": ["field x ..."]}` with 400
   (validation or malformed JSON), 401 (auth), 404, 409 (conflict, e.g. a
   duplicate service name or listen address), 500.
-- Unknown JSON fields in request bodies are rejected (400).
+- Unknown JSON fields in request bodies are rejected (400), except read-only
+  echo fields, which are accepted and ignored so a fetched object can be PUT
+  back: `status`, `fired`, `has_secret`, `created_at`, `updated_at`. The id
+  in the URL wins over an id in the body.
+- `profile_id` absent means the `default` profile for anonymize preview and
+  anonymized copies, and no anonymization for HAR export/import.
 - Auth (only when the server runs with `--admin-token`): send
   `Authorization: Bearer <token>`, or the cookie `mirage_token`, or the query
   parameter `access_token` (for EventSource and download links).
@@ -67,6 +73,8 @@ Timestamps are RFC 3339. Series timestamps (`t`) are Unix milliseconds.
   "tls": {"self_signed": true},
   "timeout": "60s",
   "max_body_bytes": 1048576,
+  "capture_sample": 1,
+  "max_capture_bytes": 0,
   "match": {"query": "exact", "ignore_params": ["_ts"], "body": "json", "headers": [],
             "path_templates": true, "selection": "sequential", "miss_status": 404},
   "latency": {"mode": "recorded", "multiplier": 1, "fixed": "0s", "jitter": "0s"},
@@ -80,8 +88,8 @@ Timestamps are RFC 3339. Series timestamps (`t`) are Unix milliseconds.
 
 ```json
 {"service_id":"svc_...","running":true,"addr":"[::]:9001","mode":"record","error":"",
- "started_at":"...","captured":1520,"capture_dropped":0,
- "virtual_hits":0,"virtual_misses":0,"indexed_exchanges":0}
+ "started_at":"...","captured":1520,"capture_dropped":0,"capture_skipped":0,
+ "virtual_hits":0,"virtual_misses":0,"virtual_injected":0,"indexed_exchanges":0}
 ```
 
 ## Recordings and exchanges
@@ -92,7 +100,7 @@ Timestamps are RFC 3339. Series timestamps (`t`) are Unix milliseconds.
 | POST | `/api/v1/recordings` | `{"name","description"?,"labels"?}` | 201 `Recording` |
 | GET | `/api/v1/recordings/{id}` | | `Recording` |
 | PATCH | `/api/v1/recordings/{id}` | `{"name"?,"description"?,"labels"?}` | `Recording` |
-| DELETE | `/api/v1/recordings/{id}` | | 204 (409 if a running service uses it) |
+| DELETE | `/api/v1/recordings/{id}` | | 204 (409 if an enabled service uses it or a replay on it is pending/running) |
 | GET | `/api/v1/recordings/{id}/endpoints` | | `[EndpointStat]` |
 | GET | `/api/v1/recordings/{id}/exchanges` | `method, status, status_class, path, endpoint, errors=1, offset, limit, desc=1` | `{"items":[ExchangeSummary],"total":N}` |
 | GET | `/api/v1/exchanges/{id}` | | `ExchangeView` |
@@ -152,7 +160,7 @@ when the capture cap cut the body.
 | POST | `/api/v1/profiles` | `AnonymizationProfile` | 201 profile |
 | GET | `/api/v1/profiles/{id}` | | profile |
 | PUT | `/api/v1/profiles/{id}` | profile, plus optional `"regenerate_secret": true` | profile |
-| DELETE | `/api/v1/profiles/{id}` | | 204 (409 for `default` or if a service uses it) |
+| DELETE | `/api/v1/profiles/{id}` | | 204 (409 for `default` or if a service or replay uses it) |
 | GET | `/api/v1/anonymize/detectors` | | `[DetectorInfo]` |
 | POST | `/api/v1/anonymize/preview` | `{"profile": AnonymizationProfile}` or `{"profile_id":"default"}`, plus `{"exchange_id": 881}` or `{"exchange": ExchangeView}` | `{"exchange": ExchangeView, "changes": [AnonChange]}` |
 
@@ -163,6 +171,7 @@ when the capture cap cut the body.
  "detectors":["email","credit_card","ssn","phone","ipv4","ipv6","jwt","aws_key","iban"],
  "detector_strategy":"fake",
  "redact_headers":["Authorization","Cookie","Set-Cookie","X-Api-Key"],
+ "opaque_bodies":"keep",
  "rules":[{"id":"r1","name":"customer id","enabled":true,"target":"json",
            "selector":"$..customer_id","scope":"both","strategy":"hash"},
           {"id":"r2","name":"card last4","enabled":true,"target":"json",
@@ -174,6 +183,11 @@ Rule `target`: `header | query | cookie | json | form | regex | path`.
 `strategy`: `redact | remove | hash | fake | mask`. `fake`: `auto | email |
 name | phone | uuid | digits | ipv4 | credit_card | string`. `scope`:
 `both | request | response`.
+
+`opaque_bodies`: `keep` (default) stores bodies the engine cannot inspect
+(binary, still-compressed, binary multipart parts) unchanged; `fill` replaces
+them with deterministic filler of the same length. Regenerating a secret
+makes new captures produce different tokens than existing recordings.
 
 `AnonChange` = `{"location":"response.body $.user.email","source":"detector:email","before":"jane@acme.io","after":"mason.reed42@example.com"}`.
 
@@ -218,15 +232,23 @@ name | phone | uuid | digits | ipv4 | credit_card | string`. `scope`:
 
 ```json
 {"recording_id":"rec_...","target":"http://staging.internal:8080","mode":"timeline",
- "speed":10,"rate":0,"stages":[{"duration":"30s","rate":500},{"duration":"2m","rate":2000}],
- "amplify":1,"error_amplification":10,"concurrency":256,"duration":"5m","loop":true,
+ "speed":10,"max_gap":"5s","rate":0,
+ "stages":[{"duration":"30s","rate":500},{"duration":"2m","rate":2000,"hold":true}],
+ "amplify":1,"error_amplification":10,"concurrency":2048,"duration":"5m","loop":true,
  "max_requests":0,"timeout":"30s","include":["^GET /users"],"exclude":[],
  "set_headers":{"Authorization":"Bearer staging-token"},"remove_headers":["Cookie"],
  "host_header":"","insecure_skip_verify":false,
- "profile_id":"","vary_clones":false,"compare_status":true}
+ "profile_id":"","vary_clones":false,"compare_status":true,"seed":0}
 ```
 
-`mode`: `timeline` (uses `speed`), `rate` (uses `rate` or `stages`), `max`.
+`mode`: `timeline` (uses `speed`, `max_gap`, `amplify`, `loop`), `rate` (uses
+`rate` or `stages`; a stage ramps linearly from the previous rate unless
+`hold` is true, which steps straight to its rate), `max` (closed loop at
+`concurrency` workers). `amplify` > 1 is only valid in timeline mode (in
+rate mode raise the rate). `concurrency` defaults to 2048 (timeline, rate)
+or 64 (max). `seed` 0 means the server picks one and stores it, so re-runs
+and clones replay the same schedule. Values of sensitive `set_headers`
+(Authorization, Cookie, X-Api-Key, …) are returned masked as `"***"`.
 
 `ReplayJob`:
 
@@ -246,8 +268,13 @@ name | phone | uuid | digits | ipv4 | credit_card | string`. `scope`:
  "latency":LatencySummary,"corrected_latency":LatencySummary,
  "target_rps":1000,"achieved_rps":998.2,"error_rate":0.0127,
  "bytes_sent":1203311,"bytes_received":88123011,"elapsed":"40.3s","max_lag":"3.1ms",
- "endpoints":[EndpointSummary]}
+ "max_in_flight":412,"saturated":false,"endpoints":[EndpointSummary]}
 ```
+
+`saturated` means every concurrency slot was busy at least once, so lag and
+corrected latency include client-side queueing (raise `concurrency`).
+`corrected_latency` is measured from each request's intended send time and
+corrects coordinated omission.
 
 `LatencySummary` (milliseconds) =
 `{"count","min","mean","p50","p90","p95","p99","p999","max"}`.
@@ -267,17 +294,22 @@ name | phone | uuid | digits | ipv4 | credit_card | string`. `scope`:
  "requests":120331,"errors":220,"bytes_in":1203311,"bytes_out":98123011,"in_flight":14,
  "status_classes":{"2xx":119800,"4xx":311,"5xx":220,"err":0},
  "rps":1022,"rps10":998.4,"error_rate10":0.0018,
- "latency":LatencySummary,"recent":LatencySummary,"endpoints":[EndpointSummary]}
+ "latency":LatencySummary,"recent":LatencySummary,
+ "corrected_latency":LatencySummary,"endpoints":[EndpointSummary]}
 ```
 
+`corrected_latency` is present only for replay collectors. `endpoints` in
+snapshots carries the 20 busiest endpoints.
+
 `SeriesPoint` =
-`{"t":1761430000000,"requests":1022,"errors":2,"p50":8.1,"p95":30.2,"p99":71.9,"max":180.4,"in_flight":14,"bytes_in":10233,"bytes_out":812331}`.
+`{"t":1761430000000,"requests":1022,"errors":2,"p50":8.1,"p95":30.2,"p99":71.9,"max":180.4,"in_flight":14,"bytes_in":10233,"bytes_out":812331,"corrected_p95":41.0,"corrected_p99":95.2}`
+(`corrected_*` only for replay collectors).
 
 SSE events on `/api/v1/stream` (each `data:` is one JSON document):
 
 - `event: stats` every second:
   `{"time":"...","snapshots":[StatsSnapshot],"points":{"service:svc_x":SeriesPoint,...}}`
-- `event: services` when any service status changes: `[ServiceStatus]`
+- `event: services` every second (and immediately on connect): `[ServiceStatus]`
 - `event: replays` every second while any job runs:
   `[{"id","status","summary":ReplaySummary}]`, and once more when a job finishes.
 - `: ping` comment every 15 s.

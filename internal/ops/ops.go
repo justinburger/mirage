@@ -10,14 +10,17 @@
 //   - CopyAnonymized creates the destination recording (Source "copy",
 //     Anonymized true, Description noting the source and profile) before
 //     copying; on error it deletes the partial destination.
-//   - ImportHAR creates a recording (Source "har"), converts entries with
-//     har.ToExchange, fills Endpoint with the normalizer, anonymizes when
-//     eng is non-nil (then Anonymized true) and appends in batches. HAR
-//     decoding may hold the parsed document in memory (HAR files are JSON).
+//   - ImportHAR creates a recording (Source "har"), streams entries with
+//     har.DecodeEntries (constant memory), converts them with
+//     har.ToExchange (skipping entries whose error wraps har.ErrUnsupported,
+//     e.g. data: URLs, and counting them in the recording description), fills
+//     Endpoint with the normalizer from the raw escaped path BEFORE
+//     anonymizing, anonymizes when eng is non-nil and appends in batches.
 //   - ExportHAR streams with har.Encoder, anonymizing each exchange first
 //     when eng is non-nil.
 //   - LoadEngine reads the profile (profileID "" = model.DefaultProfileID),
-//     applies WithDefaults and builds anonymize.New.
+//     applies WithDefaults and builds anonymize.New. A stored profile without
+//     a secret is an error (tokens would not be stable).
 //   - LoadFaults reads every fault rule and calls inj.SetRules.
 package ops
 

@@ -51,11 +51,15 @@ func (d Duration) D() time.Duration { return time.Duration(d) }
 // Ms returns the duration in (fractional) milliseconds.
 func (d Duration) Ms() float64 { return float64(d) / float64(time.Millisecond) }
 
-func (d Duration) String() string { return time.Duration(d).String() }
+// String formats like time.Duration.String but always in ASCII ("125us",
+// never "125µs"), so JSON consumers can parse it simply.
+func (d Duration) String() string {
+	return strings.Replace(time.Duration(d).String(), "µs", "us", 1)
+}
 
 // MarshalJSON implements json.Marshaler.
 func (d Duration) MarshalJSON() ([]byte, error) {
-	return json.Marshal(time.Duration(d).String())
+	return json.Marshal(d.String())
 }
 
 // UnmarshalJSON implements json.Unmarshaler.

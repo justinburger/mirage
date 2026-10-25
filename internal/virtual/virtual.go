@@ -21,10 +21,23 @@
 // whitespace removed, numbers kept as literals) or of the bytes when the
 // body is not JSON. Use a fast non-cryptographic hash (hash/maphash with a
 // per-engine seed). Exchanges whose Error is set (no upstream response) are
-// not served as normal matches but do count toward error rates.
+// not served as normal matches but do count toward error rates. Candidate
+// lists (and sequential cursors) follow (StartedAt, Seq) order, because Seq
+// is completion order, not arrival order. Template-level keys and endpoint
+// pools use the stored Exchange.Endpoint when non-empty (it was computed from
+// the raw path) and compute it with the Normalizer only otherwise.
+//
+// Ownership and immutability: Add takes ownership of the exchange it is
+// given (callers do not touch it afterwards; Build's exchanges come fresh
+// from the store). Indexed exchanges are immutable: Lookup and Respond never
+// mutate ex.Header or ex.Body (Date, Content-Length and X-Mirage-* go to the
+// response header map only). The gzip cache is built at most once per
+// exchange (sync.Once). Add after Close is a no-op.
 //
 // Lookup is the hot path (target ≥ 50k lookups/s per core, no allocation
-// beyond key building): read-locked map lookups. Selection among candidates
+// beyond key building). Avoid one global RWMutex: shard the index (e.g. 64
+// shards by key hash, one RWMutex each; Add takes only its shard's write
+// lock) or use copy-on-write snapshots behind an atomic pointer. Selection among candidates
 // per Match.Selection: sequential keeps an atomic cursor per key and cycles;
 // random picks uniformly; first always returns the first recorded.
 //
@@ -118,13 +131,7 @@ type Match struct {
 }
 
 // Stats counts engine activity since Build.
-type Stats struct {
-	Indexed  int64            `json:"indexed"`
-	Hits     int64            `json:"hits"`
-	Misses   int64            `json:"misses"`
-	Injected int64            `json:"injected"`
-	ByLevel  map[string]int64 `json:"by_level"`
-}
+type Stats = model.VirtualStats
 
 // Engine is a virtualized service backed by one recording.
 type Engine struct{}
@@ -163,8 +170,9 @@ func (e *Engine) WriteMiss(w http.ResponseWriter, r *http.Request) {
 // Len returns the number of indexed exchanges.
 func (e *Engine) Len() int { panic("virtual: not implemented") }
 
-// Stats returns activity counters.
-func (e *Engine) Stats() Stats { panic("virtual: not implemented") }
+// Stats returns activity counters (Hits, Misses, Injected, Indexed,
+// ByLevel).
+func (e *Engine) Stats() model.VirtualStats { panic("virtual: not implemented") }
 
 // Close releases resources.
 func (e *Engine) Close() error { panic("virtual: not implemented") }
