@@ -1,0 +1,75 @@
+name: Release
+
+# Push a tag such as v0.1.0 to publish binaries for Linux, macOS and Windows
+# (amd64 and arm64) with SHA-256 checksums as a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TAG: ${{ github.ref_name }}
+      MODULE: github.com/justinburger/mirage
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Never publish a tag that does not pass.
+      - name: Test
+        run: go test -count=1 ./...
+
+      - name: Build and package
+        run: |
+          set -euo pipefail
+          rm -rf dist stage
+          mkdir dist stage
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            goos="${target%/*}"
+            goarch="${target#*/}"
+            name="mirage_${TAG}_${goos}_${goarch}"
+            exe="mirage"
+            if [ "$goos" = windows ]; then exe="mirage.exe"; fi
+
+            mkdir -p "stage/$name"
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath \
+              -ldflags "-s -w -X ${MODULE}/internal/version.Version=${TAG}" \
+              -o "stage/$name/$exe" ./cmd/mirage
+            cp LICENSE README.md "stage/$name/"
+
+            if [ "$goos" = windows ]; then
+              (cd stage && zip -qr "../dist/$name.zip" "$name")
+            else
+              tar -czf "dist/$name.tar.gz" -C stage "$name"
+            fi
+          done
+          (cd dist && sha256sum -- * > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # A tag with a suffix (v1.0.0-rc.1) is a pre-release.
+          flags=()
+          case "$TAG" in *-*) flags+=(--prerelease) ;; esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Re-run of a release that already exists: replace its files.
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "$TAG" --generate-notes --verify-tag "${flags[@]}"
+          fi

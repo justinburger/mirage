@@ -195,7 +195,13 @@ function buildLive(ctx, root) {
       if (s) {
         const frac = s.planned > 0 ? s.sent / s.planned : 0;
         v.bar.set(frac, { indeterminate: s.planned <= 0 });
-        v.line.textContent = `${fmtCompact(s.sent)}${s.planned > 0 ? ' / ' + fmtCompact(s.planned) : ''} requests · ${fmtRate(s.achieved_rps)}${s.target_rps ? ' of ' + fmtRate(s.target_rps) : ''} req/s · ${fmtPct(s.error_rate)} errors`;
+        // The live snapshot of the job's collector carries the corrected
+        // latency: shown when queueing makes it differ from service time.
+        const snap = state.snapshots[`replay:${r.id}`];
+        const lat = snap && snap.latency && snap.latency.count ? snap.latency.p99 : 0;
+        const cor = snap && snap.corrected_latency && snap.corrected_latency.count ? snap.corrected_latency.p99 : 0;
+        const queued = lat > 0 && cor > lat * 1.25 && cor - lat > 10;
+        v.line.textContent = `${fmtCompact(s.sent)}${s.planned > 0 ? ' / ' + fmtCompact(s.planned) : ''} requests · ${fmtRate(s.achieved_rps)}${s.target_rps ? ' of ' + fmtRate(s.target_rps) : ''} req/s · ${fmtPct(s.error_rate)} errors${lat ? ` · p99 ${fmtMs(lat)}${queued ? ` (${fmtMs(cor)} corrected)` : ''}` : ''}${s.saturated && r.config.mode !== 'max' ? ' · sender saturated' : ''}`;
       }
     }
     for (const [id, v] of replayRows) if (!seen.has(id)) { v.el.remove(); replayRows.delete(id); }

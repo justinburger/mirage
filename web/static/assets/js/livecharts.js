@@ -22,7 +22,7 @@ export function trafficCharts({ windowMs = 15 * 60000, height = 190 } = {}) {
   const err = new TimeChart({
     title: 'Error rate', windowMs, height,
     series: [{ key: 'err_pct', label: 'errors', color: 'err', area: true }],
-    yFormat: pctAxis, tipFormat: pctTip,
+    yFormat: pctAxis, tipFormat: pctTip, yCap: 100,
   });
   const inflight = new TimeChart({
     title: 'In flight', windowMs, height,

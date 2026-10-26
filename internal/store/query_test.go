@@ -575,6 +575,36 @@ func TestIterateExchangesCallbackMayUseStore(t *testing.T) {
 	})
 }
 
+// TestIterateExchangesCallbackMayMutateSeq proves the paging cursor does not
+// depend on what fn does to the exchange: passing the visited exchange to
+// AppendExchanges rewrites its Seq in place (a copy of a recording into
+// another one), and the iteration must still visit each row exactly once.
+func TestIterateExchangesCallbackMayMutateSeq(t *testing.T) {
+	backends(t, func(t *testing.T, s *SQLite) {
+		src := newRecording(t, s, "src")
+		dst := newRecording(t, s, "dst")
+		const n = iterChunkRows*2 + 5
+		appendN(t, s, src.ID, n)
+		visited := 0
+		err := s.IterateExchanges(ctx(), src.ID, model.IterOptions{}, func(e *model.Exchange) error {
+			visited++
+			if visited > 3*n {
+				return fmt.Errorf("runaway iteration after %d visits", visited)
+			}
+			return s.AppendExchanges(ctx(), dst.ID, []*model.Exchange{e}) // rewrites e.Seq, e.ID and e.RecordingID
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if visited != n {
+			t.Fatalf("visited %d exchanges, want %d", visited, n)
+		}
+		if got, _ := s.GetRecording(ctx(), dst.ID); got.ExchangeCount != n {
+			t.Fatalf("destination has %d exchanges, want %d", got.ExchangeCount, n)
+		}
+	})
+}
+
 func TestIterateExchangesRecordingDeletedMidway(t *testing.T) {
 	s := openMem(t)
 	rec := newRecording(t, s, "doomed")

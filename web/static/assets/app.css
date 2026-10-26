@@ -673,7 +673,8 @@ td.actions { text-align: right; white-space: nowrap; width: 1%; }
 .rule-head { display: flex; align-items: center; gap: 8px; }
 .rule-num { width: 22px; height: 22px; border-radius: 6px; background: var(--panel-3); color: var(--text-3); font-size: 12px; display: flex; align-items: center; justify-content: center; flex: none; font-variant-numeric: tabular-nums; }
 .rule-grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); }
-.stage-row { display: grid; grid-template-columns: 24px 1fr 1fr auto; gap: 8px; align-items: end; }
+.stage-row { display: grid; grid-template-columns: 24px 1fr 1fr auto auto; gap: 8px; align-items: end; }
+.stage-step { margin-bottom: 6px; }
 .stage-row .rule-num { margin-bottom: 6px; }
 .dropzone { border: 1.5px dashed var(--border-2); border-radius: var(--r-md); padding: 22px; text-align: center; color: var(--text-2); cursor: pointer; background: var(--panel-2); transition: border-color .12s, background .12s; }
 .dropzone:hover, .dropzone.is-over { border-color: var(--accent); background: var(--accent-soft); }

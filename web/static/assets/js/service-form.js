@@ -67,6 +67,8 @@ export async function openServiceForm({ service = null, onSaved } = {}) {
   });
   const timeout = durCtl({ value: durText(s.timeout) || '60s', placeholder: '60s' });
   const maxBody = numCtl({ value: s.max_body_bytes ?? 1048576, step: 1, unit: 'bytes', placeholder: '1048576' });
+  const sample = numCtl({ value: s.capture_sample > 0 ? Math.round(s.capture_sample * 10000) / 100 : 100, step: 'any', min: 0, max: 100, unit: '%' });
+  const capLimit = numCtl({ value: s.max_capture_bytes || 0, step: 1, min: 0, unit: 'bytes', placeholder: '0 = no limit' });
 
   // --- network
   const tlsMode = segmentedCtl([
@@ -102,8 +104,10 @@ export async function openServiceForm({ service = null, onSaved } = {}) {
     new_recording_name: field('New recording name', recName),
     profile_id: field('Anonymization profile', profile),
     endpoint_patterns: field('Endpoint patterns', patterns, { help: 'One path template per line. They group requests into endpoints for metrics and template matching.' }),
-    timeout: field('Upstream timeout', timeout, { help: 'Whole round trip, e.g. 30s. 0 uses the 60s default.' }),
+    timeout: field('Upstream timeout', timeout, { help: 'How long to wait for the upstream\'s response headers, e.g. 30s; the body then streams until it ends. 0 uses the 60s default.' }),
     max_body_bytes: field('Max captured body', maxBody, { help: '0 = 1 MiB, -1 = do not capture bodies. Traffic is never truncated, only the captured copy.' }),
+    capture_sample: field('Capture sampling', sample, { help: 'Share of requests that are captured (100 = all). Decided before anything is buffered, so skipped requests cost nothing extra.' }),
+    max_capture_bytes: field('Capture limit', capLimit, { help: 'Stop capturing once the recording holds this many body bytes (0 = no limit). Traffic keeps flowing; the service status then reads "capture limit reached".' }),
     tls: field('TLS', tlsMode, { help: 'Serve this listener over HTTPS.' }),
     cert_file: field('Certificate file', certFile),
     key_file: field('Key file', keyFile),
@@ -163,7 +167,7 @@ export async function openServiceForm({ service = null, onSaved } = {}) {
       h('div', { class: 'muted', id: 'mode-help', style: 'font-size:12.5px;margin-top:-6px' }),
       enabled.el),
     recSection,
-    formSection('Capture', 'What is stored when traffic is recorded.', anon.el, profileRow, F.endpoint_patterns, formGrid(F.timeout, F.max_body_bytes)),
+    formSection('Capture', 'What is stored when traffic is recorded.', anon.el, profileRow, F.endpoint_patterns, formGrid(F.timeout, F.max_body_bytes), formGrid(F.capture_sample, F.max_capture_bytes)),
     formSection('Network', null, F.tls, certRow, h('div', { class: 'fgrid' }, preserveHost.el, skipVerify.el)),
     virt);
   const modeHelp = body.querySelector('#mode-help');
@@ -228,6 +232,10 @@ export async function openServiceForm({ service = null, onSaved } = {}) {
     const tmo = timeout.ms();
     const mb = maxBody.get();
     if (mb !== null && mb < -1) bail('max_body_bytes', 'Must be -1, 0 or positive.');
+    const smp = sample.get();
+    if (smp === null || !(smp > 0) || smp > 100) bail('capture_sample', 'Use a percentage above 0 and up to 100.');
+    const cap = capLimit.get();
+    if (cap !== null && cap < 0) bail('max_capture_bytes', 'Must be 0 (no limit) or positive.');
     const tm = tlsMode.get();
     if (tm === 'files' && (!certFile.get().trim() || !keyFile.get().trim())) bail('cert_file', 'Both certificate and key files are required.');
     const pats = patterns.get();
@@ -245,7 +253,12 @@ export async function openServiceForm({ service = null, onSaved } = {}) {
       scrollToFirstError(m.body);
       return null;
     }
+    // Start from the stored service so that fields this form does not edit
+    // survive the full-object PUT; the conditional ones are reset below.
+    const { status: _status, created_at: _created, updated_at: _updated, tls: _tls, profile_id: _profile, recording_id: _rec, ...kept } = s;
+    void _status; void _created; void _updated; void _tls; void _profile; void _rec;
     const payload = {
+      ...kept,
       ...(editing ? { id: s.id } : {}),
       name: nm, listen_addr: la, upstream: up, mode: md, enabled: enabled.get(),
       anonymize_capture: anon.get(),
@@ -253,6 +266,8 @@ export async function openServiceForm({ service = null, onSaved } = {}) {
       preserve_host: preserveHost.get(), insecure_skip_verify: skipVerify.get(),
       timeout: tmo ? toGoDuration(tmo) : '0s',
       max_body_bytes: mb === null ? 0 : mb,
+      capture_sample: smp >= 100 ? 1 : smp / 100,
+      max_capture_bytes: cap === null ? 0 : cap,
       match: {
         query: mQuery.get(), body: mBody.get(), path_templates: mTemplates.get(), selection: mSelection.get(), miss_status: miss || 404,
         ...(mIgnore.get().length ? { ignore_params: mIgnore.get() } : {}),

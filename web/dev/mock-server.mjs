@@ -133,6 +133,8 @@ function svcDefaults(s) {
   out.insecure_skip_verify = !!s.insecure_skip_verify;
   out.timeout = fmtGoDuration(parseGoDuration(s.timeout) || 60000);
   out.max_body_bytes = s.max_body_bytes || 1048576;
+  if (s.capture_sample > 0) out.capture_sample = s.capture_sample; else delete out.capture_sample;
+  if (s.max_capture_bytes > 0) out.max_capture_bytes = s.max_capture_bytes; else delete out.max_capture_bytes;
   const m = s.match || {};
   out.match = { query: m.query || 'exact', ...(m.ignore_params?.length ? { ignore_params: m.ignore_params } : {}), body: m.body || 'json', ...(m.headers?.length ? { headers: m.headers } : {}), path_templates: !!m.path_templates, selection: m.selection || 'sequential', miss_status: m.miss_status || 404 };
   const l = s.latency || {};
@@ -200,7 +202,8 @@ function statusOf(svc) {
   return {
     service_id: svc.id, running, addr: running ? (svc.listen_addr.startsWith(':') ? `[::]${svc.listen_addr}` : svc.listen_addr) : '', mode: svc.mode, ...(error ? { error } : {}),
     ...(running ? { started_at: iso(r.startedAt) } : {}),
-    captured: Math.round(r.captured), capture_dropped: r.dropped, virtual_hits: Math.round(r.hits), virtual_misses: Math.round(r.misses),
+    captured: Math.round(r.captured), capture_dropped: r.dropped, capture_skipped: Math.round(r.captured * 0.004), virtual_hits: Math.round(r.hits), virtual_misses: Math.round(r.misses),
+    virtual_injected: usesIndex ? Math.round(r.hits * Math.min(1, 0.004 * (svc.error_amplification || 1))) : 0,
     indexed_exchanges: running && usesIndex && rec ? rec.exchange_count : 0,
   };
 }
@@ -216,7 +219,7 @@ for (const svc of db.services.values()) {
 }
 
 // ---- validation ---------------------------------------------------------
-const SERVICE_KEYS = ['id', 'name', 'listen_addr', 'upstream', 'mode', 'enabled', 'recording_id', 'anonymize_capture', 'profile_id', 'endpoint_patterns', 'preserve_host', 'insecure_skip_verify', 'tls', 'timeout', 'max_body_bytes', 'match', 'latency', 'error_amplification', 'error_floor', 'created_at', 'updated_at'];
+const SERVICE_KEYS = ['id', 'name', 'listen_addr', 'upstream', 'mode', 'enabled', 'recording_id', 'anonymize_capture', 'profile_id', 'endpoint_patterns', 'preserve_host', 'insecure_skip_verify', 'tls', 'timeout', 'max_body_bytes', 'capture_sample', 'max_capture_bytes', 'match', 'latency', 'error_amplification', 'error_floor', 'created_at', 'updated_at'];
 
 function checkKeys(obj, allowed, where = '') {
   if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) throw bad(`json: cannot unmarshal ${Array.isArray(obj) ? 'array' : typeof obj} into Go value${where ? ' of ' + where : ''}`);
@@ -244,6 +247,8 @@ function validateService(s, { skipUniq = false, selfId = '' } = {}) {
   if (s.profile_id && !db.profiles.has(s.profile_id)) p.push(`profile_id "${s.profile_id}" does not exist`);
   if (s.tls && !s.tls.self_signed && !(s.tls.cert_file && s.tls.key_file)) p.push('tls needs self_signed or both cert_file and key_file');
   if (s.max_body_bytes < -1) p.push('max_body_bytes must be -1, 0 or positive');
+  if (s.capture_sample < 0 || s.capture_sample > 1) p.push('capture_sample must be between 0 and 1');
+  if (s.max_capture_bytes < 0) p.push('max_capture_bytes must not be negative');
   if ((parseGoDuration(s.timeout) ?? 0) < 0) p.push('timeout must not be negative');
   if (!['exact', 'ignore', 'subset'].includes(s.match.query)) p.push(`match.query "${s.match.query}" must be exact, ignore or subset`);
   if (!['ignore', 'exact', 'json'].includes(s.match.body)) p.push(`match.body "${s.match.body}" must be ignore, exact or json`);
@@ -464,17 +469,17 @@ function replayPlan(cfg, rec) {
   const cap = 420;
   let durationSec; let at;
   if (cfg.mode === 'rate') {
-    const stages = (cfg.stages || []).map((s) => ({ d: (parseGoDuration(s.duration) || 0) / 1000, rate: s.rate }));
+    const stages = (cfg.stages || []).map((s) => ({ d: (parseGoDuration(s.duration) || 0) / 1000, rate: s.rate, hold: !!s.hold }));
     if (stages.length) {
       durationSec = Math.min(cap, stages.reduce((s, x) => s + x.d, 0));
-      at = (t) => { let acc = 0, prev = 0; for (const s of stages) { if (t <= acc + s.d) return prev + (s.rate - prev) * ((t - acc) / s.d); acc += s.d; prev = s.rate; } return prev; };
+      at = (t) => { let acc = 0, prev = 0; for (const s of stages) { if (t <= acc + s.d) return s.hold ? s.rate : prev + (s.rate - prev) * ((t - acc) / s.d); acc += s.d; prev = s.rate; } return prev; };
     } else {
       durationSec = Math.min(cap, (parseGoDuration(cfg.duration) || 60000) / 1000);
       at = () => cfg.rate;
     }
   } else if (cfg.mode === 'max') {
     durationSec = Math.min(cap, (parseGoDuration(cfg.duration) || 45000) / 1000);
-    const conc = cfg.concurrency || 256;
+    const conc = cfg.concurrency || 64;
     at = (t) => Math.min(conc * 8, 2600) * (0.95 + 0.05 * Math.sin(t / 5));
   } else {
     const avg = (n / spanSec) * (cfg.speed || 1) * amp * 60; // mock recordings are small samples of real traffic
@@ -508,13 +513,16 @@ function replayPoint(job, plan, sec, tMs) {
   const p99 = p95 * (1.8 + sat * 6 + hash01(sec, 6) * 0.6);
   const errRate = 0.004 * (cfg.error_amplification || 1) + Math.max(0, load - 0.92) * 0.5;
   const errors = Math.min(achieved, Math.round(achieved * Math.min(0.9, errRate) * (0.7 + 0.6 * hash01(sec, 7))));
-  const inflight = Math.min(cfg.concurrency || 256, Math.round(achieved * (p50 / 1000) * 1.5 + 2));
-  return { t: tMs, requests: achieved, errors, p50: round(p50, 2), p95: round(p95, 2), p99: round(p99, 2), max: round(p99 * 2.1, 2), in_flight: inflight, bytes_in: achieved * 2400, bytes_out: achieved * 420, _target: target, _sat: sat };
+  const inflight = Math.min(cfg.concurrency || (cfg.mode === 'max' ? 64 : 2048), Math.round(achieved * (p50 / 1000) * 1.5 + 2));
+  const lag = sat * 900 * (0.6 + hash01(sec, 8));
+  return { t: tMs, requests: achieved, errors, p50: round(p50, 2), p95: round(p95, 2), p99: round(p99, 2), max: round(p99 * 2.1, 2), in_flight: inflight,
+    corrected_p95: round(p95 + lag * 1.8, 2), corrected_p99: round(p99 + lag * 4.5, 2), bytes_in: achieved * 2400, bytes_out: achieved * 420, _target: target, _sat: sat };
 }
 
 function foldSim(job, pt) {
   const s = job._sim;
   s.secs += 1;
+  s.maxInFlight = Math.max(s.maxInFlight || 0, pt.in_flight);
   s.targetSum += pt._target;
   s.sent += Math.round(pt.requests * 1.01);
   s.completed += pt.requests;
@@ -554,6 +562,7 @@ function replaySummary(job) {
     error_rate: s.completed ? round(s.errors / s.completed, 5) : 0,
     bytes_sent: s.bytes_sent, bytes_received: s.bytes_received,
     elapsed: fmtGoDuration(elapsed * 1000), max_lag: fmtGoDuration(s.maxLag),
+    max_in_flight: s.maxInFlight || 0, saturated: (s.maxInFlight || 0) >= (job.config.concurrency || (job.config.mode === 'max' ? 64 : 2048)),
     endpoints: shares.map((e) => {
       const count = Math.round(s.completed * e.w);
       const k = 0.85 + 0.3 * hash01(strHash(e.endpoint), 4);
@@ -668,20 +677,22 @@ function jobOut(job, withSeries) {
   return out;
 }
 
-const REPLAY_KEYS = ['recording_id', 'target', 'mode', 'speed', 'rate', 'stages', 'amplify', 'error_amplification', 'concurrency', 'duration', 'loop', 'max_requests', 'timeout', 'include', 'exclude', 'set_headers', 'remove_headers', 'host_header', 'insecure_skip_verify', 'profile_id', 'vary_clones', 'compare_status'];
+const REPLAY_KEYS = ['recording_id', 'target', 'mode', 'speed', 'max_gap', 'seed', 'rate', 'stages', 'amplify', 'error_amplification', 'concurrency', 'duration', 'loop', 'max_requests', 'timeout', 'include', 'exclude', 'set_headers', 'remove_headers', 'host_header', 'insecure_skip_verify', 'profile_id', 'vary_clones', 'compare_status'];
 function parseReplayConfig(cfg) {
   checkKeys(cfg, REPLAY_KEYS, 'ReplayConfig');
-  for (const s of cfg.stages || []) checkKeys(s, ['duration', 'rate'], 'ReplayStage');
+  for (const s of cfg.stages || []) checkKeys(s, ['duration', 'rate', 'hold'], 'ReplayStage');
   const probs = [];
   checkDurationField(cfg.duration, 'duration', probs);
   checkDurationField(cfg.timeout, 'timeout', probs);
+  checkDurationField(cfg.max_gap, 'max_gap', probs);
   (cfg.stages || []).forEach((s, i) => checkDurationField(s.duration, `stages[${i}].duration`, probs));
   if (probs.length) throw bad('validation failed', probs);
   const c = { ...cfg };
-  c.mode ||= 'timeline'; c.speed ||= 1; c.amplify ||= 1; c.error_amplification ||= 1; c.concurrency ||= 256;
+  c.mode ||= 'timeline'; c.speed ||= 1; c.amplify ||= 1; c.error_amplification ||= 1; c.concurrency ||= (c.mode === 'max' ? 64 : 2048);
+  c.seed ||= Math.floor(Math.random() * 2 ** 52) + 1;
   const norm = (k) => { if (c[k] !== undefined && c[k] !== '') c[k] = fmtGoDuration(parseGoDuration(c[k]) || 0); };
-  norm('duration'); norm('timeout');
-  if (c.stages) c.stages = c.stages.map((s) => ({ duration: fmtGoDuration(parseGoDuration(s.duration) || 0), rate: s.rate }));
+  norm('duration'); norm('timeout'); if (c.max_gap) norm('max_gap');
+  if (c.stages) c.stages = c.stages.map((s) => ({ duration: fmtGoDuration(parseGoDuration(s.duration) || 0), rate: s.rate, ...(s.hold ? { hold: true } : {}) }));
   if (!c.timeout) c.timeout = '30s';
   const p = [];
   if (!c.recording_id) p.push('recording_id is required');
@@ -697,6 +708,8 @@ function parseReplayConfig(cfg) {
     if (!dur && !(c.stages || []).length && !c.max_requests) p.push('rate mode needs duration, stages or max_requests');
   } else if (c.mode !== 'max') p.push(`mode "${c.mode}" must be timeline, rate or max`);
   if (!(c.amplify >= 1 && c.amplify <= 1000)) p.push('amplify must be between 1 and 1000');
+  if (c.amplify > 1 && c.mode !== 'timeline') p.push('amplify applies to timeline mode only (in rate mode raise the rate instead)');
+  if ((parseGoDuration(c.max_gap) || 0) < 0) p.push('max_gap must not be negative');
   if (!(c.error_amplification > 0 && c.error_amplification <= 1000)) p.push('error_amplification must be > 0 and <= 1000');
   if (!(c.concurrency >= 1 && c.concurrency <= 100000)) p.push('concurrency must be between 1 and 100000');
   if (dur < 0 || (c.max_requests || 0) < 0) p.push('duration, timeout and max_requests must not be negative');
@@ -1022,7 +1035,7 @@ route('GET', '/api/v1/recordings/:id/export.har', async (c) => {
 // anonymization
 route('GET', '/api/v1/profiles', async () => [200, Array.from(db.profiles.values()).sort((a, b) => (a.id === 'default' ? -1 : b.id === 'default' ? 1 : a.name.localeCompare(b.name))).map(profileOut)]);
 route('GET', '/api/v1/anonymize/detectors', async () => [200, DETECTOR_INFO]);
-const PROFILE_KEYS = ['id', 'name', 'description', 'detectors', 'detector_strategy', 'redact_headers', 'rules', 'secret', 'has_secret', 'created_at', 'updated_at'];
+const PROFILE_KEYS = ['id', 'name', 'description', 'detectors', 'detector_strategy', 'redact_headers', 'opaque_bodies', 'rules', 'secret', 'has_secret', 'created_at', 'updated_at'];
 const RULE_KEYS = ['id', 'name', 'enabled', 'target', 'selector', 'scope', 'strategy', 'fake', 'keep_prefix', 'keep_suffix', 'replacement'];
 function parseProfile(b, existing) {
   checkKeys(b, [...PROFILE_KEYS, 'regenerate_secret']);
@@ -1031,6 +1044,8 @@ function parseProfile(b, existing) {
   delete p.regenerate_secret; delete p.has_secret;
   p.id = b.id || existing?.id || newId('prof');
   p.detector_strategy ||= 'fake'; p.detectors ||= []; p.redact_headers ||= []; p.rules ||= [];
+  p.opaque_bodies ||= 'keep';
+  if (!['keep', 'fill'].includes(p.opaque_bodies)) throw bad('validation failed', [`opaque_bodies "${p.opaque_bodies}" must be keep or fill`]);
   p.rules = p.rules.map((r, i) => ({ ...r, id: r.id || `r${i + 1}`, scope: r.scope || 'both', strategy: r.strategy || 'hash', ...(r.strategy === 'fake' && !r.fake ? { fake: 'auto' } : {}) }));
   p.secret = b.regenerate_secret ? newSecret() : (b.secret || existing?.secret || newSecret());
   p.created_at = existing?.created_at || iso(Date.now());

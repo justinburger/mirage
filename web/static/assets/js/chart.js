@@ -37,6 +37,7 @@ export class TimeChart {
    * @param {Function} [o.yFormat] axis labels
    * @param {Function} [o.tipFormat] tooltip values (defaults to yFormat)
    * @param {number|null} [o.yMax] fixed y maximum
+   * @param {number|null} [o.yCap] upper limit of the automatic y maximum
    * @param {'clock'|'elapsed'} [o.xMode]
    * @param {number} [o.xBase] unix ms that counts as 0 in elapsed mode
    * @param {string} [o.hint] small text next to the title
@@ -102,6 +103,13 @@ export class TimeChart {
   }
 
   setTitle(t) { this.titleEl.firstChild.nodeValue = t; }
+
+  /** Small explanatory text next to the title. */
+  setHint(text) {
+    let hint = this.titleEl.querySelector('.chart-hint');
+    if (!hint) { hint = h('span', { class: 'chart-hint' }); this.titleEl.appendChild(hint); }
+    hint.textContent = text || '';
+  }
 
   destroy() {
     this.destroyed = true;
@@ -241,7 +249,8 @@ export class TimeChart {
       yMax = this.o.yMax;
       step = niceStep(yMax - this.o.yMin, 4);
     } else {
-      const want = max > 0 ? max * 1.08 : 1;
+      let want = max > 0 ? max * 1.08 : 1;
+      if (this.o.yCap != null) want = Math.min(want, this.o.yCap); // e.g. a percentage never needs more than 100
       step = niceStep(want - this.o.yMin, 4);
       yMax = Math.ceil(want / step) * step;
       if (yMax <= this.o.yMin) yMax = this.o.yMin + step;
@@ -499,14 +508,15 @@ export function rampChart(stages, { width = 600, height = 120 } = {}) {
   }
   root.appendChild(grid);
   if (!total || !stages.length) return root;
-  let t = 0, prev = 0;
+  let t = 0;
   const pts = [[padL, padT + ph]];
+  const xAt = (ms) => padL + (ms / total) * pw;
+  const yAt = (rate) => padT + ph - (rate / peak) * ph;
   for (const s of stages) {
+    if (s.hold) pts.push([xAt(t), yAt(s.rate)]); // steps straight to the rate
     t += s.durationMs;
-    pts.push([padL + (t / total) * pw, padT + ph - (s.rate / peak) * ph]);
-    prev = s.rate;
+    pts.push([xAt(t), yAt(s.rate)]);
   }
-  void prev;
   const d = pts.map((p, i) => (i ? 'L' : 'M') + p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join('');
   root.appendChild(svg('path', { class: 'ramp-area', d: d + `L${pts[pts.length - 1][0]} ${padT + ph}L${padL} ${padT + ph}Z` }));
   root.appendChild(svg('path', { class: 'ramp-line', d }));

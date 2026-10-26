@@ -107,12 +107,62 @@
 // within 20% of passthrough; virtualize ≥ 40k req/s for small responses.
 // Use sync.Pool for buffers; avoid per-request allocations that scale with
 // body size beyond the capped capture buffers.
+//
+// # IMPLEMENTATION NOTES
+//
+// Decisions made where the contract is silent or allows two readings. All of
+// them are covered by tests.
+//
+//   - Request state. Everything a request needs (mode, normalizer, transport,
+//     virtualizer, anonymizer, capture limits) lives in one immutable
+//     serviceState behind an atomic pointer. Apply builds a new state and
+//     swaps it; requests that already loaded the old one finish with it. A
+//     swapped-out state is retired: its virtualizer is closed and its idle
+//     upstream connections are dropped only once the last request that uses it
+//     is done.
+//   - Capture decisions. Sampling, the capture limit and the Accept-Encoding
+//     narrowing apply to requests that are captured. An unsampled request in
+//     record or hybrid mode is proxied exactly like passthrough, including the
+//     client's own Accept-Encoding. Upgrade requests (WebSocket) are never
+//     captured and never counted as skipped.
+//   - Capture accounting. The capture limit compares MaxCaptureBytes with the
+//     body bytes stored in the recording plus the body bytes still queued, so
+//     a burst cannot overshoot by a whole queue. The request that crosses the
+//     limit is still stored; the next ones are counted in CaptureSkipped.
+//   - An exchange belongs to the service state its request was handled with
+//     (recording, anonymizer, body cap). Apply and ProfileChanged therefore
+//     affect captures of requests handled afterwards; captures already queued
+//     keep the anonymizer they were started with and are never stored raw.
+//   - Truncated encoded bodies. A gzip or deflate body whose captured bytes
+//     were cut by MaxBodyBytes cannot be decoded and is stored as captured
+//     (still encoded, BodyTruncated set). A body that decodes but exceeds
+//     MaxBodyBytes is cut at MaxBodyBytes decoded bytes, BodyTruncated is set
+//     and BodySize is the larger of the wire size and MaxBodyBytes+1. A
+//     completely decoded body has BodySize equal to its decoded length.
+//   - Upstream failures before any response was read (502 or 504) store the
+//     synthetic JSON answer as the response. A failure after the response
+//     headers were sent stores the status and the partial body with Error set
+//     to "upstream response interrupted: ..."; httputil.ReverseProxy aborts
+//     the client connection.
+//   - Hybrid mode reads at most MaxBodyBytes of the request body for matching
+//     into a private buffer. On a miss the prefix is replayed in front of the
+//     rest of the body, so the upstream always receives the whole body.
+//   - Status counters (Captured, CaptureDropped, CaptureSkipped) count since
+//     the service was last started from stopped; reconfiguring a running
+//     service keeps them. CaptureDropped also counts exchanges lost to an
+//     anonymization or store failure, which are logged and shown in
+//     ServiceStatus.Error.
+//   - ServiceStatus.Error keeps the last Apply failure or runtime capture error
+//     until the next successful Apply. A failed Apply leaves a running service
+//     on its previous configuration.
 package proxy
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
+	"runtime"
 	"time"
 
 	"github.com/justinburger/mirage/internal/fault"
@@ -125,7 +175,9 @@ import (
 // Virtualizer serves recorded responses. *virtual.Engine implements it.
 type Virtualizer interface {
 	// Serve writes the recorded response and returns true, or returns false
-	// without writing on a miss.
+	// without writing on a miss. body holds at most Service.MaxBodyBytes of the
+	// request body (nil when the request has none or bodies are not captured)
+	// and is only valid during the call: implementations must not retain it.
 	Serve(w http.ResponseWriter, r *http.Request, body []byte) bool
 	// WriteMiss writes the configured miss response.
 	WriteMiss(w http.ResponseWriter, r *http.Request)
@@ -160,37 +212,37 @@ type Deps struct {
 	CaptureWorkers       int           // default runtime.GOMAXPROCS(0)
 }
 
-// Manager owns every service listener.
-type Manager struct{}
+// ErrClosed is returned by Manager methods that start or change services after
+// Shutdown.
+var ErrClosed = errors.New("proxy: manager is shut down")
 
-// NewManager returns a manager with no services.
-func NewManager(deps Deps) *Manager { panic("proxy: not implemented") }
+// Default capture pipeline sizes (see Deps).
+const (
+	defaultCaptureQueueSize     = 65536
+	defaultCaptureQueueBytes    = 256 << 20
+	defaultCaptureBatchSize     = 512
+	defaultCaptureFlushInterval = 250 * time.Millisecond
+)
 
-// Apply starts, reconfigures or stops a service to match svc (defaults are
-// applied with WithDefaults).
-func (m *Manager) Apply(ctx context.Context, svc model.Service) error {
-	panic("proxy: not implemented")
+// withDefaults returns d with zero-valued tunables replaced by their defaults.
+func (d Deps) withDefaults() Deps {
+	if d.Logger == nil {
+		d.Logger = slog.New(slog.DiscardHandler)
+	}
+	if d.CaptureQueueSize <= 0 {
+		d.CaptureQueueSize = defaultCaptureQueueSize
+	}
+	if d.CaptureQueueBytes <= 0 {
+		d.CaptureQueueBytes = defaultCaptureQueueBytes
+	}
+	if d.CaptureBatchSize <= 0 {
+		d.CaptureBatchSize = defaultCaptureBatchSize
+	}
+	if d.CaptureFlushInterval <= 0 {
+		d.CaptureFlushInterval = defaultCaptureFlushInterval
+	}
+	if d.CaptureWorkers <= 0 {
+		d.CaptureWorkers = runtime.GOMAXPROCS(0)
+	}
+	return d
 }
-
-// Remove stops a service, forgets it and removes its metrics collector.
-func (m *Manager) Remove(ctx context.Context, id string) error { panic("proxy: not implemented") }
-
-// Reload rebuilds a service's virtualizer from its recording.
-func (m *Manager) Reload(ctx context.Context, id string) error { panic("proxy: not implemented") }
-
-// ProfileChanged reloads the anonymizer of every service using profileID.
-func (m *Manager) ProfileChanged(ctx context.Context, profileID string) error {
-	panic("proxy: not implemented")
-}
-
-// Status returns a service's runtime status (zero Running if unknown).
-func (m *Manager) Status(id string) model.ServiceStatus { panic("proxy: not implemented") }
-
-// Statuses returns every known service's status.
-func (m *Manager) Statuses() []model.ServiceStatus { panic("proxy: not implemented") }
-
-// Handler returns the request handler of a running service (tests, embedding).
-func (m *Manager) Handler(id string) (http.Handler, bool) { panic("proxy: not implemented") }
-
-// Shutdown stops every listener and flushes captures.
-func (m *Manager) Shutdown(ctx context.Context) error { panic("proxy: not implemented") }

@@ -2,7 +2,9 @@
 
 The management UI in `web/static` is plain ES modules and CSS: there is no
 build step and no dependencies. This folder holds what you need to work on it
-without the Go backend.
+without the Go backend (the mock server below) and to check it against the
+real one (`real/up.sh` and the `real-*.mjs` scenarios, at the end of this
+file).
 
 ## Mock server
 
@@ -28,6 +30,10 @@ remote assets fail here too) and implements **every endpoint in
   as queueing, so corrected latency diverges from service time).
 * `GET /api/v1/stream` emitting `stats` every second, `services` on status
   changes and `replays` while jobs run.
+* The newer API fields: service `capture_sample` / `max_capture_bytes`, status
+  `capture_skipped` / `virtual_injected`, profile `opaque_bodies`, replay
+  `max_gap` / `seed` / stage `hold`, summary `max_in_flight` / `saturated` and the
+  `corrected_p95` / `corrected_p99` series.
 * Validation errors in the documented `{error, problems[]}` shape (400),
   duplicate names or ports (409), unknown JSON fields rejected (400), like the
   Go server.
@@ -112,3 +118,31 @@ web/static/assets/js/
   bodyview.js   JSON/hex body viewers, headers, exchange sections
   pages/        dashboard, services, recordings, replays (+form), profiles, faults, settings
 ```
+
+## Against the real server
+
+The mock can drift from the Go server, so the UI is also checked against the
+real thing. `real/up.sh` builds the binaries, starts demo-api and `mirage
+serve --config examples/mirage.yaml`, fills the recording with 35 s of traffic,
+and `real/seed.mjs` adds a virtual service, a latency fault and six replay jobs
+of every shape (timeline, staged ramp with a step, a saturated one with too few
+workers, error amplification, closed loop and one still running). Background
+traffic keeps the live charts moving. State goes to `$REAL_DIR` (default
+`$TMPDIR/mirage-ui-real`), including `ids.json` for the scenarios.
+
+```sh
+web/dev/real/up.sh                                    # http://127.0.0.1:8484
+node web/dev/run.mjs web/dev/scenarios/real.mjs       # every route: console errors, failed requests, error pages
+IGNORE_HTTP=1 node web/dev/run.mjs web/dev/scenarios/real-interactions.mjs
+OUT=docs/screenshots node web/dev/run.mjs web/dev/scenarios/real-screenshots.mjs --height 1180
+web/dev/real/down.sh
+```
+
+| Scenario | What it covers |
+|---|---|
+| `real.mjs` | opens all 23 routes (with real ids) and fails on console errors, uncaught exceptions, 4xx/5xx responses, and pages that ended in an error state |
+| `real-interactions.mjs` | the service page follows the stream (no polling of `GET /services/{id}`, counters move, an external mode change shows up), editing a service keeps fields the form does not show, the replay form in rate and timeline mode (stage steps, amplify only in timeline, `max_gap`, seed, server default concurrency), honest progress and the saturation warning, profile `opaque_bodies`. It changes demo data, so run `up.sh` again afterwards |
+| `real-screenshots.mjs` | the README screenshots in `docs/screenshots` |
+
+The interaction scenario drives replay jobs against the virtual service on
+`:9002`, so it also proves the whole path UI, API, replay engine, virtualizer.

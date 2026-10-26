@@ -102,6 +102,16 @@ export async function editor(ctx) {
   detStrategy.onChange(paintDetHelp); paintDetHelp();
   const setAllDetectors = (fn) => { detChecks.forEach((x) => { x.c.set(fn(x.d)); }); markChanged(); };
 
+  // --- opaque bodies
+  const OPAQUE_HELP = {
+    keep: 'Bodies the engine cannot inspect (binary content, bodies that are still compressed, binary multipart parts) are stored unchanged. Pick this when such bodies carry no personal data.',
+    fill: 'Bodies the engine cannot inspect are replaced by deterministic filler of the same length, so nothing readable survives and sizes stay realistic.',
+  };
+  const opaque = selectCtl([{ value: 'keep', label: 'keep unchanged' }, { value: 'fill', label: 'fill with same-length filler' }], { value: init.opaque_bodies || 'keep' });
+  const opaqueHelp = h('div', { class: 'field-help' });
+  const paintOpaqueHelp = () => { opaqueHelp.textContent = OPAQUE_HELP[opaque.get()] || ''; };
+  opaque.onChange(paintOpaqueHelp); paintOpaqueHelp();
+
   // --- headers
   const headers = chipsCtl({ value: init.redact_headers || [], placeholder: 'Add a header name and press Enter' });
   const headerSuggest = h('div', { class: 'row', style: 'gap:6px' }, h('span', { class: 'muted', style: 'font-size:12px' }, 'Quick add:'),
@@ -194,6 +204,7 @@ export async function editor(ctx) {
       detectors: detChecks.filter((x) => x.c.get()).map((x) => x.d.name),
       detector_strategy: detStrategy.get(),
       redact_headers: headers.get(),
+      opaque_bodies: opaque.get(),
       rules: rules.filter((r) => !forTest || r.selector.get().trim()).map((r) => {
         const st = r.strategy.get();
         return {
@@ -367,13 +378,14 @@ export async function editor(ctx) {
     btn('None', { size: 'sm', kind: 'ghost', onClick: () => setAllDetectors(() => false) }),
     btn('Recommended', { size: 'sm', kind: 'ghost', onClick: () => setAllDetectors((d) => d.name !== 'uuid') }));
   detChecks.forEach((x) => x.c.onChange(markChanged));
-  [name, desc, detStrategy, headers].forEach((c) => c.onChange(markChanged));
+  [name, desc, detStrategy, headers, opaque].forEach((c) => c.onChange(markChanged));
   const form = h('div', null,
     errHost,
     formSection('General', null, F.name, F.description),
     formSection('Detectors', 'Scan every textual value (bodies, query values, header and cookie values that are not already redacted) and transform what they find.',
       detBtns, detGrid, field('Detector strategy', detStrategy), detHelp),
     formSection('Redacted headers', 'These header values are always replaced with deterministic tokens. Authentication schemes such as "Bearer " are kept. Cookie and Set-Cookie are handled per cookie.', field('Headers', headers), headerSuggest),
+    formSection('Opaque bodies', 'What happens to bodies the engine cannot look inside.', field('Opaque bodies', opaque), opaqueHelp),
     formSection('Rules', 'Run before the detectors, in order. Use them for identifiers detectors cannot recognise.',
       rulesHost,
       btn('Add rule', { icon: 'plus', size: 'sm', onClick: () => { const r = makeRule({}); rules.push(r); paintRules(); r.selector.input.focus(); markChanged(); } })),

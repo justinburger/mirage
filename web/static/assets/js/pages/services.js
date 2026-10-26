@@ -200,16 +200,28 @@ export async function detail(ctx) {
     const hits = st.virtual_hits, misses = st.virtual_misses;
     const total = hits + misses;
     const virt = svc.mode === 'virtualize' || svc.mode === 'hybrid';
+    const rec = svc.mode === 'record' || svc.mode === 'hybrid';
     const snap = state.snapshots[`service:${svc.id}`];
-    statusHost.replaceChildren(h('div', { class: 'stat-grid cols-4' },
+    const cells = [
       cell('Status', st.running ? 'Running' : st.error ? 'Error' : 'Stopped', st.running && st.started_at ? `up ${relTime(st.started_at).replace(' ago', '')}` : '', st.running ? 'ok' : st.error ? 'err' : ''),
       cell('Listening on', st.addr || DASH, svc.listen_addr),
       cell('Requests / s', snap && st.running ? fmtRate(snap.rps) : DASH, snap ? `${fmtCompact(snap.requests)} total` : ''),
-      cell('Captured', fmtInt(st.captured), svc.mode === 'record' || svc.mode === 'hybrid' ? 'exchanges written' : 'not recording'),
-      cell('Capture dropped', fmtInt(st.capture_dropped), st.capture_dropped ? 'queue was full' : 'none', st.capture_dropped ? 'warn' : ''),
-      cell('Virtual hits', virt ? fmtInt(hits) : DASH, virt && total ? `${fmtPct(hits / total)} hit rate` : ''),
-      cell('Virtual misses', virt ? fmtInt(misses) : DASH, virt ? (svc.mode === 'hybrid' ? 'proxied and recorded' : `answered ${svc.match.miss_status}`) : '', virt && total && misses / total > 0.05 ? 'warn' : ''),
-      cell('Indexed', virt ? fmtInt(st.indexed_exchanges) : DASH, virt ? 'exchanges in index' : '')));
+    ];
+    if (rec) {
+      const sample = svc.capture_sample > 0 && svc.capture_sample < 1 ? ` (${fmtPct(svc.capture_sample, 0)} sampled)` : '';
+      cells.push(
+        cell('Captured', fmtInt(st.captured), `exchanges written${sample}`),
+        cell('Capture dropped', fmtInt(st.capture_dropped), st.capture_dropped ? 'queue was full' : 'none', st.capture_dropped ? 'warn' : ''),
+        cell('Capture skipped', fmtInt(st.capture_skipped), st.capture_skipped ? 'client left early, sampled out or over the limit' : 'none', ''));
+    }
+    if (virt) {
+      cells.push(
+        cell('Virtual hits', fmtInt(hits), total ? `${fmtPct(hits / total)} hit rate` : ''),
+        cell('Virtual misses', fmtInt(misses), svc.mode === 'hybrid' ? 'proxied and recorded' : `answered ${svc.match.miss_status}`, total && misses / total > 0.05 ? 'warn' : ''),
+        cell('Errors injected', fmtInt(st.virtual_injected), svc.error_amplification !== 1 || svc.error_floor > 0 ? `by ${svc.error_amplification}× amplification${svc.error_floor > 0 ? ` and ${fmtPct(svc.error_floor)} floor` : ''}` : 'amplification is off', ''),
+        cell('Indexed', fmtInt(st.indexed_exchanges), 'exchanges in index'));
+    }
+    statusHost.replaceChildren(h('div', { class: 'stat-grid cols-4' }, ...cells));
   }
 
   // --- charts
@@ -258,6 +270,8 @@ export async function detail(ctx) {
           ['Endpoint patterns', tag(svc.endpoint_patterns) || DASH],
           ['Timeout', durText(svc.timeout) || DASH],
           ['Max captured body', svc.max_body_bytes === -1 ? 'bodies not captured' : fmtBytes(svc.max_body_bytes)],
+          ['Capture sampling', svc.capture_sample > 0 && svc.capture_sample < 1 ? `${fmtPct(svc.capture_sample, 0)} of requests` : 'every request'],
+          ['Capture limit', svc.max_capture_bytes > 0 ? `${fmtBytes(svc.max_capture_bytes)} of bodies` : 'none'],
           ['Preserve Host', svc.preserve_host ? 'yes' : 'no'],
           ['Skip TLS verify', svc.insecure_skip_verify ? 'yes' : 'no'],
         ]),
@@ -283,27 +297,47 @@ export async function detail(ctx) {
     paintAll();
   }
   paintAll();
-  // live updates
+  // Live updates come from the stream: the `services` event carries the live
+  // counters of every service once a second and `stats` the traffic series,
+  // so the page needs no polling. A change of mode or of the running state
+  // (enabled, disabled, a crashed listener) also means the configuration may
+  // have changed, so it is fetched again.
+  let seenMode = svc.status.mode;
+  let seenRunning = svc.status.running;
+  let reloading = false;
   ctx.on('stats', (evt) => {
     const p = evt.points[`service:${svc.id}`];
     if (p) charts.push(pointToRow(p));
+    paintStatus();
     paintEndpoints();
   });
+  // The recording's exchange count is refreshed (at most every 10 s) when the
+  // service has captured something new, rather than on a timer.
+  let recFetched = Date.now();
+  let capturedAtFetch = svc.status.captured;
+  async function refreshRecording() {
+    if (!svc.recording_id) return;
+    recFetched = Date.now();
+    capturedAtFetch = svc.status.captured;
+    try {
+      const fresh = await api.recording(svc.recording_id);
+      if (!ctx.isActive()) return;
+      const i = recs.findIndex((r) => r.id === fresh.id);
+      if (i >= 0) recs[i] = fresh; else recs.push(fresh);
+      paintMode();
+    } catch (_) { /* the recording may have been deleted meanwhile */ }
+  }
   ctx.on('services', () => {
     const cur = serviceById(svc.id);
-    if (cur) { svc = { ...svc, status: cur.status }; paintHeader(); paintStatus(); }
+    if (!cur) return;
+    svc = { ...svc, status: cur.status };
+    paintHeader(); paintStatus();
+    if (cur.status.captured !== capturedAtFetch && Date.now() - recFetched > 10000) refreshRecording();
+    if (cur.status.mode !== seenMode || cur.status.running !== seenRunning) {
+      seenMode = cur.status.mode; seenRunning = cur.status.running;
+      if (!reloading) { reloading = true; reload().finally(() => { reloading = false; }); }
+    }
   });
-  ctx.every(async () => {
-    try {
-      const fresh = await api.service(id);
-      if (!ctx.isActive()) return;
-      const modeChanged = fresh.mode !== svc.mode || fresh.enabled !== svc.enabled || fresh.recording_id !== svc.recording_id;
-      svc = fresh;
-      paintStatus();
-      paintHeader();
-      if (modeChanged) { paintMode(); paintConfig(); }
-    } catch (_) { /* ignore transient errors */ }
-  }, 3000);
 
   return root;
 }

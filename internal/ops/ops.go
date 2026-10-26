@@ -2,64 +2,89 @@
 // the CLI: anonymized copies, HAR import/export, and loading engines and
 // fault rules from the store.
 //
-// CONTRACT (implemented by the api agent):
+// # Behaviour
 //
-//   - Everything streams: iterate with store.IterateExchanges and write in
-//     batches of 500 with store.AppendExchanges; never hold a whole
-//     recording in memory. Respect ctx cancellation between batches.
-//   - CopyAnonymized creates the destination recording (Source "copy",
-//     Anonymized true, Description noting the source and profile) before
-//     copying; on error it deletes the partial destination.
-//   - ImportHAR creates a recording (Source "har"), streams entries with
-//     har.DecodeEntries (constant memory), converts them with
-//     har.ToExchange (skipping entries whose error wraps har.ErrUnsupported,
-//     e.g. data: URLs, and counting them in the recording description), fills
-//     Endpoint with the normalizer from the raw escaped path BEFORE
-//     anonymizing, anonymizes when eng is non-nil and appends in batches.
-//   - ExportHAR streams with har.Encoder, anonymizing each exchange first
-//     when eng is non-nil.
-//   - LoadEngine reads the profile (profileID "" = model.DefaultProfileID),
-//     applies WithDefaults and builds anonymize.New. A stored profile without
-//     a secret is an error (tokens would not be stable).
-//   - LoadFaults reads every fault rule and calls inj.SetRules.
+// Everything streams. Recordings are read with store.IterateExchanges and
+// written with store.AppendExchanges in batches (500 exchanges or about 8 MiB
+// of bodies, whichever comes first), so memory use does not depend on the size
+// of the recording. Cancelling the context stops an operation between
+// exchanges.
+//
+// Operations that create a recording (CopyAnonymized, ImportHAR) are
+// all-or-nothing: when they fail after the destination was created, the
+// partial destination is deleted again (on a context that survives the
+// caller's cancellation) and the original error is returned.
+//
+//   - CopyAnonymized creates a recording with Source "copy" and Anonymized
+//     true, whose description names the source recording and the profile.
+//   - ImportHAR creates a recording with Source "har". Entries are decoded one
+//     at a time with har.DecodeEntries and converted with har.ToExchange.
+//     Entries that are not HTTP(S) exchanges (data: URLs and the like, errors
+//     wrapping har.ErrUnsupported) are skipped and counted in the
+//     recording's description; any other conversion error fails the import
+//     with an error wrapping model.ErrValidation that names the entry. The
+//     Endpoint of every exchange is computed from the raw escaped path before
+//     anonymization. Malformed HAR input yields an error wrapping
+//     model.ErrValidation; a failure of the reader itself (a dropped upload,
+//     a size limit) is returned as is, wrapped with context.
+//   - ExportHAR streams with har.Encoder through a buffered writer. It does
+//     not finish the document when it fails midway, so a truncated export is
+//     recognisably invalid JSON rather than a plausible short HAR.
+//   - LoadEngine builds the engine of a stored profile; LoadFaults copies the
+//     stored fault rules into an injector.
+//
+// Errors wrap the sentinels in package model (ErrNotFound, ErrValidation, ...)
+// so the API can map them to HTTP status codes.
 package ops
 
 import (
 	"context"
-	"io"
+	"errors"
+	"fmt"
 
 	"github.com/justinburger/mirage/internal/anonymize"
 	"github.com/justinburger/mirage/internal/fault"
 	"github.com/justinburger/mirage/internal/model"
-	"github.com/justinburger/mirage/internal/pathnorm"
 	"github.com/justinburger/mirage/internal/store"
 )
 
 // Progress reports exchanges processed so far (may be nil).
 type Progress func(done int64)
 
-// CopyAnonymized copies recording srcID into a new recording named name,
-// anonymizing every exchange with eng.
-func CopyAnonymized(ctx context.Context, st store.Store, srcID string, eng *anonymize.Engine, name string, progress Progress) (model.Recording, error) {
-	panic("ops: not implemented")
-}
-
-// ImportHAR imports a HAR document into a new recording.
-func ImportHAR(ctx context.Context, st store.Store, r io.Reader, name string, eng *anonymize.Engine, n *pathnorm.Normalizer) (model.Recording, error) {
-	panic("ops: not implemented")
-}
-
-// ExportHAR writes a recording as a HAR document.
-func ExportHAR(ctx context.Context, st store.Store, recordingID string, w io.Writer, eng *anonymize.Engine, version string) error {
-	panic("ops: not implemented")
-}
-
 // LoadEngine builds the anonymization engine for a stored profile.
+// An empty profileID selects model.DefaultProfileID. A stored profile without
+// a secret is an error, because its tokens would not be stable.
 func LoadEngine(ctx context.Context, st store.Store, profileID string) (*anonymize.Engine, error) {
-	panic("ops: not implemented")
+	if profileID == "" {
+		profileID = model.DefaultProfileID
+	}
+	p, err := st.GetProfile(ctx, profileID)
+	if err != nil {
+		return nil, fmt.Errorf("ops: load profile %q: %w", profileID, err)
+	}
+	if p.Secret == "" {
+		return nil, fmt.Errorf("ops: profile %q has no secret, so anonymized tokens would not be stable; regenerate its secret", profileID)
+	}
+	eng, err := anonymize.New(p.WithDefaults())
+	if err != nil {
+		return nil, fmt.Errorf("ops: profile %q: %w", profileID, err)
+	}
+	return eng, nil
 }
 
-// LoadFaults loads every stored fault rule into the injector.
+// LoadFaults loads every stored fault rule into the injector, replacing its
+// rule set. When the stored rules are invalid the injector keeps its previous
+// rules and the returned error wraps a *model.ValidationError.
 func LoadFaults(ctx context.Context, st store.Store, inj *fault.Injector) error {
-	panic("ops: not implemented")
+	if inj == nil {
+		return errors.New("ops: load fault rules: nil injector")
+	}
+	rules, err := st.ListFaultRules(ctx)
+	if err != nil {
+		return fmt.Errorf("ops: load fault rules: %w", err)
+	}
+	if err := inj.SetRules(rules); err != nil {
+		return fmt.Errorf("ops: load fault rules: %w", err)
+	}
+	return nil
 }

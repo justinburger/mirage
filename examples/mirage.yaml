@@ -1,0 +1,214 @@
+# Mirage example configuration: record the demo API, anonymize what is captured
+# and keep two fault rules ready for later.
+#
+#   go run ./examples/demo-api -addr :7001 -v     # the fake e-commerce API
+#   mirage serve --config examples/mirage.yaml    # or: make demo
+#   go run ./examples/trafficgen -target http://127.0.0.1:9001 -rps 20 -duration 30s
+#
+# Then open http://127.0.0.1:8484 to watch the traffic and browse the recording.
+#
+# FILE FORMAT
+#   - YAML or JSON (.json); the field names are those of the management API
+#     (docs/API.md). Unknown fields are errors.
+#   - ${VAR} and ${VAR:-default} are replaced with environment variables
+#     before the file is parsed (write $${ for a literal ${). A variable that
+#     is not set and has no default is an error. Comment lines are not expanded.
+#   - Durations are strings such as "250ms" or "1m30s"; a bare number means
+#     milliseconds.
+#   - The file is applied at start-up. Objects are matched by name: an existing
+#     service, profile or fault rule with the same name keeps its id and is
+#     overwritten with the definition below; objects that are not in the file
+#     are left alone. Applying the same file twice changes nothing.
+#   - `enabled` is false when you leave it out, for services and rules alike.
+
+# ---------------------------------------------------------------------------
+# server: process settings. They are the defaults for the command line flags;
+# a flag given explicitly on the command line wins.
+# ---------------------------------------------------------------------------
+server:
+  # Address of the admin web UI, JSON API and /metrics.
+  admin: 127.0.0.1:8484
+  # SQLite database holding recordings, profiles, services and replays.
+  data: ./mirage.db
+  # Bearer token required by the admin API. Empty means no authentication,
+  # which is fine on localhost. Prefer passing it through the environment.
+  admin_token: ${MIRAGE_ADMIN_TOKEN:-}
+  # debug, info, warn or error.
+  log_level: info
+  # text or json.
+  log_format: text
+
+# ---------------------------------------------------------------------------
+# recordings: make sure these recordings exist. A recording that is created
+# here can be pre-filled from a HAR file (path relative to this file); an
+# existing recording is left untouched. Recordings that a service names but
+# that are not listed here are created empty.
+# ---------------------------------------------------------------------------
+recordings:
+  - name: demo-capture
+    description: Traffic captured from the demo API through the "demo" service
+    # har: captures/browser-session.har
+
+# ---------------------------------------------------------------------------
+# profiles: anonymization profiles. Rules run first, in order, then the
+# detectors look for PII in everything that is left. hash and fake are keyed
+# by the profile's secret, so the same input always gives the same output.
+# The secret is generated when the profile is created and kept when this file
+# is applied again; set `secret:` only if you need it fixed.
+# ---------------------------------------------------------------------------
+profiles:
+  - name: strict
+    description: Fakes people and card data, masks account tails, hashes credentials
+    # Built-in detectors: email, credit_card, ssn, phone, ipv4, ipv6, jwt,
+    # aws_key, iban, uuid.
+    detectors: [email, credit_card, ssn, phone, ipv4, jwt, aws_key, iban]
+    # What a detector match becomes: redact, remove, hash, fake or mask.
+    detector_strategy: fake
+    # Headers whose values are always replaced by stable hash tokens
+    # (Cookie and Set-Cookie are handled per cookie).
+    redact_headers: [Authorization, Cookie, Set-Cookie, X-Api-Key, X-Forwarded-For]
+    # keep: store bodies Mirage cannot inspect (binary, still compressed)
+    # unchanged. fill: replace them with same-length filler.
+    opaque_bodies: keep
+    rules:
+      # target: header | query | cookie | json | form | regex | path
+      # scope:  both (default) | request | response
+      - name: customer email
+        enabled: true
+        target: json
+        selector: $..email
+        strategy: fake
+        fake: email
+      - name: customer name
+        enabled: true
+        target: json
+        selector: $.users[*].name
+        strategy: fake
+        fake: name
+      - name: card number
+        enabled: true
+        target: json
+        selector: $..card_number
+        scope: request
+        strategy: fake
+        fake: credit_card
+      - name: card tail
+        enabled: true
+        target: json
+        selector: $..last4
+        strategy: mask
+        keep_suffix: 2
+      - name: login password
+        enabled: true
+        target: json
+        selector: $.password
+        scope: request
+        strategy: redact
+        replacement: "[REDACTED]"
+      - name: login token
+        enabled: true
+        target: json
+        selector: $.token
+        scope: response
+        strategy: hash
+
+# ---------------------------------------------------------------------------
+# services: virtual services. Each listens on listen_addr and sits in front of
+# an upstream API.
+# ---------------------------------------------------------------------------
+services:
+  - name: demo
+    listen_addr: ":9001"
+    upstream: http://127.0.0.1:7001
+    # passthrough: proxy only | record: proxy and capture | virtualize: answer
+    # from the recording, never contact the upstream | hybrid: virtualize,
+    # proxy and record the misses.
+    mode: record
+    # Whether the listener runs.
+    enabled: true
+    # Recording (by name) to write in record and hybrid mode and to serve in
+    # virtualize and hybrid mode.
+    recording: demo-capture
+    # Anonymize exchanges before they are written to disk, with the profile
+    # named below (by name; leave out for the built-in "default" profile).
+    anonymize_capture: true
+    profile: strict
+    # Path templates used to group requests into endpoints for metrics and
+    # template matching. Without them Mirage detects ids, UUIDs and hashes.
+    endpoint_patterns:
+      - /api/users/{id}
+      - /api/products/{id}
+      - /api/orders/{uuid}
+    # How long to wait for the upstream's response headers.
+    timeout: 30s
+    # Largest request/response body that is captured (bytes; traffic itself is
+    # never truncated). 0 means 1 MiB, -1 means do not capture bodies.
+    max_body_bytes: 1048576
+    # Fraction of requests to capture (0 means all) and a cap on the captured
+    # body bytes of the recording (0 means no cap).
+    capture_sample: 1
+    max_capture_bytes: 0
+    # Send the client's Host header upstream instead of the upstream's own.
+    preserve_host: false
+    # Accept self-signed upstream certificates (https upstreams only).
+    insecure_skip_verify: false
+    # tls:
+    #   self_signed: true          # serve https with a generated certificate
+    #   cert_file: server.crt      # or use your own pair
+    #   key_file: server.key
+
+    # The settings below only matter in virtualize and hybrid mode.
+    match:
+      query: exact            # exact | ignore | subset
+      ignore_params: [_ts]    # query parameters to disregard
+      body: json              # ignore | exact | json (semantic equality)
+      headers: []             # request headers that must match too
+      path_templates: true    # GET /users/7 may answer for a recorded /users/42
+      selection: sequential   # sequential | random | first
+      miss_status: 404        # status for requests that match nothing
+    latency:
+      mode: recorded          # none | recorded | fixed
+      multiplier: 1           # 2 = twice as slow as recorded
+      fixed: 0s               # delay for mode fixed
+      jitter: 0s              # +/- random offset
+    # Raise the recorded per-endpoint error rate (10 = ten times as many
+    # errors) and set a minimum error rate for endpoints that never failed.
+    error_amplification: 1
+    error_floor: 0
+
+# ---------------------------------------------------------------------------
+# faults: fault injection. Rules apply in every mode, before the request is
+# proxied or virtualized. Every enabled matching rule fires independently with
+# its probability; latency adds up and the first terminal fault wins.
+# These two are switched off: set `enabled: true` (or use the web UI) to try
+# them.
+# ---------------------------------------------------------------------------
+faults:
+  - name: orders 10% 503
+    enabled: false
+    # Lower numbers are evaluated first.
+    order: 10
+    # Limit the rule to one service (by name or id); leave out for all of them.
+    service_id: demo
+    # methods: [POST]            # limit to these HTTP methods
+    # "*" is one path segment, "**" any number; prefix with re: for a regex.
+    path_pattern: /api/orders/**
+    # Fraction of matching requests that get the fault (0..1).
+    probability: 0.10
+    # latency | error | abort | timeout | throttle
+    type: error
+    status: 503
+    body: '{"error":"overloaded","status":503}'
+    response_headers:
+      Content-Type: application/json
+      Retry-After: "1"
+  - name: search +200ms
+    enabled: false
+    order: 20
+    service_id: demo
+    path_pattern: /api/search
+    probability: 1.0
+    type: latency
+    # Added to the request before it is handled: delay +/- jitter.
+    delay: 200ms
+    jitter: 50ms

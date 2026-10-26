@@ -1,0 +1,453 @@
+package virtual
+
+import (
+	"hash/maphash"
+	"net/http"
+	"slices"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/justinburger/mirage/internal/model"
+)
+
+// Match levels as indices into counters.level.
+const (
+	levelExact = iota
+	levelPath
+	levelTemplate
+)
+
+// Key prefixes keep the three levels apart inside one map.
+const (
+	keyExact    = 'e'
+	keyPath     = 'p'
+	keyTemplate = 't'
+)
+
+// shard is one slice of the index. Padded so neighbouring shards never share
+// a cache line (the RWMutex reader count is written on every lookup).
+type shard struct {
+	mu sync.RWMutex
+	m  map[string]*entry
+	_  [32]byte
+}
+
+// counters are the activity counters of one stripe, padded to two cache
+// lines. A lookup bumps the stripe chosen by its exact-level key hash.
+type counters struct {
+	hits, misses, injected atomic.Int64
+	level                  [3]atomic.Int64
+	_                      [80]byte
+}
+
+// entry holds the candidates of one key. cands is guarded by the shard lock
+// (readers copy the slice header under RLock and then use it lock-free): it is
+// replaced, never edited in place, once a reader may have seen it. cursor is
+// the sequential position.
+type entry struct {
+	cands    []*item
+	cursor   atomic.Uint64
+	unsorted bool // Build only: cands needs sorting before use
+}
+
+// item is one servable exchange. It is immutable once indexed.
+type item struct {
+	ex        *model.Exchange // full when resident, without bodies when lazy
+	id        int64
+	status    int
+	isErr     bool
+	gzip      bool // response may be re-encoded as gzip
+	ttfb, dur time.Duration
+	ep        *epool
+	hdrs      []hdr      // response headers to copy
+	body      *bodyEntry // resident body; nil in lazy mode
+	params    []param    // recorded query parameters (subset matching only)
+}
+
+// hdr is one response header to copy to the client.
+type hdr struct {
+	key  string
+	vals []string
+}
+
+// before reports whether a sorts before b in (StartedAt, Seq) order.
+func before(a, b *item) bool {
+	if c := a.ex.StartedAt.Compare(b.ex.StartedAt); c != 0 {
+		return c < 0
+	}
+	return a.ex.Seq < b.ex.Seq
+}
+
+func cmpItems(a, b *item) int {
+	switch {
+	case before(a, b):
+		return -1
+	case before(b, a):
+		return 1
+	}
+	return 0
+}
+
+// add inserts it in (StartedAt, Seq) order. With bulk set (Build, before the
+// engine is shared) out-of-order items are appended and the entry is marked
+// for sorting by finalize.
+func (en *entry) add(it *item, bulk bool) {
+	n := len(en.cands)
+	if n == 0 || !before(it, en.cands[n-1]) {
+		// Appending is safe for readers holding the old slice header: they
+		// never look beyond their own length.
+		en.cands = append(en.cands, it)
+		return
+	}
+	if bulk {
+		en.cands = append(en.cands, it)
+		en.unsorted = true
+		return
+	}
+	i := sort.Search(n, func(i int) bool { return before(it, en.cands[i]) })
+	nc := make([]*item, n+1)
+	copy(nc, en.cands[:i])
+	nc[i] = it
+	copy(nc[i+1:], en.cands[i:])
+	en.cands = nc
+}
+
+// put adds it to the entry for key.
+func (e *Engine) put(key []byte, it *item, bulk bool) {
+	sh := &e.shards[maphash.Bytes(e.seed, key)&(numShards-1)]
+	sh.mu.Lock()
+	en := sh.m[string(key)]
+	if en == nil {
+		en = new(entry)
+		sh.m[string(key)] = en
+	}
+	en.add(it, bulk)
+	sh.mu.Unlock()
+}
+
+// finalize sorts the candidate lists Build left unsorted and publishes the
+// endpoint pools.
+func (e *Engine) finalize() {
+	for i := range e.shards {
+		sh := &e.shards[i]
+		sh.mu.Lock()
+		for _, en := range sh.m {
+			if en.unsorted {
+				slices.SortStableFunc(en.cands, cmpItems)
+				en.unsorted = false
+			}
+		}
+		sh.mu.Unlock()
+	}
+	e.epMu.Lock()
+	for _, ep := range e.eps {
+		ep.publish()
+	}
+	e.epMu.Unlock()
+}
+
+// upperMethod returns the request method in canonical (upper) case; "" is GET.
+func upperMethod(m string) string {
+	if m == "" {
+		return http.MethodGet
+	}
+	return strings.ToUpper(m)
+}
+
+// insert indexes one exchange. With bulk set the caller is Build and the
+// engine is not shared yet.
+func (e *Engine) insert(ex *model.Exchange, bulk bool) {
+	method := upperMethod(ex.Request.Method)
+	path := ex.Request.Path
+	if path == "" {
+		path = "/"
+	}
+	endpoint := ex.Endpoint
+	if endpoint == "" {
+		endpoint = e.norm.Endpoint(method, path)
+	}
+	ep := e.endpointPool(endpoint)
+	e.count.Add(1)
+
+	isErr := ex.IsError()
+	if ex.Error != "" {
+		// No upstream response: never served, but part of the error rate.
+		ep.record(nil, isErr, !bulk)
+		return
+	}
+
+	// Request-side keys come from the request body, so compute them before
+	// the exchange is trimmed.
+	var sb [192]byte
+	suffix := e.appendSuffix(sb[:0], ex.Request.RawQuery, ex.Request.Body, ex.Request.Header)
+	var params []param
+	if e.cfg.subset {
+		params = e.parseParams(ex.Request.RawQuery, nil, true, true)
+	}
+
+	size := int64(len(ex.Request.Body) + len(ex.Response.Body))
+	lazyItem := e.st != nil && ex.ID != 0 && (e.lazy || e.resident.Load()+size > e.opts.MaxResidentBytes)
+	it := newItem(ex, lazyItem)
+	it.ep = ep
+	it.params = params
+	if lazyItem {
+		it.id = ex.ID
+	} else {
+		e.resident.Add(size)
+	}
+	ep.record(it, isErr, !bulk)
+
+	var kb [320]byte
+	key := append(kb[:0], keyExact)
+	key = append(key, method...)
+	key = append(key, 0)
+	key = append(key, path...)
+	key = append(key, 0)
+	key = append(key, suffix...)
+	e.put(key, it, bulk)
+
+	if !e.cfg.pathSame {
+		key = append(kb[:0], keyPath)
+		key = append(key, method...)
+		key = append(key, 0)
+		key = append(key, path...)
+		e.put(key, it, bulk)
+	}
+	if e.cfg.templates {
+		key = append(kb[:0], keyTemplate)
+		key = append(key, endpoint...)
+		e.put(key, it, bulk)
+	}
+}
+
+// newItem builds the indexed form of ex. In lazy mode the item keeps a copy of
+// the exchange without bodies.
+func newItem(ex *model.Exchange, lazy bool) *item {
+	it := &item{
+		status: ex.Response.Status,
+		isErr:  ex.IsError(),
+		gzip:   ex.Response.ContentEncoding == "gzip",
+		ttfb:   ex.TTFB.D(),
+		dur:    ex.Duration.D(),
+		hdrs:   buildHeaders(ex.Response.Header, ex.Response.ContentEncoding != ""),
+	}
+	if lazy {
+		c := *ex
+		c.Request.Body = nil
+		c.Response.Body = nil
+		it.ex = &c
+	} else {
+		it.ex = ex
+		it.body = &bodyEntry{raw: ex.Response.Body}
+	}
+	return it
+}
+
+// buildHeaders returns the response headers worth copying: canonical keys
+// without hop-by-hop headers, Content-Length and Date (recomputed), the
+// headers a Connection header names, and Content-Encoding when the body was
+// stored decoded.
+func buildHeaders(h http.Header, decoded bool) []hdr {
+	if len(h) == 0 {
+		return nil
+	}
+	var named []string
+	if conn := h["Connection"]; len(conn) > 0 {
+		for _, v := range conn {
+			for tok := range strings.SplitSeq(v, ",") {
+				if tok = strings.TrimSpace(tok); tok != "" {
+					named = append(named, http.CanonicalHeaderKey(tok))
+				}
+			}
+		}
+	}
+	out := make([]hdr, 0, len(h))
+	for k, vals := range h {
+		ck := http.CanonicalHeaderKey(k)
+		if len(vals) == 0 || skipHeader(ck, decoded) || slices.Contains(named, ck) {
+			continue
+		}
+		if ck != k {
+			// Merge keys that differ only in case.
+			if i := slices.IndexFunc(out, func(x hdr) bool { return x.key == ck }); i >= 0 {
+				out[i].vals = append(slices.Clone(out[i].vals), vals...)
+				continue
+			}
+		}
+		out = append(out, hdr{key: ck, vals: vals})
+	}
+	slices.SortFunc(out, func(a, b hdr) int { return strings.Compare(a.key, b.key) })
+	return out
+}
+
+// skipHeader reports whether the canonical header key must not be copied from
+// a recorded response.
+func skipHeader(k string, decoded bool) bool {
+	switch k {
+	case "Connection", "Keep-Alive", "Te", "Trailer", "Transfer-Encoding", "Upgrade",
+		"Content-Length", "Date":
+		return true
+	case "Content-Encoding":
+		return decoded
+	}
+	return strings.HasPrefix(k, "Proxy-")
+}
+
+// lookup finds the response for r and fills m. It counts hits and misses.
+func (e *Engine) lookup(r *http.Request, body []byte, m *Match) bool {
+	method := upperMethod(r.Method)
+	path, rawQuery := "/", ""
+	if r.URL != nil {
+		path, rawQuery = r.URL.EscapedPath(), r.URL.RawQuery
+		if path == "" {
+			path = "/"
+		}
+	}
+	body = e.requestBody(r, body)
+
+	var sb [192]byte
+	suffix := e.appendSuffix(sb[:0], rawQuery, body, r.Header)
+	var req []param
+	if e.cfg.subset {
+		var pb [8]param
+		req = e.parseParams(rawQuery, pb[:0], false, false)
+	}
+
+	var kb [320]byte
+	key := append(kb[:0], keyExact)
+	key = append(key, method...)
+	key = append(key, 0)
+	key = append(key, path...)
+	key = append(key, 0)
+	key = append(key, suffix...)
+	h := maphash.Bytes(e.seed, key)
+	stripe := &e.stats[h&(numShards-1)]
+
+	ok := e.find(h, key, path, method, req, m)
+	if !ok && method == http.MethodHead {
+		// A HEAD request is answered from the GET recording when no HEAD was
+		// recorded.
+		key = append(kb[:0], keyExact)
+		key = append(key, http.MethodGet...)
+		key = append(key, 0)
+		key = append(key, path...)
+		key = append(key, 0)
+		key = append(key, suffix...)
+		ok = e.find(maphash.Bytes(e.seed, key), key, path, http.MethodGet, req, m)
+	}
+	if !ok {
+		stripe.misses.Add(1)
+		return false
+	}
+	stripe.hits.Add(1)
+	stripe.level[levelOf(m.Level)].Add(1)
+	if e.cfg.ampOn {
+		e.amplify(m)
+		if m.Injected {
+			stripe.injected.Add(1)
+		}
+	}
+	return true
+}
+
+func levelOf(name string) int {
+	switch name {
+	case LevelExact:
+		return levelExact
+	case LevelPath:
+		return levelPath
+	}
+	return levelTemplate
+}
+
+// find walks the match levels for one method. key is the exact-level key and
+// h its hash.
+func (e *Engine) find(h uint64, key []byte, path, method string, req []param, m *Match) bool {
+	if it := e.probe(h, key, req); it != nil {
+		m.set(it, LevelExact)
+		return true
+	}
+	var kb [320]byte
+	if !e.cfg.pathSame {
+		k := append(kb[:0], keyPath)
+		k = append(k, method...)
+		k = append(k, 0)
+		k = append(k, path...)
+		if it := e.probe(maphash.Bytes(e.seed, k), k, req); it != nil {
+			m.set(it, LevelPath)
+			return true
+		}
+	}
+	if e.cfg.templates {
+		k := append(kb[:0], keyTemplate)
+		k = append(k, method...)
+		k = append(k, ' ')
+		k = append(k, e.norm.Template(path)...)
+		if it := e.probe(maphash.Bytes(e.seed, k), k, req); it != nil {
+			m.set(it, LevelTemplate)
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Match) set(it *item, level string) {
+	*m = Match{Exchange: it.ex, Level: level, it: it, ttfb: it.ttfb, dur: it.dur}
+}
+
+// probe returns the candidate chosen for key, or nil.
+func (e *Engine) probe(h uint64, key []byte, req []param) *item {
+	sh := &e.shards[h&(numShards-1)]
+	sh.mu.RLock()
+	en := sh.m[string(key)]
+	var cands []*item
+	if en != nil {
+		cands = en.cands
+	}
+	sh.mu.RUnlock()
+	if len(cands) == 0 {
+		return nil
+	}
+	if !e.cfg.subset {
+		return cands[e.pick(en, len(cands))]
+	}
+	n := 0
+	for _, c := range cands {
+		if subsetOf(c.params, req) {
+			n++
+		}
+	}
+	if n == 0 {
+		return nil
+	}
+	k := e.pick(en, n)
+	for _, c := range cands {
+		if subsetOf(c.params, req) {
+			if k == 0 {
+				return c
+			}
+			k--
+		}
+	}
+	return nil
+}
+
+// pick returns an index in [0, n) according to the selection strategy.
+func (e *Engine) pick(en *entry, n int) int {
+	if n == 1 {
+		if e.cfg.selection == model.SelectSequential {
+			en.cursor.Add(1)
+		}
+		return 0
+	}
+	switch e.cfg.selection {
+	case model.SelectFirst:
+		return 0
+	case model.SelectRandom:
+		return e.rng.intn(n)
+	}
+	return int((en.cursor.Add(1) - 1) % uint64(n))
+}

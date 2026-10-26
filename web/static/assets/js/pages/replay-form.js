@@ -43,10 +43,12 @@ export async function create(ctx) {
   const rateKind = segmentedCtl([{ value: 'constant', label: 'Constant rate' }, { value: 'stages', label: 'Stages (ramp)' }], { value: cfg.stages && cfg.stages.length ? 'stages' : 'constant', label: 'Rate shape', size: 'sm' });
   const rate = numCtl({ value: cfg.rate || 100, min: 0, step: 1, unit: 'req/s' });
   const rateDuration = durCtl({ value: durText(cfg.duration) || '2m', placeholder: '2m' });
-  const maxConc = numCtl({ value: cfg.concurrency || 256, min: 1, step: 1, unit: 'workers' });
+  const maxConc = numCtl({ value: (cfg.mode === 'max' && cfg.concurrency) || 64, min: 1, step: 1, unit: 'workers' });
   const amplify = sliderCtl({ min: 1, max: 100, step: 1, log: true, value: cfg.amplify || 1, presets: [1, 2, 5, 10], format: (v) => `${v}×`, numMin: 1, numMax: 1000 });
   const errAmp = sliderCtl({ min: 0.1, max: 100, step: 0.1, log: true, value: cfg.error_amplification || 1, presets: [1, 2, 5, 10], format: (v) => `${v}×`, numMin: 0.01, numMax: 1000 });
-  const concurrency = numCtl({ value: cfg.concurrency || 256, min: 1, step: 1, unit: 'in flight' });
+  const concurrency = numCtl({ value: (cfg.mode !== 'max' && cfg.concurrency) || 2048, min: 1, step: 1, unit: 'in flight' });
+  const maxGap = durCtl({ value: durText(cfg.max_gap), placeholder: 'optional, e.g. 5s' });
+  const seed = numCtl({ value: cfg.seed || '', min: 0, step: 1, placeholder: 'random (kept for re-runs)' });
   const duration = durCtl({ value: durText(cfg.duration), placeholder: 'optional, e.g. 5m' });
   const loop = switchCtl({ label: 'Loop the recording', help: 'Start over when the recording ends. Needs a duration or a request cap.', checked: !!cfg.loop });
   const maxReq = numCtl({ value: cfg.max_requests || '', min: 0, step: 1, placeholder: '0 = no cap' });
@@ -64,25 +66,28 @@ export async function create(ctx) {
   // stages editor
   const stagesHost = h('div', { class: 'stack-sm' });
   const stageRows = [];
-  function addStage(d = '', r = '') {
+  function addStage(d = '', r = '', hold = false) {
     const dur = durCtl({ value: d, placeholder: '30s' });
     const rt = numCtl({ value: r, min: 0, step: 1, placeholder: '500', unit: 'req/s' });
+    const step = switchCtl({ label: 'Step', checked: hold });
+    step.el.title = 'Jump straight to the target rate instead of ramping up to it';
     const num = h('div', { class: 'rule-num' });
     const row = h('div', { class: 'stage-row' }, num, field('Duration', dur), field('Target rate', rt),
+      h('div', { class: 'stage-step' }, step.el),
       h('div', { style: 'margin-bottom:2px' }, iconBtn('x', 'Remove stage', () => { const i = stageRows.indexOf(entry); stageRows.splice(i, 1); row.remove(); renumber(); paintPlan(); })));
-    const entry = { dur, rt, row, num };
-    dur.onChange(paintPlan); rt.onChange(paintPlan);
+    const entry = { dur, rt, step, row, num };
+    dur.onChange(paintPlan); rt.onChange(paintPlan); step.onChange(paintPlan);
     stageRows.push(entry);
     stagesHost.appendChild(row);
     renumber();
   }
   function renumber() { stageRows.forEach((s, i) => { s.num.textContent = String(i + 1); }); }
-  if (cfg.stages && cfg.stages.length) cfg.stages.forEach((s) => addStage(durText(s.duration), s.rate));
+  if (cfg.stages && cfg.stages.length) cfg.stages.forEach((s) => addStage(durText(s.duration), s.rate, !!s.hold));
   else { addStage('30s', 500); addStage('2m', 2000); }
   const rampHost = h('div');
   const stagesBlock = h('div', { class: 'stack-sm' }, stagesHost,
     h('div', { class: 'row-between' }, btn('Add stage', { icon: 'plus', size: 'sm', onClick: () => { const last = stageRows[stageRows.length - 1]; addStage('1m', last && last.rt.get() ? last.rt.get() : 1000); paintPlan(); } }),
-      h('span', { class: 'muted', style: 'font-size:12px' }, 'The rate ramps linearly from the previous stage (the first ramps from 0).')),
+      h('span', { class: 'muted', style: 'font-size:12px' }, 'Each stage ramps linearly from the previous rate (the first from 0). Switch on Step to jump straight to its rate and hold it.')),
     rampHost);
 
   const F = {
@@ -90,12 +95,14 @@ export async function create(ctx) {
     recording_id: field('Recording', recSel, { required: true }),
     target: field('Target URL', target, { required: true, help: 'Base URL for the requests. Each recorded path and query is appended; a path on the target is used as a prefix.' }),
     speed: field('Speed', speed, { help: 'Speed 10 replays the recorded traffic shape ten times faster. 1× keeps the original timing.' }),
+    max_gap: field('Cap idle gaps at', maxGap, { help: 'Shorten quiet stretches in the recording longer than this (before the speed is applied), so an overnight lull does not stall the run.' }),
+    seed: field('Seed', seed, { help: 'Makes error sampling and any other randomness reproducible. Leave empty for a random seed that is stored with the job, so re-runs and clones replay the same schedule.' }),
     rate: field('Rate', rate, { help: 'Requests per second, held constant.' }),
     duration_rate: field('Duration', rateDuration, { help: 'How long to hold the rate, e.g. 2m.' }),
     concurrency_max: field('Concurrency', maxConc, { help: 'Number of workers sending back-to-back. More workers means more load.' }),
-    amplify: field('Amplify (copies)', amplify, { help: 'Send each scheduled request this many times. Amplify 10 is ten times the recorded traffic, spread evenly between requests instead of firing in a burst.' }),
+    amplify: field('Amplify (copies)', amplify, { help: 'Timeline only: send each scheduled request this many times. Amplify 10 is ten times the recorded traffic, spread evenly between requests instead of firing in a burst. In rate mode raise the rate instead.' }),
     error_amplification: field('Error amplification', errAmp, { help: 'Oversamples requests whose recorded response was an error (5xx or 429). 10× sends them about ten times as often, so the target sees many more error-inducing requests.' }),
-    concurrency: field('Max in flight', concurrency, { help: 'Caps concurrent requests. In max mode this is the number of workers.' }),
+    concurrency: field('Max in flight', concurrency, { help: 'Caps concurrent requests. When every slot is busy, requests queue on this side and the run is reported as saturated, so keep it well above rate × latency.' }),
     duration: field('Stop after', duration, { help: 'Optional run time limit. Leave empty for one pass through the recording.' }),
     max_requests: field('Request cap', maxReq, { help: 'Stop after this many requests (0 = no cap).' }),
     timeout: field('Request timeout', timeout, { help: 'Per request. Slow responses past this count as timeouts.' }),
@@ -109,7 +116,7 @@ export async function create(ctx) {
 
   // ----------------------------------------------------------- layout
   const modeText = h('p', { class: 'explain' });
-  const timelineBlock = h('div', { class: 'stack-sm' }, F.speed);
+  const timelineBlock = h('div', { class: 'stack-sm' }, formGrid(F.speed, F.max_gap));
   const rateBlock = h('div', { class: 'stack' }, rateKind.el,
     h('div', { id: 'rate-const' }, formGrid(F.rate, F.duration_rate)), stagesBlock);
   const rateConstHost = rateBlock.querySelector('#rate-const');
@@ -119,13 +126,15 @@ export async function create(ctx) {
   const shape = formSection('Load shape', null, mode.el, modeText, timelineBlock, rateBlock, maxBlock);
   const advanced = collapsible('Advanced', h('div', { class: 'stack' },
     formGrid(F.include, F.exclude), F.set_headers, formGrid(F.remove_headers, F.host_header), skipVerify.el,
-    formGrid(F.profile_id), vary.el, compare.el), { hint: 'filters, headers, anonymization, status comparison' });
+    formGrid(F.profile_id), vary.el, compare.el, formGrid(F.seed)), { hint: 'filters, headers, anonymization, seed' });
   const errHost = h('div');
+  const multiplyGrid = formGrid(F.amplify, F.error_amplification);
+  const multiplySection = formSection('Multiply the traffic', 'Independent knobs on top of the load shape.', multiplyGrid);
   const form = h('div', null,
     errHost,
     formSection('What to replay', null, formGrid(F.name, F.recording_id), recInfo, rawWarn, F.target),
     shape,
-    formSection('Multiply the traffic', 'Independent knobs on top of the load shape.', formGrid(F.amplify, F.error_amplification)),
+    multiplySection,
     formSection('Limits', null, formGrid(F.concurrency, F.timeout), formGrid(F.duration, F.max_requests), loop.el),
     advanced);
 
@@ -134,7 +143,7 @@ export async function create(ctx) {
   const rampMount = rampHost;
   function recording() { return recs.find((r) => r.id === recSel.get()); }
   function stageList() {
-    return stageRows.map((s) => ({ durationMs: s.dur.ms() || 0, rate: s.rt.get() || 0 })).filter((s) => s.durationMs > 0);
+    return stageRows.map((s) => ({ durationMs: s.dur.ms() || 0, rate: s.rt.get() || 0, hold: s.step.get() })).filter((s) => s.durationMs > 0);
   }
   function paintPlan() {
     const m = mode.get();
@@ -146,6 +155,9 @@ export async function create(ctx) {
     rateConstHost.hidden = rateKind.get() !== 'constant';
     stagesBlock.hidden = rateKind.get() !== 'stages';
     F.concurrency.hidden = m === 'max';
+    // Amplify copies each scheduled request: it only exists in timeline mode.
+    F.amplify.hidden = m !== 'timeline';
+    vary.el.hidden = m !== 'timeline';
     vary.setDisabled(!profile.get() || (amplify.get() || 1) <= 1);
     if (rec) {
       recInfo.replaceChildren(
@@ -153,7 +165,7 @@ export async function create(ctx) {
         h('span', { class: 'muted' }, `${fmtInt(rec.exchange_count)} exchanges, ${fmtInt(rec.error_count)} errors, ${rec.first_at && rec.last_at ? fmtHuman(Date.parse(rec.last_at) - Date.parse(rec.first_at)) + ' of traffic' : 'empty'}`));
       rawWarn.replaceChildren(!rec.anonymized && !profile.get() ? alertBox('warn', 'This recording is raw: requests are sent exactly as captured. Pick an anonymization profile under Advanced to anonymize on the fly.') : '');
     }
-    const amp = amplify.get() || 1;
+    const amp = m === 'timeline' ? (amplify.get() || 1) : 1;
     const items = [];
     let big = DASH, bigSub = '';
     const spanSec = rec && rec.first_at && rec.last_at ? Math.max(1, (Date.parse(rec.last_at) - Date.parse(rec.first_at)) / 1000) : 0;
@@ -178,7 +190,7 @@ export async function create(ctx) {
         const st = stageList();
         const total = st.reduce((a, s) => a + s.durationMs, 0);
         let prev = 0, count = 0;
-        for (const s of st) { count += ((prev + s.rate) / 2) * (s.durationMs / 1000); prev = s.rate; }
+        for (const s of st) { count += (s.hold ? s.rate : (prev + s.rate) / 2) * (s.durationMs / 1000); prev = s.rate; }
         const peak = Math.max(0, ...st.map((s) => s.rate));
         big = `peak ${fmtRate(peak)} req/s`;
         bigSub = `${st.length} stage${st.length === 1 ? '' : 's'} over ${fmtHuman(total)}`;
@@ -190,7 +202,7 @@ export async function create(ctx) {
       big = `${fmtInt(maxConc.get() || 0)} workers`;
       bigSub = 'closed loop, as fast as the target allows';
       items.push(['Run time', duration.ms() ? fmtHuman(duration.ms()) : 'one pass through the recording']);
-      items.push(['Requests', maxReq.get() > 0 ? fmtInt(maxReq.get()) : fmtInt(n * amp)]);
+      items.push(['Requests', maxReq.get() > 0 ? fmtInt(maxReq.get()) : (loop.get() ? 'until the time limit' : fmtInt(n))]);
     }
     if (m !== 'rate' || rateKind.get() !== 'stages') rampMount.replaceChildren();
     if (rec && rec.exchange_count) {
@@ -199,7 +211,7 @@ export async function create(ctx) {
       const share = Math.min(1, (base0 * ea) / (1 - base0 + base0 * ea));
       items.push(['Error-inducing requests', `${fmtPct(share)}${ea !== 1 ? ` (recorded ${fmtPct(base0)})` : ''}`]);
     }
-    items.push(['Copies per request', `${amp}×`]);
+    if (m === 'timeline') items.push(['Copies per request', `${amp}×`]);
     items.push(['Target', target.get().trim() || DASH]);
     planHost.replaceChildren(
       h('div', { class: 'plan-big' }, big),
@@ -223,13 +235,20 @@ export async function create(ctx) {
     if (m === 'timeline' && !((speed.get() || 0) > 0)) bail('speed', 'Speed must be greater than 0.');
     const config = {
       recording_id: recSel.get(), target: tg, mode: m,
-      amplify: Math.round(amplify.get() || 1), error_amplification: errAmp.get() || 1,
+      error_amplification: errAmp.get() || 1,
       compare_status: compare.get(),
     };
-    const am = config.amplify;
-    if (am < 1 || am > 1000) bail('amplify', 'Amplify must be between 1 and 1000.');
+    if (m === 'timeline') {
+      const am = Math.round(amplify.get() || 1);
+      if (am < 1 || am > 1000) bail('amplify', 'Amplify must be between 1 and 1000.');
+      else if (am > 1) config.amplify = am;
+    }
     if (!((errAmp.get() || 0) > 0 && errAmp.get() <= 1000)) bail('error_amplification', 'Must be greater than 0 and at most 1000.');
-    if (m === 'timeline') config.speed = speed.get() || 1;
+    if (m === 'timeline') {
+      config.speed = speed.get() || 1;
+      if (!maxGap.valid()) bail('max_gap', 'Use a duration like 5s.');
+      else if (maxGap.ms()) config.max_gap = toGoDuration(maxGap.ms());
+    }
     if (m === 'rate') {
       if (rateKind.get() === 'constant') {
         if (!((rate.get() || 0) > 0)) bail('rate', 'Rate must be greater than 0.');
@@ -242,7 +261,7 @@ export async function create(ctx) {
         for (const s of st) {
           if (!s.d || s.d <= 0 || s.r === null || s.r < 0) { stageRows[s.i].row.classList.add('has-error'); errs.push(`Stage ${s.i + 1} needs a duration and a rate.`); }
         }
-        config.stages = st.map((s) => ({ duration: toGoDuration(s.d || 0), rate: s.r || 0 }));
+        config.stages = st.map((s) => ({ duration: toGoDuration(s.d || 0), rate: s.r || 0, ...(stageRows[s.i].step.get() ? { hold: true } : {}) }));
       }
     }
     const conc = m === 'max' ? maxConc.get() : concurrency.get();
@@ -267,7 +286,8 @@ export async function create(ctx) {
     if (removeHeaders.get().length) config.remove_headers = removeHeaders.get();
     if (hostHeader.get().trim()) config.host_header = hostHeader.get().trim();
     if (skipVerify.get()) config.insecure_skip_verify = true;
-    if (profile.get()) { config.profile_id = profile.get(); if (vary.get()) config.vary_clones = true; }
+    if (profile.get()) { config.profile_id = profile.get(); if (m === 'timeline' && (config.amplify || 1) > 1 && vary.get()) config.vary_clones = true; }
+    if (seed.get() !== null && seed.get() > 0) config.seed = Math.round(seed.get());
     if (errs.length) {
       errHost.replaceChildren(alertBox('error', 'Fix the highlighted fields and try again.'), h('div', { style: 'height:14px' }));
       scrollToFirstError(form);
@@ -287,7 +307,7 @@ export async function create(ctx) {
       navigate(`/replays/${encodeURIComponent(job.id)}`);
     } catch (e) {
       if (!(e instanceof ApiError)) throw e;
-      applyProblems({ target: F.target, recording_id: F.recording_id, speed: F.speed, rate: F.rate, 'stage': F.duration_rate, amplify: F.amplify, error_amplification: F.error_amplification, concurrency: F.concurrency, duration: F.duration, 'max_requests': F.max_requests, timeout: F.timeout, 'profile_id': F.profile_id }, e);
+      applyProblems({ target: F.target, recording_id: F.recording_id, speed: F.speed, max_gap: F.max_gap, rate: F.rate, 'stage': F.duration_rate, amplify: F.amplify, error_amplification: F.error_amplification, concurrency: F.concurrency, duration: F.duration, 'max_requests': F.max_requests, timeout: F.timeout, 'profile_id': F.profile_id, seed: F.seed }, e);
       errHost.replaceChildren(errorBox(e), h('div', { style: 'height:14px' }));
       scrollToFirstError(form);
     }

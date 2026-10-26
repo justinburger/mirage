@@ -183,6 +183,10 @@ func (s *SQLite) IterateExchanges(ctx context.Context, recordingID string, opts 
 			// while we were reading it.
 			return notFound("recording", recordingID)
 		}
+		// Take the cursor before running fn: a callback may change Seq (for
+		// example by passing the exchange to AppendExchanges, which assigns it
+		// in place), and that must not move the paging.
+		last := chunk[len(chunk)-1].Seq
 		for _, e := range chunk {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -191,7 +195,7 @@ func (s *SQLite) IterateExchanges(ctx context.Context, recordingID string, opts 
 				return err
 			}
 		}
-		after = chunk[len(chunk)-1].Seq
+		after = last
 	}
 	return nil
 }

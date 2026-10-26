@@ -103,6 +103,69 @@
 // once). Starting a finished job re-runs it (overwriting results). Recover
 // marks jobs left running by a previous process as failed ("interrupted:
 // mirage restarted"). OnChange is called after every status change.
+//
+// # Implementation notes
+//
+// Where the implementation interprets or extends the contract:
+//
+//   - Requests recorded in the same instant form a group. The group's copies
+//     (error copies times amplify, over all its requests) are spread evenly
+//     over the gap to the next request with a later recorded time, round by
+//     round (copy 0 of every request, then copy 1, ...), so Amplify never
+//     fires in a burst unless the recording did and due times never go
+//     backwards. The last request of a pass has the mean gap after it, and a
+//     pass of a recording with no time extent (one request, identical
+//     timestamps) lasts one second when looping.
+//   - Arrival n of a rate curve is due when the cumulative arrival count
+//     reaches n, so a constant rate r sends at exactly n/r (the first request
+//     at once) and a ramp sends as many requests as the area under it. A
+//     rate job lasts through its stages (or Duration) even when the curve is
+//     quiet at the end. Planned is the rounded-up integral.
+//   - Planned follows the schedule exactly for a single pass, including the
+//     same error-amplification draws and a Duration or MaxRequests cut. For a
+//     looping timeline with a Duration it is the first pass's rate times
+//     Duration; for max mode with Loop it is MaxRequests or -1.
+//   - SetHeaders are applied after anonymization, never before, so a token
+//     for the target is not itself hashed by the profile. A target with
+//     userinfo ("http://user:pw@host") sends it as Basic credentials when no
+//     Authorization header is set. Redirects are not followed, a 302 is a
+//     302. A SetHeaders "Host" acts as HostHeader (which wins).
+//   - Latency and CorrectedLatency cover requests that got a response;
+//     requests without one are counted in Failed (and Timeouts) and appear on
+//     the collector as status 0 with the time they took. Requests aborted by
+//     cancelling the job are not counted as failures. The first failures of a
+//     job are logged (endpoint and error only).
+//   - Bytes are body bytes: BytesSent request bodies as sent (after
+//     anonymization and gzip), BytesReceived response bodies as they came on
+//     the wire (compression is never undone).
+//   - Include/Exclude filters run on the recorded request; offsets are
+//     relative to the earliest request that survives them.
+//   - At Duration the scheduler stops waiting: for requests that are not due
+//     yet, and for a free worker. A scheduler that is merely late (a stalled
+//     machine) still sends the requests that were due before Duration, so
+//     Sent reaches Planned; a saturated one drops its backlog there and
+//     Saturated says why Sent is lower. Requests in flight are allowed to
+//     finish, each bounded by Timeout, and Elapsed runs until the last one is
+//     done. Cancelling the context aborts them instead.
+//   - The scheduler sleeps until 1 ms before a request is due and yields in
+//     a loop for the rest, because runtime timers fire up to a millisecond
+//     late; send-time error stays in the tens of microseconds at the cost of
+//     up to a millisecond of spinning per sleep (so about rate × 1 ms of a
+//     core below 1000 req/s, a full core above). With a single P it only
+//     sleeps.
+//   - Run ticks its collector (TickCollector) on whole-second boundaries,
+//     as the registry does, so a CLI run and a Manager job produce the same
+//     series stamps. A registry-ticked job waits up to 1.5 s at its end for
+//     the registry to close the last second (skipped on Shutdown and Delete,
+//     so those are prompt); Manager.Stop waits for that and for the save.
+//   - Manager.Create reports a profile that does not exist as a
+//     *model.ValidationError (the request body is wrong) and a recording that
+//     does not exist as model.ErrNotFound. Jobs persist their result before
+//     they leave Running(), observers hear pending, running, then the result
+//     in that order, and a deleted job is never written back.
+//
+// Additions to the stub's API: RunOptions.JobID, ErrRecordingTooLarge,
+// ErrEmptyRecording and ErrShutdown.
 package replay
 
 import (
@@ -125,67 +188,18 @@ type RunOptions struct {
 	// summary.
 	Progress func(model.ReplaySummary)
 	Logger   *slog.Logger
+	// JobID is sent as the value of the X-Mirage-Replay header; empty means
+	// "cli".
+	JobID string
 }
 
 // Run executes one replay synchronously and returns its summary and
 // per-second series. Cancelling ctx stops it early; the partial summary is
 // still returned together with ctx.Err().
 func Run(ctx context.Context, st store.Store, cfg model.ReplayConfig, opts RunOptions) (model.ReplaySummary, []model.SeriesPoint, error) {
-	panic("replay: not implemented")
+	r, err := newRunner(st, cfg, opts)
+	if err != nil {
+		return model.ReplaySummary{Planned: -1}, nil, err
+	}
+	return r.execute(ctx)
 }
-
-// Deps are the Manager's dependencies.
-type Deps struct {
-	Store   store.Store
-	Metrics *metrics.Registry
-	Logger  *slog.Logger
-	// OnChange is called after a job changes status (may be nil).
-	OnChange func(model.ReplayJob)
-}
-
-// Manager runs replay jobs in the background.
-type Manager struct{}
-
-// NewManager returns a manager.
-func NewManager(deps Deps) *Manager { panic("replay: not implemented") }
-
-// Create validates and stores a pending job.
-func (m *Manager) Create(ctx context.Context, name string, cfg model.ReplayConfig) (model.ReplayJob, error) {
-	panic("replay: not implemented")
-}
-
-// Start runs a job in the background.
-func (m *Manager) Start(ctx context.Context, id string) error { panic("replay: not implemented") }
-
-// Stop cancels a running job.
-func (m *Manager) Stop(id string) error { panic("replay: not implemented") }
-
-// Get returns a job, with the live summary if running.
-func (m *Manager) Get(ctx context.Context, id string) (model.ReplayJob, error) {
-	panic("replay: not implemented")
-}
-
-// List returns all jobs (newest first, without series), with live summaries
-// for running jobs.
-func (m *Manager) List(ctx context.Context) ([]model.ReplayJob, error) {
-	panic("replay: not implemented")
-}
-
-// Series returns per-second points with T >= sinceMs: from the live run
-// while the job runs, from the stored job once finished.
-func (m *Manager) Series(ctx context.Context, id string, sinceMs int64) ([]model.SeriesPoint, error) {
-	panic("replay: not implemented")
-}
-
-// Running returns the jobs currently running (in memory, no store access),
-// with live summaries and without series.
-func (m *Manager) Running() []model.ReplayJob { panic("replay: not implemented") }
-
-// Delete removes a job (stopping it first if running).
-func (m *Manager) Delete(ctx context.Context, id string) error { panic("replay: not implemented") }
-
-// Recover marks jobs interrupted by a restart as failed.
-func (m *Manager) Recover(ctx context.Context) error { panic("replay: not implemented") }
-
-// Shutdown stops running jobs and waits for them to save (bounded by ctx).
-func (m *Manager) Shutdown(ctx context.Context) error { panic("replay: not implemented") }

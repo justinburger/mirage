@@ -1,89 +1,15 @@
-// Package virtual serves recorded responses in place of a real upstream
-// (service virtualization), with realistic latency and controllable error
-// rates.
-//
-// CONTRACT (implemented by the virtual agent):
-//
-// Index. Build streams the recording (store.IterateExchanges with request
-// and response bodies) into an in-memory index with three levels (see
-// model.MatchConfig):
-//
-//	exact    method + path + query key + body key + selected header values
-//	path     method + path
-//	template method + endpoint template (only if Match.PathTemplates)
-//
-// Query key per Match.Query: exact → params sorted by name then value,
-// minus IgnoreParams; ignore → empty; subset → empty at the exact level, and
-// candidates found at the "path" level are then filtered to those whose
-// recorded params (minus IgnoreParams) are all present with equal values in
-// the request. Body key per Match.Body: ignore → empty; exact → hash of
-// bytes; json → hash of canonical JSON (keys sorted, insignificant
-// whitespace removed, numbers kept as literals) or of the bytes when the
-// body is not JSON. Use a fast non-cryptographic hash (hash/maphash with a
-// per-engine seed). Exchanges whose Error is set (no upstream response) are
-// not served as normal matches but do count toward error rates. Candidate
-// lists (and sequential cursors) follow (StartedAt, Seq) order, because Seq
-// is completion order, not arrival order. Template-level keys and endpoint
-// pools use the stored Exchange.Endpoint when non-empty (it was computed from
-// the raw path) and compute it with the Normalizer only otherwise.
-//
-// Ownership and immutability: Add takes ownership of the exchange it is
-// given (callers do not touch it afterwards; Build's exchanges come fresh
-// from the store). Indexed exchanges are immutable: Lookup and Respond never
-// mutate ex.Header or ex.Body (Date, Content-Length and X-Mirage-* go to the
-// response header map only). The gzip cache is built at most once per
-// exchange (sync.Once). Add after Close is a no-op.
-//
-// Lookup is the hot path (target ≥ 50k lookups/s per core, no allocation
-// beyond key building). Avoid one global RWMutex: shard the index (e.g. 64
-// shards by key hash, one RWMutex each; Add takes only its shard's write
-// lock) or use copy-on-write snapshots behind an atomic pointer. Selection among candidates
-// per Match.Selection: sequential keeps an atomic cursor per key and cycles;
-// random picks uniformly; first always returns the first recorded.
-//
-// Error amplification. At Build, for each recorded endpoint compute the
-// error rate e (model.Exchange.IsError) and keep pools of its error and
-// success exchanges. Target rate t = min(1, max(e × ErrorAmplification,
-// ErrorFloor)). When a matched response is a success and t > e, flip it to an
-// error with probability (t − e) / (1 − e): serve a random recorded error
-// exchange of the same endpoint, or if there is none a synthetic 503 with
-// JSON body {"error":"service unavailable (injected by mirage)"}. When the
-// match is an error and t < e, flip to a random recorded success with
-// probability 1 − t/e (when a success exists). Mark the Match Injected.
-//
-// Writing a response (Respond / Serve):
-//   - Latency per model.LatencyConfig: recorded → wait TTFB × Multiplier,
-//     write and flush the headers, wait the rest of (Duration − TTFB) ×
-//     Multiplier, then write the body; fixed → wait Fixed, then respond;
-//     Jitter adds uniform ±Jitter to the total (never negative). Waits stop
-//     early if the request context is cancelled (then return without writing).
-//   - Copy recorded headers except hop-by-hop headers (Connection,
-//     Keep-Alive, Proxy-*, Te, Trailer, Transfer-Encoding, Upgrade),
-//     Content-Length (recomputed) and Date (set to now).
-//   - If the recorded response had ContentEncoding "gzip" and the request
-//     accepts gzip, serve it gzip-compressed with Content-Encoding: gzip,
-//     compressing each exchange's body once and caching the result.
-//   - Add "X-Mirage-Match: exact|path|template" and, for amplified errors,
-//     "X-Mirage-Injected: error".
-//   - HEAD requests get headers only.
-//
-// Misses: Serve returns false and writes nothing; WriteMiss writes
-// Match.MissStatus with a JSON body explaining the miss
-// ({"error":"no recorded response matches this request","method":…,
-// "path":…,"recording_id":…}) and "X-Mirage-Match: miss".
-//
-// Memory. If the recording's captured bytes exceed MaxResidentBytes, keep
-// only the index and request-side keys in memory and load response bodies on
-// demand with store.GetExchange through an LRU cache bounded by
-// MaxResidentBytes. Below the threshold everything stays resident.
-//
-// Hybrid mode: Add inserts a newly captured exchange into all levels and
-// the endpoint pools while serving continues (write lock).
 package virtual
 
 import (
 	"context"
+	"fmt"
+	"hash/maphash"
 	"net/http"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/justinburger/mirage/internal/model"
 	"github.com/justinburger/mirage/internal/pathnorm"
@@ -92,6 +18,24 @@ import (
 
 // DefaultMaxResidentBytes is the default MaxResidentBytes (512 MiB).
 const DefaultMaxResidentBytes = 512 << 20
+
+// Match levels, as reported in Match.Level and in the X-Mirage-Match header.
+const (
+	LevelExact    = "exact"
+	LevelPath     = "path"
+	LevelTemplate = "template"
+	// LevelMiss is the X-Mirage-Match value of a miss response.
+	LevelMiss = "miss"
+)
+
+// Response headers Mirage adds to virtualized responses.
+const (
+	// HeaderMatch carries the match level (or "miss").
+	HeaderMatch = "X-Mirage-Match"
+	// HeaderInjected is "error" on responses where error amplification
+	// replaced a success with an error.
+	HeaderInjected = "X-Mirage-Injected"
+)
 
 // Options configures an Engine.
 type Options struct {
@@ -120,59 +64,272 @@ func OptionsFromService(svc model.Service, n *pathnorm.Normalizer) Options {
 	}
 }
 
-// Match is the result of a lookup.
+// Match is the result of a lookup. It is read-only: Exchange belongs to the
+// index and must not be modified.
 type Match struct {
+	// Exchange is the recorded exchange that will be served. In lazy mode (see
+	// Engine.Lazy) its Response.Body is nil: the body is loaded by Respond.
 	Exchange *model.Exchange
 	Level    string // "exact", "path" or "template"
 	Injected bool   // response swapped by error amplification
 	// Synthetic is true when Injected and no recorded error existed, so a
 	// synthetic 503 is served (Exchange is then nil).
 	Synthetic bool
+
+	// it is the indexed form of Exchange (nil for a synthetic response), and
+	// ttfb and dur are the recorded latency to simulate.
+	it        *item
+	ttfb, dur time.Duration
 }
 
 // Stats counts engine activity since Build.
 type Stats = model.VirtualStats
 
-// Engine is a virtualized service backed by one recording.
-type Engine struct{}
+// numShards is the number of index shards; a power of two.
+const numShards = 64
+
+// Engine is a virtualized service backed by one recording. It is safe for
+// concurrent use; Add may run while requests are being served.
+type Engine struct {
+	st   store.Store
+	opts Options
+	cfg  config
+	seed maphash.Seed
+	norm *pathnorm.Normalizer
+	rng  rng
+
+	shards [numShards]shard
+	stats  [numShards]counters
+
+	count    atomic.Int64 // exchanges indexed (Len)
+	resident atomic.Int64 // request+response body bytes held in memory
+	lazy     bool         // set by Build before the engine is shared
+	closed   atomic.Bool
+
+	epMu sync.Mutex
+	eps  map[string]*epool // endpoint → error-rate pools
+
+	cache *bodyCache // lazy bodies; nil without a store
+	synth *bodyEntry // body of the synthetic 503
+
+	gzPool sync.Pool    // *gzip.Writer
+	gzips  atomic.Int64 // bodies compressed (diagnostics, tests)
+	date   atomic.Pointer[dateStamp]
+
+	// Test hooks.
+	sleep func(ctx context.Context, d time.Duration) bool
+	now   func() time.Time
+}
+
+// config is Options with defaults applied and derived flags.
+type config struct {
+	query      model.QueryMatch
+	body       model.BodyMatch
+	selection  model.Selection
+	headers    []string // canonical names whose values are part of the exact key
+	ignore     []string // query parameters excluded from matching
+	templates  bool
+	subset     bool
+	pathSame   bool // the path level is identical to the exact level
+	missStatus int
+
+	latMode    model.LatencyMode
+	multiplier float64
+	fixed      time.Duration
+	jitter     time.Duration
+
+	amp, floor float64
+	ampOn      bool
+}
 
 // Build loads the recording from the store.
 func Build(ctx context.Context, st store.Store, opts Options) (*Engine, error) {
-	panic("virtual: not implemented")
+	if st == nil {
+		return nil, fmt.Errorf("virtual: build: nil store: %w", model.ErrValidation)
+	}
+	if opts.RecordingID == "" {
+		return nil, fmt.Errorf("virtual: build: recording id is required: %w", model.ErrValidation)
+	}
+	rec, err := st.GetRecording(ctx, opts.RecordingID)
+	if err != nil {
+		return nil, fmt.Errorf("virtual: build: load recording %q: %w", opts.RecordingID, err)
+	}
+	e := NewEngine(st, opts)
+	e.lazy = rec.Bytes > e.opts.MaxResidentBytes
+
+	iter := model.IterOptions{
+		RequestBodies:  e.cfg.body != model.BodyIgnore,
+		ResponseBodies: !e.lazy,
+	}
+	n := 0
+	err = st.IterateExchanges(ctx, opts.RecordingID, iter, func(ex *model.Exchange) error {
+		if n++; n&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		e.insert(ex, true)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("virtual: build: index recording %q: %w", opts.RecordingID, err)
+	}
+	e.finalize()
+	return e, nil
 }
 
 // NewEngine returns an empty engine (populate with Add). st may be nil when
 // everything stays resident.
-func NewEngine(st store.Store, opts Options) *Engine { panic("virtual: not implemented") }
+func NewEngine(st store.Store, opts Options) *Engine {
+	svc := model.Service{
+		Match:              opts.Match,
+		Latency:            opts.Latency,
+		ErrorAmplification: opts.ErrorAmplification,
+	}.WithDefaults()
+	opts.Match = svc.Match
+	opts.Latency = svc.Latency
+	opts.ErrorAmplification = svc.ErrorAmplification
+	opts.Match.IgnoreParams = slices.Clone(opts.Match.IgnoreParams)
+	opts.Match.Headers = slices.Clone(opts.Match.Headers)
+	if opts.MaxResidentBytes <= 0 {
+		opts.MaxResidentBytes = DefaultMaxResidentBytes
+	}
+	if opts.Normalizer == nil {
+		opts.Normalizer = pathnorm.Default
+	}
 
-// Add indexes one exchange (hybrid mode, tests).
-func (e *Engine) Add(ex *model.Exchange) { panic("virtual: not implemented") }
+	e := &Engine{
+		st:   st,
+		opts: opts,
+		seed: maphash.MakeSeed(),
+		norm: opts.Normalizer,
+		eps:  make(map[string]*epool),
+		now:  time.Now,
+	}
+	e.rng.init(opts.Seed)
+	e.cfg = newConfig(opts, svc)
+	for i := range e.shards {
+		e.shards[i].m = make(map[string]*entry)
+	}
+	if st != nil {
+		e.cache = newBodyCache(opts.MaxResidentBytes)
+	}
+	e.synth = &bodyEntry{raw: []byte(syntheticBody)}
+	return e
+}
+
+func newConfig(opts Options, svc model.Service) config {
+	c := config{
+		query:      svc.Match.Query,
+		body:       svc.Match.Body,
+		selection:  svc.Match.Selection,
+		templates:  svc.Match.PathTemplates,
+		missStatus: svc.Match.MissStatus,
+		latMode:    svc.Latency.Mode,
+		multiplier: svc.Latency.Multiplier,
+		fixed:      max(svc.Latency.Fixed.D(), 0),
+		jitter:     max(svc.Latency.Jitter.D(), 0),
+		amp:        svc.ErrorAmplification,
+		floor:      min(max(opts.ErrorFloor, 0), 1),
+	}
+	if c.missStatus < 100 || c.missStatus > 999 {
+		c.missStatus = model.DefaultMissStatus
+	}
+	if c.multiplier <= 0 {
+		c.multiplier = 1
+	}
+	if c.amp <= 0 {
+		c.amp = 1
+	}
+	c.ampOn = c.amp != 1 || c.floor > 0
+	c.subset = c.query == model.QuerySubset
+
+	seen := make(map[string]bool)
+	for _, h := range svc.Match.Headers {
+		h = http.CanonicalHeaderKey(strings.TrimSpace(h))
+		if h != "" && !seen[h] {
+			seen[h] = true
+			c.headers = append(c.headers, h)
+		}
+	}
+	c.ignore = slices.Clone(svc.Match.IgnoreParams)
+	c.pathSame = c.query != model.QueryExact && c.body == model.BodyIgnore && len(c.headers) == 0
+	return c
+}
+
+// Lazy reports whether response bodies are loaded from the store on demand
+// instead of being held in memory (see Options.MaxResidentBytes).
+func (e *Engine) Lazy() bool { return e.lazy }
+
+// Add indexes one exchange (hybrid mode, tests). The engine takes ownership
+// of ex: the caller must not touch it afterwards. Add after Close is a no-op.
+func (e *Engine) Add(ex *model.Exchange) {
+	if ex == nil || e.closed.Load() {
+		return
+	}
+	e.insert(ex, false)
+}
 
 // Lookup finds the response for a request. body is the full request body
 // (already read by the caller). Returns nil on a miss.
-func (e *Engine) Lookup(r *http.Request, body []byte) *Match { panic("virtual: not implemented") }
-
-// Respond writes the matched response, simulating latency.
-func (e *Engine) Respond(w http.ResponseWriter, r *http.Request, m *Match) {
-	panic("virtual: not implemented")
+func (e *Engine) Lookup(r *http.Request, body []byte) *Match {
+	m := new(Match)
+	if !e.lookup(r, body, m) {
+		return nil
+	}
+	return m
 }
 
 // Serve is Lookup + Respond. It returns false, writing nothing, on a miss.
 func (e *Engine) Serve(w http.ResponseWriter, r *http.Request, body []byte) bool {
-	panic("virtual: not implemented")
+	var m Match
+	if !e.lookup(r, body, &m) {
+		return false
+	}
+	e.Respond(w, r, &m)
+	return true
 }
 
-// WriteMiss writes the miss response.
-func (e *Engine) WriteMiss(w http.ResponseWriter, r *http.Request) {
-	panic("virtual: not implemented")
-}
-
-// Len returns the number of indexed exchanges.
-func (e *Engine) Len() int { panic("virtual: not implemented") }
+// Len returns the number of indexed exchanges. Exchanges that failed without
+// an upstream response (Exchange.Error set) are included: they are indexed
+// for error rates although they are never served.
+func (e *Engine) Len() int { return int(e.count.Load()) }
 
 // Stats returns activity counters (Hits, Misses, Injected, Indexed,
-// ByLevel).
-func (e *Engine) Stats() model.VirtualStats { panic("virtual: not implemented") }
+// ByLevel). ByLevel always has the keys "exact", "path" and "template".
+func (e *Engine) Stats() model.VirtualStats {
+	var hits, misses, injected int64
+	var lv [3]int64
+	for i := range e.stats {
+		c := &e.stats[i]
+		hits += c.hits.Load()
+		misses += c.misses.Load()
+		injected += c.injected.Load()
+		for j := range lv {
+			lv[j] += c.level[j].Load()
+		}
+	}
+	return model.VirtualStats{
+		Indexed:  e.count.Load(),
+		Hits:     hits,
+		Misses:   misses,
+		Injected: injected,
+		ByLevel: map[string]int64{
+			LevelExact:    lv[levelExact],
+			LevelPath:     lv[levelPath],
+			LevelTemplate: lv[levelTemplate],
+		},
+	}
+}
 
-// Close releases resources.
-func (e *Engine) Close() error { panic("virtual: not implemented") }
+// Close releases resources. Add after Close is a no-op; requests already
+// matched can still be answered. Close is idempotent.
+func (e *Engine) Close() error {
+	if e.closed.Swap(true) {
+		return nil
+	}
+	if e.cache != nil {
+		e.cache.close()
+	}
+	return nil
+}

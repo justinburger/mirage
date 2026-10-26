@@ -41,17 +41,52 @@ async function cloneJob(job) {
   navigate(`/replays/${encodeURIComponent(copy.id)}`);
 }
 
+/** True when the sender (not the target) was the limit. Closed-loop max runs always use every worker, by design. */
+const senderSaturated = (job) => !!(job.summary && job.summary.saturated && job.config.mode !== 'max');
+
+/** Real progress of a job: sent over planned (or elapsed over the time limit). */
 function progressInfo(job) {
   const s = job.summary;
-  if (!s) return { frac: 0, text: job.status === 'pending' ? 'not started' : DASH, indeterminate: false };
+  if (!s) return { frac: 0, text: job.status === 'pending' ? 'not started' : DASH, indeterminate: false, known: false };
   if (s.planned > 0) {
     const frac = Math.min(1, s.sent / s.planned);
-    return { frac: DONE(job.status) && job.status === 'completed' ? 1 : frac, text: `${fmtCompact(s.sent)} / ${fmtCompact(s.planned)}`, indeterminate: false };
+    return { frac, text: `${fmtCompact(s.sent)} / ${fmtCompact(s.planned)}`, indeterminate: false, known: true };
   }
   const d = durMs(job.config.duration);
   const el = durMs(s.elapsed);
-  if (d > 0) return { frac: Math.min(1, el / d), text: `${fmtCompact(s.sent)} sent`, indeterminate: false };
-  return { frac: 0, text: `${fmtCompact(s.sent)} sent`, indeterminate: job.status === 'running' };
+  if (d > 0) return { frac: Math.min(1, el / d), text: `${fmtCompact(s.sent)} sent`, indeterminate: false, known: true };
+  return { frac: 0, text: `${fmtCompact(s.sent)} sent`, indeterminate: job.status === 'running', known: false };
+}
+
+/** Percentage text that never rounds an unfinished run up to "100%". */
+function pctText(frac) {
+  if (frac >= 1) return '100%';
+  const p = frac * 100;
+  return p >= 99.5 ? `${Math.min(p, 99.9).toFixed(1)}%` : `${Math.round(p)}%`;
+}
+
+/**
+ * Why a finished job sent fewer requests than were planned, in one sentence
+ * ('' when it simply sent everything or the reason is not interesting).
+ */
+function endReason(job) {
+  const s = job.summary;
+  const c = job.config;
+  if (!s || !DONE(job.status)) return '';
+  if (job.status === 'stopped') return 'It was stopped before it finished.';
+  if (job.status === 'failed') return '';
+  const planned = s.planned;
+  const short = planned > 0 && s.sent < planned;
+  const limit = durMs(c.duration);
+  const atLimit = limit > 0 && durMs(s.elapsed) >= limit * 0.95;
+  if (c.max_requests > 0 && s.sent >= c.max_requests) return `It stopped at its request cap of ${fmtInt(c.max_requests)}.`;
+  if (senderSaturated(job) && short && atLimit) {
+    return `Because the sender saturated, requests were still queued when the ${fmtDur(c.duration)} time limit ended the run, and that backlog was never sent.`;
+  }
+  if (short && atLimit) return `It ended at its ${fmtDur(c.duration)} time limit${c.loop ? '; the planned count is an estimate for looped runs' : ''}.`;
+  if (short && c.mode === 'rate' && c.stages && c.stages.length) return 'It ended with its last stage.';
+  if (short && senderSaturated(job)) return 'The sender saturated, so part of the schedule was never sent.';
+  return '';
 }
 
 // ------------------------------------------------------------------ list
@@ -87,7 +122,7 @@ export async function list(ctx) {
       { key: 'name', label: 'Replay', sortValue: (r) => r.name.toLowerCase(), render: (r) => h('div', { class: 'cell-main' }, h('a', { class: 'cell-name', href: `#/replays/${encodeURIComponent(r.id)}` }, r.name), h('span', { class: 'cell-sub' }, `${recName.get(r.config.recording_id) || r.config.recording_id} → ${r.config.target}`)), sig: (r) => r.name + r.config.target },
       { key: 'status', label: 'Status', render: (r) => replayBadge(r.status), sig: (r) => r.status },
       { key: 'mode', label: 'Load', cls: 'hide-md', render: (r) => h('span', { class: 'muted nowrap' }, modeSummary(r.config)), sig: (r) => modeSummary(r.config) },
-      { key: 'progress', label: 'Progress', sortable: false, width: '170px', render: (r) => { const b = getBar(r.id); const p = progressInfo(r); b.bar.set(p.frac, { indeterminate: p.indeterminate, tone: r.status === 'failed' ? 'err' : r.status === 'completed' ? 'ok' : '' }); b.txt.textContent = p.text; return b.el; }, sig: (r) => `p${r.id}` },
+      { key: 'progress', label: 'Progress', sortable: false, width: '170px', render: (r) => { const b = getBar(r.id); const p = progressInfo(r); b.bar.set(p.frac, { indeterminate: p.indeterminate, tone: r.status === 'failed' ? 'err' : senderSaturated(r) ? 'warn' : r.status === 'completed' && p.frac >= 0.995 ? 'ok' : r.status === 'stopped' ? 'warn' : '' }); b.txt.textContent = p.text; b.txt.title = senderSaturated(r) ? 'The sender saturated its concurrency limit' : ''; return b.el; }, sig: (r) => `p${r.id}` },
       { key: 'rate', label: 'Achieved / target', align: 'right', sortValue: (r) => (r.summary ? r.summary.achieved_rps : 0), render: (r) => (r.summary && r.summary.sent ? `${fmtRate(r.summary.achieved_rps)} / ${r.summary.target_rps ? fmtRate(r.summary.target_rps) : 'max'}` : DASH) },
       { key: 'p95', label: 'p95', align: 'right', sortValue: (r) => (r.summary ? r.summary.latency.p95 : 0), render: (r) => (r.summary && r.summary.completed ? fmtMs(r.summary.latency.p95) : DASH) },
       { key: 'err', label: 'Errors', align: 'right', sortValue: (r) => (r.summary ? r.summary.error_rate : 0), render: (r) => (r.summary && r.summary.completed ? h('span', { style: r.summary.error_rate > 0.02 ? 'color:var(--err)' : r.summary.error_rate > 0.005 ? 'color:var(--warn)' : null }, fmtPct(r.summary.error_rate)) : DASH) },
@@ -111,8 +146,8 @@ export async function list(ctx) {
 
 function modeSummary(c) {
   if (c.mode === 'timeline') return `timeline ${c.speed || 1}×${c.amplify > 1 ? ` · ${c.amplify} copies` : ''}`;
-  if (c.mode === 'rate') return c.stages && c.stages.length ? `ramp, ${c.stages.length} stages` : `${fmtRate(c.rate)} req/s`;
-  return `max, ${c.concurrency || 256} workers`;
+  if (c.mode === 'rate') return c.stages && c.stages.length ? `ramp, ${c.stages.length} stage${c.stages.length === 1 ? '' : 's'}` : `${fmtRate(c.rate)} req/s`;
+  return `max, ${c.concurrency || 64} workers`;
 }
 
 // ---------------------------------------------------------------- detail
@@ -120,8 +155,9 @@ function targetFn(job) {
   const c = job.config;
   if (c.mode === 'rate') {
     if (c.stages && c.stages.length) {
-      const st = c.stages.map((s) => ({ d: durMs(s.duration) / 1000, rate: s.rate }));
-      return (sec) => { let acc = 0, prev = 0; for (const s of st) { if (sec <= acc + s.d) return prev + (s.rate - prev) * ((sec - acc) / s.d); acc += s.d; prev = s.rate; } return prev; };
+      const st = c.stages.map((s) => ({ d: durMs(s.duration) / 1000, rate: s.rate, hold: !!s.hold }));
+      // A stage ramps linearly from the previous rate, or with hold steps straight to its rate.
+      return (sec) => { let acc = 0, prev = 0; for (const s of st) { if (sec <= acc + s.d) return s.hold ? s.rate : prev + (s.rate - prev) * ((sec - acc) / s.d); acc += s.d; prev = s.rate; } return prev; };
     }
     return () => c.rate || 0;
   }
@@ -141,6 +177,7 @@ export async function detail(ctx) {
   const root = h('div', { class: 'stack' });
   const headHost = h('div');
   const bannerHost = h('div');
+  const satHost = h('div');
   const progHost = h('div');
   const statsHost = h('div');
   const latHost = h('div');
@@ -148,7 +185,7 @@ export async function detail(ctx) {
   const statusHost = h('div');
   const epHost = h('div');
   const cfgHost = h('div');
-  root.append(headHost, bannerHost, progHost, statsHost, latHost, chartsHost, statusHost, epHost, cfgHost);
+  root.append(headHost, bannerHost, satHost, progHost, statsHost, latHost, chartsHost, statusHost, epHost, cfgHost);
 
   // ---- header
   function paintHeader() {
@@ -177,20 +214,32 @@ export async function detail(ctx) {
   // ---- progress
   const bar = progressBar(0);
   const progText = h('div', { class: 'row-between', style: 'font-size:13px' });
-  progHost.appendChild(card({ body: h('div', { class: 'stack-sm' }, progText, bar.el) }));
+  const progWhy = h('div');
+  progHost.appendChild(card({ body: h('div', { class: 'stack-sm' }, progText, bar.el, progWhy) }));
   bar.el.classList.add('progress-lg');
   function paintProgress() {
     const p = progressInfo(job);
     const s = job.summary;
-    bar.set(p.frac, { indeterminate: p.indeterminate, tone: job.status === 'failed' ? 'err' : job.status === 'completed' ? 'ok' : job.status === 'stopped' ? 'warn' : '' });
+    const tone = job.status === 'failed' ? 'err' : senderSaturated(job) ? 'warn' : job.status === 'completed' && p.frac >= 0.995 ? 'ok' : job.status === 'stopped' ? 'warn' : '';
+    bar.set(p.frac, { indeterminate: p.indeterminate, tone });
     let eta = '';
     if (job.status === 'running' && s && s.planned > 0 && s.sent > 0 && durMs(s.elapsed) > 0) {
       const remain = ((s.planned - s.sent) / (s.sent / durMs(s.elapsed)));
       eta = ` · about ${fmtHuman(remain)} left`;
     }
+    let line = 'Not started yet';
+    if (s) {
+      line = `${fmtInt(s.sent)} sent`;
+      if (s.planned > 0) line += ` of ${fmtInt(s.planned)} planned (${pctText(p.frac)})`;
+      else if (durMs(job.config.duration) > 0) line += ` (${pctText(p.frac)} of the ${fmtDur(job.config.duration)} limit)`;
+      else line += ' (open-ended run)';
+      line += eta;
+    }
+    const why = endReason(job);
     progText.replaceChildren(
-      h('span', null, s ? `${fmtInt(s.sent)} sent${s.planned > 0 ? ` of ${fmtInt(s.planned)} planned (${fmtPct(p.frac, 0)})` : ' (open-ended run)'}${eta}` : 'Not started yet'),
+      h('span', null, line),
       h('span', { class: 'muted' }, s ? `elapsed ${fmtDur(s.elapsed)}` : ''));
+    progWhy.replaceChildren(why ? h('div', { class: 'muted', style: 'font-size:12.5px' }, why) : '');
   }
 
   // ---- summary cards
@@ -198,15 +247,26 @@ export async function detail(ctx) {
   function paintStats() {
     const s = job.summary;
     if (!s) { statsHost.replaceChildren(); return; }
+    const allowed = job.config.concurrency || (job.config.mode === 'max' ? 64 : 2048);
     statsHost.replaceChildren(h('div', { class: 'stat-grid cols-4' },
       cell('Achieved rate', `${fmtRate(s.achieved_rps)} /s`, s.target_rps ? `target ${fmtRate(s.target_rps)} /s (${fmtPct(s.achieved_rps / s.target_rps, 0)})` : 'closed loop (no target)', s.target_rps && s.achieved_rps / s.target_rps < 0.9 ? 'warn' : ''),
       cell('Error rate', fmtPct(s.error_rate), `${fmtInt(s.errors)} errors`, s.error_rate > 0.05 ? 'err' : s.error_rate > 0.01 ? 'warn' : 'ok'),
       cell('Completed', fmtInt(s.completed), `${fmtInt(s.failed)} failed, ${fmtInt(s.timeouts)} timeouts`, s.failed ? 'warn' : ''),
       cell('Status mismatches', job.config.compare_status ? fmtInt(s.mismatches) : 'off', job.config.compare_status ? 'differ from the recording' : 'enable compare_status', job.config.compare_status && s.mismatches ? 'warn' : ''),
       cell('Max lag', fmtDur(s.max_lag), 'intended vs actual send time', durMs(s.max_lag) > 100 ? 'warn' : ''),
-      cell('Sent', fmtBytes(s.bytes_sent), 'request bytes'),
-      cell('Received', fmtBytes(s.bytes_received), 'response bytes'),
+      cell('Peak in flight', fmtInt(s.max_in_flight), `of ${fmtInt(allowed)} ${job.config.mode === 'max' ? 'workers' : 'allowed'}${s.saturated && job.config.mode !== 'max' ? ', all busy' : ''}`, senderSaturated(job) ? 'warn' : ''),
+      cell('Data', `${fmtBytes(s.bytes_sent)} out`, `${fmtBytes(s.bytes_received)} received`),
       cell('Elapsed', fmtDur(s.elapsed), job.ended_at ? `ended ${relTime(job.ended_at)}` : 'running')));
+  }
+
+  // ---- saturation warning
+  function paintSaturated() {
+    const s = job.summary;
+    const allowed = job.config.concurrency || 2048;
+    if (!s || !senderSaturated(job)) { satHost.replaceChildren(); return; }
+    satHost.replaceChildren(alertBox('warn',
+      `Every one of the ${fmtInt(allowed)} concurrency slots was busy at least once (peak ${fmtInt(s.max_in_flight)} in flight). From then on requests waited on this side before they were sent, so lag and corrected latency measure the load generator as much as the target. Raise the concurrency, then run again.`,
+      { title: 'The sender saturated' }));
   }
 
   // ---- latency table
@@ -232,7 +292,7 @@ export async function detail(ctx) {
         h('div', { class: 'table-wrap' }, tbl),
         h('div', { class: 'stack-sm' },
           queued
-            ? alertBox('warn', `Corrected latency is up to ${worst.toFixed(1)}× the service time (p99 ${fmtMs(s.corrected_latency.p99)} against ${fmtMs(s.latency.p99)}). The target, or the concurrency limit, could not keep up with the schedule, so requests waited before they were even sent.`, { title: 'Queueing detected' })
+            ? alertBox('warn', `Corrected latency is up to ${worst.toFixed(1)}× the service time (p99 ${fmtMs(s.corrected_latency.p99)} against ${fmtMs(s.latency.p99)}). ${senderSaturated(job) ? 'The concurrency limit was reached, so requests waited on the sender before they were even sent.' : 'The target could not keep up with the schedule, so requests waited before they were even sent.'}`, { title: 'Queueing detected' })
             : alertBox('success', 'Service time and corrected latency agree, so requests went out on schedule.', { title: 'On schedule' }),
           h('p', { class: 'explain' }, h('b', null, 'Service time'), ' runs from the moment a request was sent until its response was fully read.'),
           h('p', { class: 'explain' }, h('b', null, 'Corrected latency'), ' runs from when the request was ', h('i', null, 'supposed'), ' to be sent. When a slow target holds up the sender, plain service time hides that wait (coordinated omission: the slowest moments get the fewest samples). Corrected latency counts it, so it is the honest number for what a real user would have felt.'))),
@@ -245,7 +305,8 @@ export async function detail(ctx) {
   const showTarget = job.config.mode !== 'max';
   const mk = (title, series, yFormat, tipFormat) => new TimeChart({ title, series, windowMs: null, xMode: 'elapsed', xBase: startedMs, yFormat, tipFormat, height: 190, gapMs: 15000 });
   const cRps = mk('Achieved vs target rate', [{ key: 'rps', label: 'achieved', color: 'c1', area: true }, ...(showTarget ? [{ key: 'target', label: 'target', color: 'c5', dash: [6, 4], width: 1.5 }] : [])], fmtRate, (v) => `${fmtCompact(v)} /s`);
-  const cLat = mk('Latency', [{ key: 'p50', label: 'p50', color: 'c1' }, { key: 'p95', label: 'p95', color: 'c2' }, { key: 'p99', label: 'p99', color: 'c3' }], fmtMsShort, fmtMs);
+  const cLat = mk('Latency', [{ key: 'p50', label: 'p50', color: 'c1' }, { key: 'p95', label: 'p95', color: 'c2' }, { key: 'p99', label: 'p99', color: 'c3' }, { key: 'cp99', label: 'p99 corrected', color: 'c5', dash: [6, 4], width: 2 }], fmtMsShort, fmtMs);
+  cLat.setHint('corrected = from the intended send time');
   const cErr = mk('Errors per second', [{ key: 'errors', label: 'errors/s', color: 'err', area: true }], fmtCompact, (v) => `${fmtCompact(v)} /s`);
   const cIn = mk('In flight', [{ key: 'in_flight', label: 'requests', color: 'c4', area: true }], fmtCompact, (v) => String(Math.round(v)));
   const allCharts = [cRps, cLat, cErr, cIn];
@@ -294,10 +355,12 @@ export async function detail(ctx) {
       body: h('div', { class: 'stack-sm' },
         h('div', { class: 'cols-2' },
           kvList([
-            ['Mode', c.mode], ['Speed', c.mode === 'timeline' ? `${c.speed}×` : undefined], ['Rate', c.mode === 'rate' && !(c.stages && c.stages.length) ? `${c.rate} req/s` : undefined],
-            ['Stages', c.stages && c.stages.length ? c.stages.map((s) => `${fmtDur(s.duration)} → ${fmtCompact(s.rate)}/s`).join(', ') : undefined],
-            ['Amplify', `${c.amplify || 1}×`], ['Error amplification', `${c.error_amplification || 1}×`], ['Concurrency', c.concurrency],
-            ['Duration', c.duration ? fmtDur(c.duration) : DASH], ['Loop', c.loop ? 'yes' : 'no'], ['Max requests', c.max_requests || DASH], ['Timeout', fmtDur(c.timeout)],
+            ['Mode', c.mode], ['Speed', c.mode === 'timeline' ? `${c.speed || 1}×` : undefined], ['Idle gaps capped at', c.mode === 'timeline' ? (c.max_gap ? fmtDur(c.max_gap) : DASH) : undefined],
+            ['Rate', c.mode === 'rate' && !(c.stages && c.stages.length) ? `${c.rate} req/s` : undefined],
+            ['Stages', c.stages && c.stages.length ? c.stages.map((s) => `${fmtDur(s.duration)} ${s.hold ? 'step to' : 'ramp to'} ${fmtCompact(s.rate)}/s`).join(', ') : undefined],
+            ['Amplify', c.mode === 'timeline' ? `${c.amplify || 1}×` : undefined], ['Error amplification', `${c.error_amplification || 1}×`], ['Concurrency', c.concurrency || (c.mode === 'max' ? 64 : 2048)],
+            ['Duration', c.duration ? fmtDur(c.duration) : DASH], ['Loop', c.mode === 'rate' ? undefined : c.loop ? 'yes' : 'no'], ['Max requests', c.max_requests || DASH], ['Timeout', c.timeout ? fmtDur(c.timeout) : DASH],
+            ['Seed', c.seed ? String(c.seed) : DASH, true],
           ]),
           kvList([
             ['Include', list(c.include)], ['Exclude', list(c.exclude)],
@@ -311,7 +374,7 @@ export async function detail(ctx) {
 
   // ---- lifecycle
   function paintAll() {
-    paintHeader(); paintProgress(); paintStats(); paintLatency(); paintStatus(); paintEndpoints(); paintConfig();
+    paintHeader(); paintSaturated(); paintProgress(); paintStats(); paintLatency(); paintStatus(); paintEndpoints(); paintConfig();
     const pending = job.status === 'pending';
     chartsHost.hidden = pending;
     epHost.hidden = !(job.summary && job.summary.completed);
@@ -348,7 +411,7 @@ export async function detail(ctx) {
     if (!cur) return;
     job = { ...job, status: cur.status, summary: cur.summary || job.summary };
     if (cur.status !== lastStatus) { lastStatus = cur.status; reload(true); return; }
-    paintProgress(); paintStats(); paintLatency(); paintStatus(); paintEndpoints();
+    paintSaturated(); paintProgress(); paintStats(); paintLatency(); paintStatus(); paintEndpoints();
     if (job.status === 'running') paintHeader();
   });
 void replaceQuery; void badge; void selectCtl; void icon;
@@ -431,6 +494,7 @@ function summaryCompare(ja, jb) {
   for (const [k, l] of LAT_ROWS.filter(([k]) => ['p50', 'p95', 'p99', 'p999', 'max'].includes(k))) add(l, A.corrected_latency[k], B.corrected_latency[k], fmtMs, BETTER_LOW);
   rows.push({ section: 'Scheduling and volume' });
   add('Max lag', durMs(A.max_lag), durMs(B.max_lag), fmtMs, BETTER_LOW);
+  add('Peak in flight', A.max_in_flight, B.max_in_flight, fmtInt, null);
   add('Requests sent', A.sent, B.sent, fmtInt, null);
   add('Elapsed', durMs(A.elapsed), durMs(B.elapsed), (v) => fmtHuman(v), null);
   add('Bytes received', A.bytes_received, B.bytes_received, fmtBytes, null);
@@ -447,7 +511,7 @@ function summaryCompare(ja, jb) {
 }
 
 function configDiff(ja, jb) {
-  const keys = ['recording_id', 'target', 'mode', 'speed', 'rate', 'stages', 'amplify', 'error_amplification', 'concurrency', 'duration', 'loop', 'max_requests', 'timeout', 'include', 'exclude', 'profile_id', 'vary_clones', 'compare_status'];
+  const keys = ['recording_id', 'target', 'mode', 'speed', 'max_gap', 'rate', 'stages', 'amplify', 'error_amplification', 'concurrency', 'duration', 'loop', 'max_requests', 'timeout', 'include', 'exclude', 'host_header', 'insecure_skip_verify', 'profile_id', 'vary_clones', 'compare_status'];
   const fmtV = (v) => (v === undefined || v === '' ? DASH : typeof v === 'object' ? JSON.stringify(v) : String(v));
   const diffs = keys.filter((k) => JSON.stringify(ja.config[k]) !== JSON.stringify(jb.config[k]));
   return card({

@@ -1,0 +1,30 @@
+# Keep the build context small and the layer cache stable: only what
+# `go build ./cmd/mirage` and the image need.
+.git
+.github
+.gitignore
+.dockerignore
+.DS_Store
+
+# build output and local state
+bin/
+dist/
+/mirage
+*.test
+*.out
+*.prof
+coverage.*
+*.db
+*.db-shm
+*.db-wal
+tmp/
+
+# not needed to build the binary
+docs/
+examples/
+scripts/
+Dockerfile
+Makefile
+
+# UI development tooling and screenshots (the embedded UI is web/static)
+web/dev/

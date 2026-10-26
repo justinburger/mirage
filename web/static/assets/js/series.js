@@ -23,6 +23,10 @@ export function pointToRow(p) {
     in_flight: p.in_flight || 0,
     bytes_in: p.bytes_in || 0,
     bytes_out: p.bytes_out || 0,
+    // Replay jobs only: latency from each request's intended send time. Left
+    // undefined for services so charts skip the series.
+    cp95: p.corrected_p95 != null ? p.corrected_p95 : undefined,
+    cp99: p.corrected_p99 != null ? p.corrected_p99 : undefined,
   };
 }
 

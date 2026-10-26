@@ -34,15 +34,16 @@ error mix. A built-in web UI manages and monitors all of it.
 | `internal/anonymize` | Deterministic anonymization engine and PII detectors | model |
 | `internal/fault` | Fault rules: latency, errors, aborts, hangs, throttling | model |
 | `internal/pathnorm` | Path → endpoint template (`/users/{id}`) | — |
+| `internal/netutil` | `net/http` helpers shared by the HTTP servers (fast graceful shutdown) | — |
 | `internal/har` | HAR 1.2 import/export | model |
 | `internal/virtual` | Recorded-response matching, latency simulation, error amplification | model, store, pathnorm |
-| `internal/proxy` | Service listeners, reverse proxy, capture pipeline | model, store, metrics, fault, anonymize, pathnorm |
+| `internal/proxy` | Service listeners, reverse proxy, capture pipeline | model, store, metrics, fault, anonymize, pathnorm, netutil |
 | `internal/replay` | Load generator and replay job manager | model, store, metrics, anonymize, pathnorm |
 | `internal/ops` | Anonymized copies, HAR import/export over the store | model, store, anonymize, har, pathnorm, fault |
 | `internal/api` | REST API, SSE, auth, static UI | model, store, metrics, fault, anonymize, har, pathnorm, ops |
 | `internal/config` | YAML/JSON config file, applied at start-up | model, store, ops |
 | `internal/app` | Wiring: builds every component, start-up and shutdown | everything |
-| `cmd/mirage` | CLI: `serve`, `replay`, `anonymize`, `import`, `export`, `version` | app, … |
+| `cmd/mirage` | CLI: `serve`, `replay`, `anonymize`, `import`, `export`, `recordings`, `version` | app, … |
 | `web` | Embedded UI (vanilla JS ES modules, no build step) | — |
 
 Rules:
@@ -89,15 +90,27 @@ Rules:
 
 ## Wiring (`internal/app`)
 
-Start: open store → `config.Apply` → `ops.LoadFaults` → metrics registry
-`Run` → `replay.Manager.Recover` → `proxy.Manager.Apply` for every enabled
-service → `api.Server.Run` + admin HTTP server.
+`app.New` opens the store, applies the configuration file (`config.Apply`,
+after `anonymize.Validate` over its profiles), loads the fault rules
+(`ops.LoadFaults`), builds the managers and binds the admin listener, so a bad
+file or a busy port fails before anything is served. `App.Run` then starts, in
+order: metrics registry `Run` → `replay.Manager.Recover` →
+`proxy.Manager.Apply` for every enabled service (a service that cannot start is
+logged and does not stop the others) → `api.Server.Run` on the run context +
+admin HTTP server.
 
 Shutdown (reverse): admin HTTP server → `replay.Manager.Shutdown` →
-`proxy.Manager.Shutdown` (drains captures) → stop the registry → `store.Close`.
+`proxy.Manager.Shutdown` (drains captures) → stop the registry → `store.Close`,
+all inside one 20 s deadline. `api.Server.Run` shares the run context, so
+cancelling it closes every open SSE stream, which `http.Server.Shutdown` would
+otherwise wait for; `netutil.NewConns` closes connections that never sent a
+request (browsers open them speculatively), which `Shutdown` would hold for
+five seconds.
 
 The `proxy.VirtualizerFactory` adapter returns an untyped nil interface on
-error (typed-nil trap).
+error (typed-nil trap); `app` also holds the compile-time assertions that
+`*proxy.Manager`, `*replay.Manager` and `*virtual.Engine` satisfy the
+interfaces that connect them.
 
 ## Performance principles
 
