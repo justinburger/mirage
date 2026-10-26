@@ -106,16 +106,56 @@ func Decode(r io.Reader) (*HAR, error) {
 // error is returned (wrapped with the entry index). The *Entry passed to fn
 // is only valid during the call.
 func DecodeEntries(r io.Reader, fn func(index int, e *Entry) error) (*Log, error) {
-	br := bufio.NewReader(r)
+	lim := &entryLimiter{r: r, max: maxEntryBytes}
+	br := bufio.NewReader(lim)
 	if b, err := br.Peek(3); err == nil && bytes.Equal(b, []byte{0xEF, 0xBB, 0xBF}) {
 		_, _ = br.Discard(3)
 	}
 	d := &docDecoder{dec: json.NewDecoder(br), fn: fn}
+	lim.dec = d.dec
 	lg, err := d.document()
 	if err != nil {
 		return nil, fmt.Errorf("har: %w", err)
 	}
 	return lg, nil
+}
+
+// maxEntryBytes bounds the size of one entry of the document (and of any other
+// single JSON value in it), which has to be held in memory whole, several
+// times over, while it is decoded. A variable so tests can lower it.
+var maxEntryBytes int64 = 256 << 20
+
+// ErrEntryTooLarge is wrapped by the error DecodeEntries returns for an entry
+// larger than the decoder will buffer.
+var ErrEntryTooLarge = errors.New("HAR entry is too large")
+
+// entryLimiter fails a read once the JSON decoder is holding more than max
+// bytes of one value: the bytes read from r minus the offset the decoder has
+// consumed up to (the end of the last token) are the part of the value read
+// so far.
+type entryLimiter struct {
+	r   io.Reader
+	n   int64
+	max int64
+	dec *json.Decoder
+	err error // set once the limit is hit; every later Read returns it
+}
+
+func (l *entryLimiter) Read(p []byte) (int, error) {
+	if l.err != nil {
+		return 0, l.err
+	}
+	n, err := l.r.Read(p)
+	l.n += int64(n)
+	if l.dec != nil && l.n-l.dec.InputOffset() > l.max {
+		if l.max >= 1<<20 {
+			l.err = fmt.Errorf("%w (more than %d MiB)", ErrEntryTooLarge, l.max>>20)
+		} else {
+			l.err = fmt.Errorf("%w (more than %d KiB)", ErrEntryTooLarge, l.max>>10)
+		}
+		return n, l.err
+	}
+	return n, err
 }
 
 // docDecoder walks the HAR document with json.Decoder tokens so that the

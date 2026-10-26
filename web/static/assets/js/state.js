@@ -69,6 +69,23 @@ export async function refreshInfo() {
   return state.info;
 }
 
+/**
+ * What ServiceStatus.error means depends on whether the listener is up. On a
+ * service that is not running it is why it could not start (or why its
+ * listener died). On a running one it is a problem found while serving. The
+ * server reports "capture limit reached" in the separate `warning` field (the
+ * service is fine, only capturing stopped), which is never a failure; older
+ * servers put the same text in `error`, so the text is recognised in both.
+ * Returns {kind: 'failed' | 'capture-limit' | 'runtime', text} or null.
+ */
+export function statusNotice(st) {
+  if (!st) return null;
+  const note = st.running ? (st.error || st.warning) : '';
+  if (note) return { kind: /capture limit reached/i.test(note) ? 'capture-limit' : 'runtime', text: note };
+  if (st.error) return { kind: 'failed', text: st.error };
+  return null;
+}
+
 export function serviceById(id) {
   return state.services.find((s) => s.id === id) || null;
 }

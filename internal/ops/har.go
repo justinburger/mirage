@@ -2,7 +2,9 @@ package ops
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +25,18 @@ const SourceHAR = "har"
 // entry) and the destination writer.
 const exportBufferSize = 64 << 10
 
+// InvalidHARError reports input that is not a usable HAR document. Problems
+// say what is wrong, in words for the person who supplied the document (no
+// package prefixes). It is a validation error: errors.Is(err,
+// model.ErrValidation) holds.
+type InvalidHARError struct {
+	Problems []string
+}
+
+func (e *InvalidHARError) Error() string { return "invalid HAR: " + strings.Join(e.Problems, "; ") }
+
+func (e *InvalidHARError) Unwrap() error { return model.ErrValidation }
+
 // ImportHAR imports a HAR document read from r into a new recording called
 // name (an empty name becomes "import <timestamp>"). Entries are streamed, so
 // memory use does not depend on the size of the document. n classifies
@@ -31,9 +45,10 @@ const exportBufferSize = 64 << 10
 // recording anonymized.
 //
 // The import is all-or-nothing: on any error the partial recording is deleted.
-// Unreadable HAR content returns an error wrapping model.ErrValidation; an
-// error of r itself (for example a dropped upload) is returned wrapped but
-// otherwise unchanged, so callers can recognise it with errors.Is/As.
+// Unreadable HAR content (empty input included) returns an *InvalidHARError,
+// which wraps model.ErrValidation; an error of r itself (for example a dropped
+// upload) is returned wrapped but otherwise unchanged, so callers can
+// recognise it with errors.Is/As.
 func ImportHAR(ctx context.Context, st store.Store, r io.Reader, name string, eng *anonymize.Engine, n *pathnorm.Normalizer) (model.Recording, error) {
 	if strings.TrimSpace(name) == "" {
 		name = "import " + time.Now().Format("2006-01-02 15:04:05")
@@ -51,24 +66,28 @@ func ImportHAR(ctx context.Context, st store.Store, r io.Reader, name string, en
 	var (
 		skipped int64
 		fnErr   error
+		fnIndex int
 		app     = newAppender(st, rec.ID, nil)
 		src     = &errReader{r: r}
 	)
 	lg, err := har.DecodeEntries(src, func(index int, e *har.Entry) error {
-		fnErr = importEntry(ctx, app, e, eng, n, &skipped)
-		if fnErr != nil {
-			return fnErr
-		}
-		return nil
+		fnErr, fnIndex = importEntry(ctx, app, e, eng, n, &skipped), index
+		return fnErr
 	})
 	switch {
 	case err != nil && fnErr != nil && errors.Is(err, fnErr):
 		// A failure of ours (store, anonymizer, cancelled context, bad entry).
+		// A bad entry is reported as the input's fault, without the decoder's
+		// wrapping.
+		var ih *InvalidHARError
+		if errors.As(fnErr, &ih) {
+			err = &InvalidHARError{Problems: []string{fmt.Sprintf("entry %d: %s", fnIndex, strings.Join(ih.Problems, "; "))}}
+		}
 	case err != nil && src.err != nil:
 		// The reader failed; that is not the HAR's fault.
 		err = fmt.Errorf("read HAR: %w", src.err)
 	case err != nil:
-		err = fmt.Errorf("invalid HAR: %w: %v", model.ErrValidation, err)
+		err = &InvalidHARError{Problems: []string{harProblem(err, src.sawData)}}
 	default:
 		err = app.flush(ctx)
 	}
@@ -98,7 +117,7 @@ func importEntry(ctx context.Context, app *appender, e *har.Entry, eng *anonymiz
 			*skipped++
 			return nil
 		}
-		return fmt.Errorf("%w: %v", model.ErrValidation, err)
+		return &InvalidHARError{Problems: []string{strings.TrimPrefix(err.Error(), "har: ")}}
 	}
 	// The endpoint comes from the raw escaped path, before anonymization can
 	// replace segments of it.
@@ -109,6 +128,20 @@ func importEntry(ctx context.Context, app *appender, e *har.Entry, eng *anonymiz
 		}
 	}
 	return app.add(ctx, ex)
+}
+
+// harProblem words a failure to read the HAR document. sawData says whether
+// the input held anything besides white space.
+func harProblem(err error, sawData bool) string {
+	var syn *json.SyntaxError
+	switch {
+	case !sawData && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)):
+		return "the input is empty: send a HAR document"
+	case errors.As(err, &syn):
+		return fmt.Sprintf("malformed JSON at byte %d: %v", syn.Offset, syn)
+	}
+	msg := strings.TrimPrefix(err.Error(), "har: ")
+	return strings.ReplaceAll(msg, "unexpected EOF", "unexpected end of input (is the document truncated?)")
 }
 
 func importDescription(imported, skipped int64, lg *har.Log, eng *anonymize.Engine) string {
@@ -184,10 +217,15 @@ func ExportHAR(ctx context.Context, st store.Store, recordingID string, w io.Wri
 type errReader struct {
 	r   io.Reader
 	err error
+	// sawData is set once anything but JSON white space has been read.
+	sawData bool
 }
 
 func (e *errReader) Read(p []byte) (int, error) {
 	n, err := e.r.Read(p)
+	if !e.sawData && len(bytes.TrimSpace(p[:n])) > 0 {
+		e.sawData = true
+	}
 	if err != nil && err != io.EOF && e.err == nil {
 		e.err = err
 	}

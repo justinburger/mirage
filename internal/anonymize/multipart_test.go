@@ -256,8 +256,10 @@ func TestMultipartTextPartsGetRulesAndDetectors(t *testing.T) {
 	check("meta", func(p gotPart) bool {
 		return strings.Contains(p.body, `"session":"[REDACTED]"`) && !strings.Contains(p.body, "acme.io") && strings.Contains(p.body, `"n":1`)
 	}, "a JSON part should get JSON rules and detectors")
-	check("avatar", func(p gotPart) bool { return p.body == "\x89PNG-bytes jane@acme.io" && p.filename == "me.png" }, "file parts are kept")
-	check("resume", func(p gotPart) bool { return p.body == "John Smith, jane@acme.io" }, "text file parts are kept")
+	check("avatar", func(p gotPart) bool { return p.body == "\x89PNG-bytes jane@acme.io" && p.filename == "me.png" }, "binary file parts are kept")
+	check("resume", func(p gotPart) bool {
+		return strings.HasPrefix(p.body, "John Smith, ") && !strings.Contains(p.body, "acme.io") && strings.Contains(p.body, "@example.") && p.filename == "cv.txt"
+	}, "text file parts are inspected like any text body")
 
 	// Boundary, preamble, epilogue, delimiters and part headers are byte for byte.
 	skeleton := func(s string, bodies []string) string {
@@ -309,21 +311,24 @@ func TestMultipartFillPartBehaviour(t *testing.T) {
 	in := buildMP(mpBoundary, "\r\n",
 		tpart{name: "email", body: "jane@acme.io"},
 		tpart{name: "photo", filename: "a.jpg", ct: "image/jpeg", body: bin},
-		tpart{name: "doc", filename: "cv.txt", ct: "text/plain", body: "John Smith lives at 1 Main St"},
-		tpart{name: "blob", ct: "application/octet-stream", body: "\x00\x01\x02\xffbinary"}, // binary part without filename
-		tpart{name: "enc", ct: "text/plain", extra: "Content-Transfer-Encoding: base64\r\n", body: "amFuZUBhY21lLmlv"},
+		tpart{name: "doc", filename: "cv.txt", ct: "text/plain", body: "John Smith lives at 1 Main St, jane@acme.io"}, // a text file: inspected, never filled
+		tpart{name: "blob", ct: "application/octet-stream", body: "\x00\x01\x02\xffbinary"},                           // binary part without filename
+		tpart{name: "enc", ct: "application/octet-stream", extra: "Content-Transfer-Encoding: base64\r\n", body: "AAEC/2JpbmFyeS1ieXRlcy1oZXJlAH8="},
 		tpart{name: "video", filename: "v.mp4", ct: "video/mp4", body: big},
 		tpart{name: "same", filename: "s.bin", ct: "image/png", body: bin}, // equal to photo
 		tpart{name: "empty", filename: "e.bin", ct: "image/png", body: ""},
 	)
 	keep := mpRequest(t, defaultEngine(t), mpCT(mpBoundary), in, false, 0)
 	kp := readMP(t, string(keep.Body), mpBoundary)
-	for _, n := range []string{"photo", "doc", "blob", "enc", "video", "same"} {
+	for _, n := range []string{"photo", "blob", "enc", "video", "same"} {
 		p, _ := mpByName(kp, n)
 		orig, _ := mpByName(readMP(t, in, mpBoundary), n)
 		if p.body != orig.body {
 			t.Errorf("keep: part %q changed", n)
 		}
+	}
+	if doc, _ := mpByName(kp, "doc"); strings.Contains(doc.body, "acme.io") || !strings.HasPrefix(doc.body, "John Smith lives at 1 Main St, ") {
+		t.Errorf("keep: the text file part was not anonymized: %q", doc.body)
 	}
 
 	e := fillEngine(t)
@@ -346,6 +351,11 @@ func TestMultipartFillPartBehaviour(t *testing.T) {
 		case "empty":
 			if f.body != "" {
 				t.Errorf("empty part got content: %q", f.body)
+			}
+		case "doc":
+			// A text file is anonymized like any text, not replaced by filler.
+			if strings.Contains(f.body, "acme.io") || !strings.HasPrefix(f.body, "John Smith lives at 1 Main St, ") || !strings.Contains(f.body, "@example.") {
+				t.Errorf("text file part: %q", f.body)
 			}
 		default:
 			if len(f.body) != len(o.body) {
@@ -471,22 +481,24 @@ func TestMultipartNested(t *testing.T) {
 		tpart{name: "files", ct: "multipart/mixed; boundary=INNER", body: inner},
 	)
 	keep := mpRequest(t, defaultEngine(t), mpCT("OUTER"), in, false, 0)
-	if strings.Contains(string(keep.Body), `jane@acme.io`) && strings.Count(string(keep.Body), "acme.io") != 1 {
-		t.Errorf("only the file's copy may remain under keep: %q", keep.Body)
+	// The nested text file is inspected (its address is faked); the gif is
+	// binary and kept.
+	if strings.Contains(string(keep.Body), `acme.io`) {
+		t.Errorf("an address survived in a nested text file: %q", keep.Body)
 	}
-	if !strings.Contains(string(keep.Body), "file a for jane@acme.io") || !strings.Contains(string(keep.Body), string(patterned(80, "gif"))) {
-		t.Errorf("nested file parts must be kept: %q", keep.Body)
+	if !strings.Contains(string(keep.Body), "file a for ") || !strings.Contains(string(keep.Body), string(patterned(80, "gif"))) {
+		t.Errorf("the nested text file must be anonymized and the nested gif kept: %q", keep.Body)
 	}
 
 	req := mpRequest(t, fillEngine(t), mpCT("OUTER"), in, false, 0)
 	out := string(req.Body)
-	if strings.Contains(out, "acme.io") || strings.Contains(out, string(patterned(80, "gif"))) || strings.Contains(out, "file a for") {
-		t.Errorf("nested file parts were not filled: %q", out)
+	if strings.Contains(out, "acme.io") || strings.Contains(out, string(patterned(80, "gif"))) || !strings.Contains(out, "file a for ") {
+		t.Errorf("under fill the nested gif must be filled and the nested text anonymized: %q", out)
 	}
 	parts := readMP(t, out, "OUTER")
 	files, _ := mpByName(parts, "files")
-	if len(files.body) != len(inner) {
-		t.Errorf("nested body length %d, want %d", len(files.body), len(inner))
+	if !strings.Contains(files.body, "@example.") {
+		t.Errorf("nested text file: %q", files.body)
 	}
 	if !strings.HasPrefix(files.body, "--INNER\r\nContent-Disposition: file; filename=\"a.txt\"\r\nContent-Type: text/plain\r\n\r\n") || !strings.HasSuffix(files.body, "\r\n--INNER--") {
 		t.Errorf("nested framing changed: %q", files.body)

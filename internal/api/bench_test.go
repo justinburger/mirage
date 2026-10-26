@@ -31,7 +31,7 @@ func BenchmarkGetService(b *testing.B) {
 	e := benchEnv(b)
 	svc := e.seedService(model.Service{Name: "bench"})
 	h := e.srv.Handler()
-	req := httptest.NewRequest("GET", "/api/v1/services/"+svc.ID, nil)
+	req := benchRequest("GET", "/api/v1/services/"+svc.ID, nil)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -47,7 +47,7 @@ func BenchmarkListServices100(b *testing.B) {
 		e.seedService(model.Service{Name: fmt.Sprintf("svc-%03d", i), ListenAddr: ":0"})
 	}
 	h := e.srv.Handler()
-	req := httptest.NewRequest("GET", "/api/v1/services", nil)
+	req := benchRequest("GET", "/api/v1/services", nil)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -61,7 +61,7 @@ func BenchmarkListExchangesPage100(b *testing.B) {
 	e := benchEnv(b)
 	rec := e.seedRecording("bench", 5000)
 	h := e.srv.Handler()
-	req := httptest.NewRequest("GET", "/api/v1/recordings/"+rec.ID+"/exchanges?limit=100&offset=2000", nil)
+	req := benchRequest("GET", "/api/v1/recordings/"+rec.ID+"/exchanges?limit=100&offset=2000", nil)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -76,7 +76,7 @@ func BenchmarkGetExchange(b *testing.B) {
 	rec := e.seedRecording("bench", 100)
 	items, _, _ := e.st.ListExchanges(context.Background(), rec.ID, model.ExchangeQuery{Limit: 1})
 	h := e.srv.Handler()
-	req := httptest.NewRequest("GET", fmt.Sprintf("/api/v1/exchanges/%d", items[0].ID), nil)
+	req := benchRequest("GET", fmt.Sprintf("/api/v1/exchanges/%d", items[0].ID), nil)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -94,7 +94,7 @@ func BenchmarkServiceStats(b *testing.B) {
 		col.Observe(metrics.Observation{Endpoint: fmt.Sprintf("GET /e%d", i), Status: 200, Duration: time.Millisecond})
 	}
 	h := e.srv.Handler()
-	req := httptest.NewRequest("GET", "/api/v1/services/"+svc.ID+"/stats", nil)
+	req := benchRequest("GET", "/api/v1/services/"+svc.ID+"/stats", nil)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -111,7 +111,7 @@ func BenchmarkCreateFaultRule(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		req := httptest.NewRequest("POST", "/api/v1/faults", bytes.NewReader(payload))
+		req := benchRequest("POST", "/api/v1/faults", bytes.NewReader(payload))
 		if r := serve(b, h, req); r.Code != 201 {
 			b.Fatal(r.Code, r.Body.String())
 		}
@@ -153,7 +153,7 @@ func BenchmarkAuthOverhead(b *testing.B) {
 				}
 			})
 			h := e.srv.Handler()
-			req := httptest.NewRequest("GET", "/api/v1/info", nil)
+			req := benchRequest("GET", "/api/v1/info", nil)
 			if withToken {
 				req.Header.Set("Authorization", "Bearer "+testToken)
 			}
@@ -172,11 +172,11 @@ func BenchmarkStaticUI(b *testing.B) {
 	e := benchEnv(b)
 	h := e.srv.Handler()
 	first := httptest.NewRecorder()
-	h.ServeHTTP(first, httptest.NewRequest("GET", "/assets/app.js", nil))
+	h.ServeHTTP(first, benchRequest("GET", "/assets/app.js", nil))
 	etag := first.Header().Get("ETag")
 
 	b.Run("200", func(b *testing.B) {
-		req := httptest.NewRequest("GET", "/assets/app.js", nil)
+		req := benchRequest("GET", "/assets/app.js", nil)
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			if r := serve(b, h, req); r.Code != 200 {
@@ -185,7 +185,7 @@ func BenchmarkStaticUI(b *testing.B) {
 		}
 	})
 	b.Run("304", func(b *testing.B) {
-		req := httptest.NewRequest("GET", "/assets/app.js", nil)
+		req := benchRequest("GET", "/assets/app.js", nil)
 		req.Header.Set("If-None-Match", etag)
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
@@ -195,7 +195,7 @@ func BenchmarkStaticUI(b *testing.B) {
 		}
 	})
 	b.Run("spa-fallback", func(b *testing.B) {
-		req := httptest.NewRequest("GET", "/services/svc_1", nil)
+		req := benchRequest("GET", "/services/svc_1", nil)
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			if r := serve(b, h, req); r.Code != 200 {

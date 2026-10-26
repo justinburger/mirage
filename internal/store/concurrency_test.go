@@ -221,7 +221,9 @@ func TestConcurrentConfigWrites(t *testing.T) {
 		for err := range errs {
 			t.Error(err)
 		}
-		for table, want := range map[string]int{"fault_rules": 1, "replay_jobs": 1, "settings": 1} {
+		// settings: the "shared" key written above, plus the store's own
+		// default_profile_rev record.
+		for table, want := range map[string]int{"fault_rules": 1, "replay_jobs": 1, "settings": 2} {
 			if n := countRows(t, s, table); n != want {
 				t.Errorf("%s has %d rows, want %d", table, n, want)
 			}

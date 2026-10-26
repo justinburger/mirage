@@ -153,7 +153,9 @@ func TestInfoReportsAuth(t *testing.T) {
 }
 
 // A cookie is sent by the browser on cross-site requests too, so a request that
-// only has a cookie must come from this site to change anything.
+// only has a cookie must come from this site to change anything. Since the
+// guard applies in every auth mode (see guard_test.go), a request with another
+// origin is refused whichever credential it presents.
 func TestAuthCookieRefusesCrossOriginWrites(t *testing.T) {
 	e := authEnv(t)
 	host := strings.TrimPrefix(e.ts.URL, "http://")
@@ -175,8 +177,9 @@ func TestAuthCookieRefusesCrossOriginWrites(t *testing.T) {
 		{"DELETE from this origin reaches the handler", "DELETE", "/api/v1/services/svc_x", map[string]string{"Cookie": cookie, "Origin": "http://" + host}, 404},
 		{"POST without Origin (curl)", "POST", "/api/v1/services", map[string]string{"Cookie": cookie}, 400},
 		{"GET from another origin is harmless", "GET", "/api/v1/services", map[string]string{"Cookie": cookie, "Origin": "https://evil.example"}, 200},
-		{"bearer is not subject to the origin check", "POST", "/api/v1/services", map[string]string{"Authorization": "Bearer " + testToken, "Origin": "https://evil.example"}, 400},
-		{"query token is not subject to the origin check", "POST", "/api/v1/services?access_token=" + testToken, map[string]string{"Origin": "https://evil.example"}, 400},
+		{"bearer from another origin is refused too", "POST", "/api/v1/services", map[string]string{"Authorization": "Bearer " + testToken, "Origin": "https://evil.example"}, 403},
+		{"query token from another origin is refused too", "POST", "/api/v1/services?access_token=" + testToken, map[string]string{"Origin": "https://evil.example"}, 403},
+		{"bearer from this origin reaches the handler", "POST", "/api/v1/services", map[string]string{"Authorization": "Bearer " + testToken, "Origin": "http://" + host}, 400},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

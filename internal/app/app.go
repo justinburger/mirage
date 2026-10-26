@@ -7,9 +7,10 @@
 // configuration (config.Apply), loads the fault rules (ops.LoadFaults) and
 // builds the managers; Run then starts the metrics registry, runs
 // replay.Manager.Recover, applies every enabled service (proxy.Manager.Apply)
-// and finally starts api.Server.Run and the admin HTTP server. Shutdown is the
-// reverse: admin HTTP server, replay jobs, proxy listeners (draining the
-// capture queue), the registry, the store.
+// and finally starts api.Server.Run and the admin HTTP server. Shutdown
+// reverses it: the admin HTTP server drains alongside the replay jobs and the
+// proxy listeners (draining the capture queue), each with its own slice of the
+// time budget (see App.stop), then the registry and the store are closed.
 package app
 
 import (
@@ -53,6 +54,26 @@ var (
 // captures, saving replay jobs, closing the store).
 const ShutdownTimeout = 20 * time.Second
 
+// adminGrace is how long admin requests that are still running get to finish
+// once shutdown begins. After that their connections are closed, so a client
+// that stalled in the middle of an upload cannot hold up saving the replay jobs
+// and draining the capture queue, which have their own budgets inside
+// ShutdownTimeout (see App.stop).
+const adminGrace = 5 * time.Second
+
+// handlerWait bounds how long shutdown waits for admin handlers whose
+// connections were closed to return before the store is closed under them.
+const handlerWait = 2 * time.Second
+
+// Shares of the time left in the shutdown budget (see budget). Replay jobs
+// only have to be cancelled and saved; the proxy phase drains the capture queue
+// and gets nearly everything that is left. The rest is for stopping the
+// registry and closing the store.
+const (
+	replayShare = 0.3
+	proxyShare  = 0.85
+)
+
 // Options configures an App.
 type Options struct {
 	// Admin is the listen address of the admin UI, API and /metrics
@@ -68,6 +89,10 @@ type Options struct {
 	Config *config.Config
 	// AdminToken, when not empty, is required by the admin API.
 	AdminToken string
+	// AllowedHosts are DNS names (optionally with a port) the admin API may be
+	// addressed by when it has no AdminToken. IP addresses and localhost
+	// always work; see api.Deps.AllowedHosts.
+	AllowedHosts []string
 	// Logger defaults to a discard logger.
 	Logger *slog.Logger
 }
@@ -85,10 +110,16 @@ type App struct {
 	api      *api.Server
 	httpSrv  *http.Server
 	newConns *netutil.NewConns
+	requests *requestTracker
 	ln       net.Listener
 
 	// applied describes what the configuration file changed.
 	applied config.ApplyResult
+
+	// shutdownTimeout and adminGrace are ShutdownTimeout and adminGrace; tests
+	// shorten them.
+	shutdownTimeout time.Duration
+	adminGrace      time.Duration
 
 	runOnce      sync.Once
 	shutdownOnce sync.Once
@@ -112,7 +143,7 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		opts.Data = "mirage.db"
 	}
 
-	a := &App{opts: opts, log: log}
+	a := &App{opts: opts, log: log, shutdownTimeout: ShutdownTimeout, adminGrace: adminGrace}
 	ok := false
 	defer func() {
 		if !ok {
@@ -166,16 +197,17 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	})
 
 	a.api = api.New(api.Deps{
-		Store:      st,
-		Services:   a.proxy,
-		Replays:    a.replay,
-		Metrics:    a.registry,
-		Faults:     a.faults,
-		UI:         web.FS(),
-		AdminToken: opts.AdminToken,
-		Version:    version.Version,
-		DataPath:   opts.Data,
-		Logger:     log.With("component", "api"),
+		Store:        st,
+		Services:     a.proxy,
+		Replays:      a.replay,
+		Metrics:      a.registry,
+		Faults:       a.faults,
+		UI:           web.FS(),
+		AdminToken:   opts.AdminToken,
+		AllowedHosts: opts.AllowedHosts,
+		Version:      version.Version,
+		DataPath:     opts.Data,
+		Logger:       log.With("component", "api"),
 	})
 
 	// Bind the admin address now so that "address in use" is reported before
@@ -185,8 +217,9 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		return nil, fmt.Errorf("admin listener: %w", err)
 	}
 	a.ln = ln
+	a.requests = &requestTracker{next: a.api.Handler()}
 	a.httpSrv = &http.Server{
-		Handler:           a.api.Handler(),
+		Handler:           a.requests,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    1 << 20,
@@ -345,11 +378,11 @@ func (a *App) startServices(ctx context.Context) {
 // to call more than once and after Run returned.
 func (a *App) Close() error { return a.shutdown() }
 
-// shutdown stops everything in reverse start order, bounded by
-// ShutdownTimeout. Only the first call does the work.
+// shutdown stops everything, bounded by ShutdownTimeout. Only the first call
+// does the work.
 func (a *App) shutdown() error {
 	a.shutdownOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), ShutdownTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), a.shutdownTimeout)
 		defer cancel()
 		a.shutdownErr = a.stop(ctx)
 	})
@@ -365,39 +398,46 @@ func (a *App) stop(ctx context.Context) error {
 	}
 
 	// 1. Admin HTTP server. Open SSE streams were closed when the API's
-	// context ended; whatever is left is cut when the deadline passes.
-	if a.httpSrv != nil {
-		a.newConns.CloseAll() // idle browser connections must not delay Shutdown by 5 s
-		if err := a.httpSrv.Shutdown(ctx); err != nil {
-			_ = a.httpSrv.Close()
-			if !errors.Is(err, http.ErrServerClosed) {
-				errs = append(errs, fmt.Errorf("admin server: %w", err))
-			}
-		}
-	}
-	if a.ln != nil {
-		_ = a.ln.Close()
-	}
-	if a.api != nil {
-		a.api.WaitContext(ctx)
-	}
-	phase("admin server")
+	// context ended; requests still running get adminGrace to finish.
+	adminDone := a.stopAdmin(ctx)
 
 	// 2. Replay jobs: stopped and saved with their partial results.
 	if a.replay != nil {
-		if err := a.replay.Shutdown(ctx); err != nil {
+		rctx, cancel := budget(ctx, replayShare)
+		if err := a.replay.Shutdown(rctx); err != nil {
 			errs = append(errs, fmt.Errorf("replay: %w", err))
 		}
+		cancel()
 	}
 	phase("replay jobs")
 
 	// 3. Service listeners, then the capture queue.
 	if a.proxy != nil {
-		if err := a.proxy.Shutdown(ctx); err != nil {
+		pctx, cancel := budget(ctx, proxyShare)
+		if err := a.proxy.Shutdown(pctx); err != nil {
 			errs = append(errs, fmt.Errorf("proxy: %w", err))
 		}
+		cancel()
 	}
 	phase("service listeners and capture queue")
+
+	// The admin server is bounded by adminGrace, so this wait is short. It
+	// keeps the store open until the handlers are done, including those whose
+	// connections were just closed and are cleaning up (an interrupted import
+	// deletes its partial recording).
+	select {
+	case <-adminDone:
+	case <-ctx.Done():
+	}
+	if a.api != nil {
+		a.api.WaitContext(ctx)
+	}
+	if a.requests != nil {
+		wctx, wcancel := context.WithTimeout(ctx, handlerWait)
+		a.requests.wait(wctx)
+		wcancel()
+	}
+	phase("admin server")
 
 	// 4. The registry.
 	if a.regStop != nil {
@@ -415,6 +455,95 @@ func (a *App) stop(ctx context.Context) error {
 		a.log.Info("shutdown complete")
 	}
 	return errors.Join(errs...)
+}
+
+// stopAdmin begins shutting the admin server down and returns a channel that
+// is closed once it is done. The server stops accepting at once and finishes
+// the requests in flight; those still running after adminGrace have their
+// connections closed (a stalled upload is cut, which is not a failed
+// shutdown, so it is logged and not returned).
+func (a *App) stopAdmin(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
+	if a.httpSrv == nil {
+		if a.ln != nil {
+			_ = a.ln.Close()
+		}
+		close(done)
+		return done
+	}
+	a.newConns.CloseAll() // idle browser connections must not delay Shutdown by 5 s
+	go func() {
+		defer close(done)
+		gctx, cancel := context.WithTimeout(ctx, a.adminGrace)
+		defer cancel()
+		if err := a.httpSrv.Shutdown(gctx); err != nil {
+			_ = a.httpSrv.Close()
+			if !errors.Is(err, http.ErrServerClosed) {
+				a.log.Warn("admin requests were still running after the grace period; their connections were closed",
+					"grace", a.adminGrace.String(), "error", err)
+			}
+		}
+		if a.ln != nil {
+			_ = a.ln.Close()
+		}
+	}()
+	return done
+}
+
+// budget returns a context that ends after at most frac of the time left in
+// parent (or when parent ends). Without a deadline it is just a child of
+// parent.
+func budget(parent context.Context, frac float64) (context.Context, context.CancelFunc) {
+	dl, ok := parent.Deadline()
+	if !ok {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, time.Duration(float64(time.Until(dl))*frac))
+}
+
+// requestTracker counts the admin requests whose handlers are still running.
+// http.Server.Shutdown waits for them, http.Server.Close does not, and the
+// store must outlive them.
+type requestTracker struct {
+	next http.Handler
+
+	mu   sync.Mutex
+	n    int
+	idle chan struct{} // closed when n drops to 0; nil when nobody waits
+}
+
+func (t *requestTracker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	t.mu.Lock()
+	t.n++
+	t.mu.Unlock()
+	defer func() {
+		t.mu.Lock()
+		t.n--
+		if t.n == 0 && t.idle != nil {
+			close(t.idle)
+			t.idle = nil
+		}
+		t.mu.Unlock()
+	}()
+	t.next.ServeHTTP(w, r)
+}
+
+// wait blocks until no handler is running or ctx ends.
+func (t *requestTracker) wait(ctx context.Context) {
+	t.mu.Lock()
+	if t.n == 0 {
+		t.mu.Unlock()
+		return
+	}
+	if t.idle == nil {
+		t.idle = make(chan struct{})
+	}
+	idle := t.idle
+	t.mu.Unlock()
+	select {
+	case <-idle:
+	case <-ctx.Done():
+	}
 }
 
 // closeQuiet releases what New had opened when it fails half way.

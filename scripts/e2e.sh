@@ -485,6 +485,15 @@ rc=$?
 set -e
 assert "replay CLI exits 1 when --max-p99 is exceeded" test "$rc" = 1
 
+# A target that is down measures nothing: that must fail even without thresholds.
+set +e
+"$BIN/mirage" replay --har "$TMP/e2e.har" --target "http://127.0.0.1:$(free_port)" --speed 1000 --max-requests 5 \
+  --quiet >"$TMP/cli3b.out" 2>"$TMP/cli3b.err"
+rc=$?
+set -e
+assert "replay CLI exits 1 when no request gets a response (target down, no thresholds)" test "$rc" = 1
+assert "...and says every request failed" grep -q 'every request failed' "$TMP/cli3b.err"
+
 set +e
 "$BIN/mirage" replay --har "$TMP/e2e.har" --target "$SVC" --speed 20 --quiet --json "$TMP/cli-har.json" >"$TMP/cli4.out" 2>"$TMP/cli4.err"
 rc=$?

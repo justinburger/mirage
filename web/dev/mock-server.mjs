@@ -194,13 +194,23 @@ function newAcc() {
   return { requests: 0, errors: 0, bytes_in: 0, bytes_out: 0, cls: { '2xx': 0, '3xx': 0, '4xx': 0, '5xx': 0, err: 0 }, wsum: 0, p50: 0, p95: 0, p99: 0, max: 0, min: 1e9, recent: [] };
 }
 
+// Like the Go proxy: once the recording holds max_capture_bytes of bodies, a
+// record or hybrid service keeps running and says "capture limit reached" in
+// ServiceStatus.warning (a runtime note, not an error or a start failure).
+function captureLimitNote(svc, rec, running) {
+  const captures = svc.mode === 'record' || svc.mode === 'hybrid';
+  return running && captures && svc.max_capture_bytes > 0 && rec && rec.bytes >= svc.max_capture_bytes ? 'capture limit reached' : '';
+}
+
 function statusOf(svc) {
-  const { running, error } = resolveRunning(svc);
+  const { running, error: startError } = resolveRunning(svc);
   const r = rt(svc);
   const rec = db.recordings.get(svc.recording_id);
+  const error = startError;
+  const warning = captureLimitNote(svc, rec, running);
   const usesIndex = svc.mode === 'virtualize' || svc.mode === 'hybrid';
   return {
-    service_id: svc.id, running, addr: running ? (svc.listen_addr.startsWith(':') ? `[::]${svc.listen_addr}` : svc.listen_addr) : '', mode: svc.mode, ...(error ? { error } : {}),
+    service_id: svc.id, running, addr: running ? (svc.listen_addr.startsWith(':') ? `[::]${svc.listen_addr}` : svc.listen_addr) : '', mode: svc.mode, ...(error ? { error } : {}), ...(warning ? { warning } : {}),
     ...(running ? { started_at: iso(r.startedAt) } : {}),
     captured: Math.round(r.captured), capture_dropped: r.dropped, capture_skipped: Math.round(r.captured * 0.004), virtual_hits: Math.round(r.hits), virtual_misses: Math.round(r.misses),
     virtual_injected: usesIndex ? Math.round(r.hits * Math.min(1, 0.004 * (svc.error_amplification || 1))) : 0,
@@ -557,7 +567,8 @@ function replaySummary(job) {
   return {
     planned: plan.planned, sent: s.sent, completed: s.completed, failed: s.failed, timeouts: s.timeouts, errors: s.errors, mismatches: s.mismatches,
     status_counts: statusCounts, latency: L, corrected_latency: C,
-    target_rps: job.config.mode === 'max' ? 0 : round(elapsed ? s.targetSum / elapsed : plan.avg, 1),
+    // Like the Go engine: unknown (0) until the first second has been scheduled.
+    target_rps: job.config.mode === 'max' || !elapsed ? 0 : round(s.targetSum / elapsed, 1),
     achieved_rps: round(elapsed ? s.completed / elapsed : 0, 1),
     error_rate: s.completed ? round(s.errors / s.completed, 5) : 0,
     bytes_sent: s.bytes_sent, bytes_received: s.bytes_received,
@@ -668,9 +679,25 @@ function replaySnapshot(job) {
 }
 
 const cleanPoint = (p) => { const { _target, _sat, ...rest } = p; return rest; };
+// The Go API returns the values of credential-like set_headers as "***" on
+// every read, including the create response, by a fixed rule (not the default
+// profile's redact list): well-known names, names containing one of a few
+// fragments, and names ending in -key or _key. It also refuses to store "***"
+// for such a header (400), so a fetched job cannot be posted back with the mask.
+const MASKED_VALUE = '***';
+const SENSITIVE_NAMES = new Set(['authorization', 'proxy-authorization', 'cookie', 'set-cookie', 'x-api-key', 'x-auth-token', 'x-access-token', 'x-csrf-token', 'x-xsrf-token']);
+const SENSITIVE_PARTS = ['auth', 'token', 'secret', 'password', 'passwd', 'credential', 'session', 'cookie', 'api-key', 'apikey', 'api_key', 'private-key', 'access-key', 'signature'];
+function isSensitiveHeader(name) {
+  const n = String(name).trim().toLowerCase();
+  return SENSITIVE_NAMES.has(n) || n === 'key' || n.endsWith('-key') || n.endsWith('_key') || SENSITIVE_PARTS.some((part) => n.includes(part));
+}
+function maskSetHeaders(cfg) {
+  if (!cfg || !cfg.set_headers || !Object.keys(cfg.set_headers).length) return cfg;
+  return { ...cfg, set_headers: Object.fromEntries(Object.entries(cfg.set_headers).map(([k, v]) => [k, isSensitiveHeader(k) ? MASKED_VALUE : v])) };
+}
 function jobOut(job, withSeries) {
   const { _sim, _plan, _startMs, series, ...rest } = job;
-  const out = { ...rest };
+  const out = { ...rest, config: maskSetHeaders(rest.config) };
   if (!out.started_at) delete out.started_at;
   if (out.ended_at === null) out.ended_at = null;
   if (withSeries) out.series = series.map(cleanPoint);
@@ -717,7 +744,10 @@ function parseReplayConfig(cfg) {
   if (c.vary_clones && !c.profile_id) p.push('vary_clones needs profile_id');
   if (c.profile_id && !db.profiles.has(c.profile_id)) p.push(`profile_id "${c.profile_id}" does not exist`);
   for (const re of [...(c.include || []), ...(c.exclude || [])]) { try { new RegExp(re); } catch (e) { p.push(`filter "${re}": ${e.message}`); } }
-  for (const k of Object.keys(c.set_headers || {})) if (!k.trim()) p.push('set_headers has an empty header name');
+  for (const [k, v] of Object.entries(c.set_headers || {})) {
+    if (!k.trim()) p.push('set_headers has an empty header name');
+    else if (v === MASKED_VALUE && isSensitiveHeader(k)) p.push(`config.set_headers "${k}" is "${MASKED_VALUE}", the masked form the API returns; send the real value, or clone the replay to reuse the stored one`);
+  }
   if (p.length) throw bad('validation failed', p);
   return c;
 }
@@ -736,7 +766,7 @@ const allStatuses = () => Array.from(db.services.values()).map(statusOf);
 let lastStatusSig = '';
 function emitServices(force) {
   const list = allStatuses();
-  const sig = JSON.stringify(list.map((s) => [s.service_id, s.running, s.mode, s.error, s.addr]));
+  const sig = JSON.stringify(list.map((s) => [s.service_id, s.running, s.mode, s.error, s.warning, s.addr]));
   if (force || sig !== lastStatusSig) { lastStatusSig = sig; broadcast('services', list); }
 }
 

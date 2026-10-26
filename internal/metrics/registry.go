@@ -12,6 +12,7 @@ import (
 
 // Update is published by the registry once per second.
 type Update struct {
+	// Time is the tick (a whole second), always in UTC.
 	Time time.Time `json:"time"`
 	// Snapshots of every collector.
 	Snapshots []model.StatsSnapshot `json:"snapshots"`
@@ -102,7 +103,7 @@ func (r *Registry) List() []*Collector {
 func (r *Registry) Tick(now time.Time) Update {
 	cols := r.List()
 	u := Update{
-		Time:      now,
+		Time:      now.UTC(),
 		Snapshots: make([]model.StatsSnapshot, 0, len(cols)),
 		Points:    make(map[string]model.SeriesPoint, len(cols)),
 	}

@@ -75,8 +75,19 @@ type runner struct {
 	spin    bool
 	reqCtx  context.Context
 
-	planned   atomic.Int64
-	targetRPS atomic.Uint64
+	planned atomic.Int64
+	// plannedEstimate marks a Planned that is an estimate (a looping timeline
+	// whose later passes may draw differently from the first), so the summary
+	// never shows more requests sent than planned.
+	plannedEstimate atomic.Bool
+	targetRPS       atomic.Uint64
+
+	// sendEndNs is the run clock when the scheduler stopped sending (0 while
+	// it still does), and windowDone the completions up to that moment (-1
+	// when the rate is over the whole run instead). AchievedRPS is measured
+	// over the send window, not over the drain that follows it.
+	sendEndNs  atomic.Int64
+	windowDone atomic.Int64
 
 	sent, completed, failed, timeouts atomic.Int64
 	errStatus, mismatches             atomic.Int64
@@ -140,6 +151,7 @@ func (r *runner) execute(ctx context.Context) (model.ReplaySummary, []model.Seri
 
 	gen, planned, targetRPS := newGenerator(prep, cfg)
 	r.planned.Store(planned)
+	r.plannedEstimate.Store(cfg.Mode == model.ReplayTimeline && cfg.Loop && cfg.Duration > 0)
 	r.targetRPS.Store(math.Float64bits(targetRPS))
 
 	r.runLoad(ctx, gen)
@@ -203,11 +215,21 @@ func (r *runner) load(ctx context.Context) (*prepared, error) {
 }
 
 // newTransport builds the job's dedicated HTTP transport.
+//
+// MaxConnsPerHost is the number of workers: a worker that finishes a response
+// and starts its next request before the transport has put the connection back
+// in the idle pool would otherwise dial a new one, and the surplus connection
+// is closed when the pool is full. At a couple of thousand workers that churn
+// leaves tens of thousands of sockets in TIME_WAIT, exhausts the ephemeral
+// ports and shows up as multi-second latencies and failures that are the
+// client's. With the cap the request waits for the returning connection (the
+// transport hands it over directly), so each worker keeps one.
 func newTransport(cfg model.ReplayConfig) *http.Transport {
 	return &http.Transport{
 		DialContext:         limitDials((&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext, maxConcurrentDials),
 		ForceAttemptHTTP2:   true,
-		MaxIdleConns:        2 * cfg.Concurrency,
+		MaxConnsPerHost:     cfg.Concurrency,
+		MaxIdleConns:        cfg.Concurrency,
 		MaxIdleConnsPerHost: cfg.Concurrency,
 		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
@@ -245,6 +267,7 @@ func (r *runner) runLoad(ctx context.Context, gen generator) {
 	go r.monitor(stopMon, monDone)
 
 	r.schedule(ctx, sctx, gen)
+	r.noteSendEnd(sctx)
 	r.wg.Wait()
 	if r.timer != nil {
 		r.timer.Stop()
@@ -257,6 +280,24 @@ func (r *runner) runLoad(ctx context.Context, gen generator) {
 }
 
 func (r *runner) now() time.Duration { return time.Since(r.start) }
+
+// noteSendEnd closes the send window: the moment the scheduler stopped
+// handing out requests, which is where the schedule ends however long the
+// in-flight requests then take to drain. A closed loop that simply ran out of
+// requests has no such window (its workers are still busy), so its rate stays
+// over the whole run; one cut by Duration or a cancel has, and counts the
+// completions inside it.
+func (r *runner) noteSendEnd(sctx context.Context) {
+	done := int64(-1)
+	if r.cfg.Mode == model.ReplayMax {
+		if sctx.Err() == nil {
+			return
+		}
+		done = r.completed.Load()
+	}
+	r.windowDone.Store(done)
+	r.sendEndNs.Store(max(1, int64(r.now())))
+}
 
 // schedule feeds the workers until the schedule ends. It closes r.work.
 //
@@ -302,6 +343,11 @@ func (r *runner) schedule(hard, soft context.Context, gen generator) {
 // waitUntil blocks until the run clock reaches due, sleeping while it is far
 // off and yielding in a loop for the last stretch. It reports false when hard
 // was cancelled, or soft ended before due.
+//
+// A scheduler that wakes late can find its timer and soft.Done both ready,
+// and select then picks either one. Soft ending only counts when the run clock
+// has really not reached due (see softEnded), so a request that was due before
+// Duration is sent whichever case won.
 func (r *runner) waitUntil(hard, soft context.Context, due time.Duration) bool {
 	done := soft.Done()
 	for {
@@ -315,17 +361,24 @@ func (r *runner) waitUntil(hard, soft context.Context, due time.Duration) bool {
 				d -= spinWindow
 			}
 			if !r.sleep(done, d) {
-				return false
+				return r.softEnded(hard, due)
 			}
 			continue
 		}
 		select {
 		case <-done:
-			return false
+			return r.softEnded(hard, due)
 		default:
 		}
 		runtime.Gosched()
 	}
+}
+
+// softEnded is waitUntil's answer once the soft context has ended: the request
+// is still sent when its due time has already passed (and hard is alive), which
+// is a late scheduler, not a run that was cut before the request was due.
+func (r *runner) softEnded(hard context.Context, due time.Duration) bool {
+	return r.now() >= due && hard.Err() == nil
 }
 
 // sleep waits d or until done is closed, reusing one timer.
@@ -430,6 +483,12 @@ func (r *runner) exec(j job) {
 		if r.reqCtx.Err() != nil {
 			return // aborted by Stop or Shutdown, not a target failure
 		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			// The request's clock started before it was built, so a timeout
+			// waited at least Timeout.
+			svc = max(svc, r.timeout)
+			corr = max(corr, svc)
+		}
 		r.fail(it, err, svc, corr)
 		return
 	}
@@ -460,17 +519,47 @@ func (r *runner) exec(j job) {
 const maxLoggedFailures = 5
 
 // fail records a request that got no response.
+//
+// A request that waited for the target and then failed (a timeout, or a
+// connection that broke after it was made) is part of the latency summaries,
+// with the time it actually spent: leaving it out would make the percentiles
+// better the worse the target gets, since only the survivors would count. One
+// that never got as far as the target (build error, refused or unresolvable
+// connection, failed certificate check) waited for nothing and is left out.
 func (r *runner) fail(it *item, err error, svc, corr time.Duration) {
 	if r.failed.Add(1) <= maxLoggedFailures {
 		r.log.Warn("replay request failed", "endpoint", it.endpoint, "error", err)
 	}
-	if isTimeout(err) {
+	timeout := isTimeout(err)
+	if timeout {
 		r.timeouts.Add(1)
 	}
 	if corr <= 0 {
 		corr = max(svc, 1)
 	}
+	if svc > 0 && (timeout || reachedTarget(err)) {
+		r.lat.Record(svc)
+		r.corr.Record(corr)
+	}
 	r.col.Observe(metrics.Observation{Endpoint: it.endpoint, Status: 0, Duration: svc, Error: true, Corrected: corr})
+}
+
+// reachedTarget reports whether a failed request got as far as a connection
+// to the target: false for errors from dialing, name resolution and
+// certificate verification, where nothing was ever sent.
+func reachedTarget(err error) bool {
+	var (
+		op   *net.OpError
+		dns  *net.DNSError
+		cert *tls.CertificateVerificationError
+	)
+	switch {
+	case errors.As(err, &dns), errors.As(err, &cert):
+		return false
+	case errors.As(err, &op):
+		return op.Op != "dial"
+	}
+	return true
 }
 
 // isTimeout reports whether err is a deadline or network timeout.
@@ -630,6 +719,27 @@ func (r *runner) finalSeries() {
 // seriesSince returns the live series points with T >= sinceMs.
 func (r *runner) seriesSince(sinceMs int64) []model.SeriesPoint { return r.series.since(sinceMs) }
 
+// achievedRPS is the rate the target actually saw: the responses that came
+// back for requests sent inside the send window, over that window. The drain
+// that follows (the in-flight requests finishing, up to Timeout) is not part
+// of the schedule, so a run that sent everything on time is not reported below
+// its target because a few responses were slow. While the scheduler still
+// sends, and for closed-loop runs that end by running out of requests, it is
+// completed over the run so far.
+func (r *runner) achievedRPS(completed int64, elapsed time.Duration) float64 {
+	window := elapsed
+	if end := time.Duration(r.sendEndNs.Load()); end > 0 {
+		window = end
+		if done := r.windowDone.Load(); done >= 0 {
+			completed = done
+		}
+	}
+	if window <= 0 {
+		return 0
+	}
+	return float64(completed) / window.Seconds()
+}
+
 // summary builds the Summary from the run's counters and histograms; it is
 // safe to call at any time.
 func (r *runner) summary() model.ReplaySummary {
@@ -657,17 +767,21 @@ func (r *runner) summary() model.ReplaySummary {
 		Elapsed:          model.Duration(elapsed),
 		MaxLag:           model.Duration(r.maxLag.Load()),
 		MaxInFlight:      r.maxBusy.Load(),
-		Saturated:        r.maxBusy.Load() >= int64(r.conc),
-		Endpoints:        r.col.Endpoints(),
+		// A closed loop keeps every worker busy by definition and has no
+		// intended send times to fall behind, so only the open-loop modes can
+		// be saturated.
+		Saturated: r.cfg.Mode != model.ReplayMax && r.maxBusy.Load() >= int64(r.conc),
+		Endpoints: r.col.Endpoints(),
+	}
+	if s.Planned >= 0 && s.Sent > s.Planned && r.plannedEstimate.Load() {
+		s.Planned = s.Sent
 	}
 	for code := range r.statuses {
 		if n := r.statuses[code].Load(); n > 0 {
 			s.StatusCounts[strconv.Itoa(code)] = n
 		}
 	}
-	if elapsed > 0 {
-		s.AchievedRPS = float64(completed) / elapsed.Seconds()
-	}
+	s.AchievedRPS = r.achievedRPS(completed, elapsed)
 	if done := completed + failed; done > 0 {
 		s.ErrorRate = float64(s.Errors) / float64(done)
 	}

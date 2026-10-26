@@ -212,7 +212,7 @@ func (r *run) applyChain(chain []*rule, s string, loc *locator) string {
 // applyRegex replaces every match of the rule's pattern (or its first capture
 // group) with the rule's strategy applied to the matched text.
 func (r *run) applyRegex(rl *rule, s string, loc *locator) string {
-	if s == "" {
+	if s == "" || rl.prefix != "" && !strings.Contains(s, rl.prefix) {
 		return s
 	}
 	idx := rl.re.FindAllStringSubmatchIndex(s, -1)
@@ -251,7 +251,14 @@ func (r *run) applyRegex(rl *rule, s string, loc *locator) string {
 // detect replaces every detector match in s. It returns s itself when nothing
 // matched. st may be nil when the caller has not classified s yet.
 func (r *run) detect(s string, st *textStats, loc *locator) string {
-	if r.c.detMask == 0 || len(s) < 3 {
+	return r.detectWith(s, st, loc, r.c.detMask)
+}
+
+// detectWith is detect restricted to the detectors in only (a subset of the
+// profile's: a detector the profile has not enabled never runs).
+func (r *run) detectWith(s string, st *textStats, loc *locator, only uint16) string {
+	only &= r.c.detMask
+	if only == 0 || len(s) < 3 {
 		return s
 	}
 	var local textStats
@@ -259,7 +266,7 @@ func (r *run) detect(s string, st *textStats, loc *locator) string {
 		local = classify(s)
 		st = &local
 	}
-	mask := candidates(r.c.detMask, st)
+	mask := candidates(only, st)
 	if mask == 0 {
 		return s
 	}

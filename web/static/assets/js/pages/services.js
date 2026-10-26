@@ -2,7 +2,7 @@
 import { h } from '../dom.js';
 import { icon } from '../icons.js';
 import { api } from '../api.js';
-import { state, refreshServices, serviceById } from '../state.js';
+import { state, refreshServices, serviceById, statusNotice } from '../state.js';
 import { navigate } from '../router.js';
 import { loadHistory, pointToRow } from '../series.js';
 import { trafficCharts, WINDOWS, savedWindow, saveWindow } from '../livecharts.js';
@@ -11,8 +11,14 @@ import { openServiceForm, switchMode, MODES, MODE_HELP, durText } from '../servi
 import { fmtRate, fmtPct, fmtMs, fmtInt, fmtBytes, relTime, portOf, DASH, fmtCompact } from '../format.js';
 
 function stateCell(st, enabled) {
-  if (st.running) return h('span', { class: 'status-text' }, dot('live'), 'Running');
-  if (st.error) return h('span', { class: 'status-text', title: st.error, style: 'color:var(--err)' }, dot('err'), 'Error');
+  const n = statusNotice(st);
+  if (st.running) {
+    const tag = !n ? null : n.kind === 'capture-limit'
+      ? badge('Capture full', 'warn', { title: 'The capture limit was reached: traffic is served, but no new exchanges are recorded.' })
+      : badge('Warning', 'warn', { title: n.text });
+    return h('span', { class: 'status-text' }, dot('live'), 'Running', tag);
+  }
+  if (n) return h('span', { class: 'status-text', title: n.text, style: 'color:var(--err)' }, dot('err'), 'Error');
   return h('span', { class: 'status-text muted' }, dot('off'), enabled ? 'Stopped' : 'Disabled');
 }
 
@@ -155,7 +161,29 @@ export async function detail(ctx) {
         btn(svc.enabled ? 'Disable' : 'Enable', { icon: svc.enabled ? 'pause' : 'play', onClick: async () => { await toggleEnabled(svc); await reload(); } }),
         svc.mode === 'virtualize' || svc.mode === 'hybrid' ? btn('Reload index', { icon: 'refresh', onClick: () => reloadIndex(svc) }) : null,
         btn('Delete', { icon: 'trash', kind: 'danger', onClick: async () => { if (await deleteService(svc)) navigate('/services'); } }))));
-    errHost.replaceChildren(st.error ? alertBox('error', st.error, { title: 'This service could not start' }) : '');
+    paintNotice();
+  }
+
+  // The banner under the title. Rebuilt only when it changes, because the
+  // header repaints every second and a button in it would lose focus.
+  let noticeSig = null;
+  function paintNotice() {
+    const n = statusNotice(svc.status);
+    const sig = n ? `${n.kind}|${n.text}|${svc.max_capture_bytes}` : '';
+    if (sig === noticeSig) return;
+    noticeSig = sig;
+    if (!n) { errHost.replaceChildren(); return; }
+    if (n.kind === 'failed') {
+      errHost.replaceChildren(alertBox('error', n.text, { title: /^listener failed/i.test(n.text) ? 'The listener stopped' : 'This service could not start' }));
+    } else if (n.kind === 'capture-limit') {
+      const limit = svc.max_capture_bytes > 0 ? ` of ${fmtBytes(svc.max_capture_bytes)}` : '';
+      errHost.replaceChildren(alertBox('warn', h('div', { class: 'stack-sm' },
+        h('div', null, `The recording holds the capture limit${limit} of request and response bodies, so new exchanges are no longer stored. The service itself is running: traffic is still proxied and measured.`),
+        h('div', null, btn('Raise the limit', { size: 'sm', icon: 'edit', onClick: () => openServiceForm({ service: svc, focus: 'max_capture_bytes', onSaved: () => reload() }) }))),
+      { title: `Capture stopped: limit${limit ? ` of ${fmtBytes(svc.max_capture_bytes)}` : ''} reached` }));
+    } else {
+      errHost.replaceChildren(alertBox('warn', n.text, { title: 'The service reported a problem while running' }));
+    }
   }
 
   // --- mode switcher + client hint
@@ -209,8 +237,9 @@ export async function detail(ctx) {
     ];
     if (rec) {
       const sample = svc.capture_sample > 0 && svc.capture_sample < 1 ? ` (${fmtPct(svc.capture_sample, 0)} sampled)` : '';
+      const capFull = (statusNotice(st) || {}).kind === 'capture-limit';
       cells.push(
-        cell('Captured', fmtInt(st.captured), `exchanges written${sample}`),
+        cell('Captured', fmtInt(st.captured), capFull ? 'stopped: capture limit reached' : `exchanges written${sample}`, capFull ? 'warn' : ''),
         cell('Capture dropped', fmtInt(st.capture_dropped), st.capture_dropped ? 'queue was full' : 'none', st.capture_dropped ? 'warn' : ''),
         cell('Capture skipped', fmtInt(st.capture_skipped), st.capture_skipped ? 'client left early, sampled out or over the limit' : 'none', ''));
     }

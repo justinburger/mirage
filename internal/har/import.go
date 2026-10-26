@@ -27,8 +27,12 @@ var ErrUnsupported = errors.New("unsupported HAR entry")
 // noResponseError is the Exchange.Error text for entries without a response.
 const noResponseError = "no response in HAR"
 
-// maxInflate bounds how far a gzip-compressed base64 body is expanded.
-const maxInflate = 128 << 20
+// maxInflate bounds how far a gzip-compressed body is expanded: the cap the
+// proxy puts on a captured body (a service's default max_body_bytes). A few
+// kilobytes of gzip expand a thousandfold, so a larger limit let a small HAR
+// turn into gigabytes of memory and disk. What lies beyond is dropped and the
+// body is flagged truncated, exactly like a capture cut by the proxy.
+const maxInflate = int(model.DefaultMaxBodyBytes)
 
 // EntryError reports the entry that could not be converted by ToExchanges.
 type EntryError struct {
@@ -107,7 +111,9 @@ func ToExchange(e *Entry) (*model.Exchange, error) {
 	}
 	reqEncoding := takeContentEncoding(reqHeader)
 	if reqEncoding != "" {
-		reqBody = maybeInflate(reqEncoding, reqBody)
+		var cut bool
+		reqBody, cut = maybeInflate(reqEncoding, reqBody)
+		reqTruncated = reqTruncated || cut
 	}
 
 	ex := &model.Exchange{
@@ -150,8 +156,9 @@ func ToExchange(e *Entry) (*model.Exchange, error) {
 		return nil, fmt.Errorf("har: response body: %w", err)
 	}
 	respEncoding := takeContentEncoding(respHeader)
+	respCut := false
 	if respEncoding != "" {
-		respBody = maybeInflate(respEncoding, respBody)
+		respBody, respCut = maybeInflate(respEncoding, respBody)
 	}
 	ex.Response = model.Response{
 		Status:          e.Response.Status,
@@ -161,7 +168,7 @@ func ToExchange(e *Entry) (*model.Exchange, error) {
 		BodySize:        max(int64(e.Response.Content.Size), int64(len(respBody))),
 		ContentEncoding: respEncoding,
 	}
-	ex.Response.BodyTruncated = e.Response.Content.Truncated || ex.Response.BodySize > int64(len(respBody))
+	ex.Response.BodyTruncated = e.Response.Content.Truncated || respCut || ex.Response.BodySize > int64(len(respBody))
 	switch {
 	case e.Response.Status == 0 && e.Response.Error != "":
 		ex.Error = e.Response.Error
@@ -387,24 +394,29 @@ func decodeBase64(s string) ([]byte, error) {
 }
 
 // maybeInflate decompresses a body that is still gzip-compressed even though
-// HAR bodies are normally stored decoded. Anything else is returned as is.
-func maybeInflate(encoding string, body []byte) []byte {
+// HAR bodies are normally stored decoded. Anything else, and a stream that
+// does not decompress, is returned as is. At most maxInflate bytes are
+// produced; truncated reports that the stream held more.
+func maybeInflate(encoding string, body []byte) (out []byte, truncated bool) {
 	if encoding != "gzip" && encoding != "x-gzip" {
-		return body
+		return body, false
 	}
 	if len(body) < 2 || body[0] != 0x1f || body[1] != 0x8b {
-		return body
+		return body, false
 	}
 	zr, err := gzip.NewReader(bytes.NewReader(body))
 	if err != nil {
-		return body
+		return body, false
 	}
 	defer zr.Close()
-	out, err := io.ReadAll(io.LimitReader(zr, maxInflate+1))
-	if err != nil || len(out) > maxInflate {
-		return body
+	out, err = io.ReadAll(io.LimitReader(zr, int64(maxInflate)+1))
+	if err != nil {
+		return body, false
 	}
-	return out
+	if len(out) > maxInflate {
+		return out[:maxInflate:maxInflate], true
+	}
+	return out, false
 }
 
 // cookieHeader renders request cookies as a Cookie header value.

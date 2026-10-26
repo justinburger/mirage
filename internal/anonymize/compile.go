@@ -20,8 +20,13 @@ type rule struct {
 	name  string         // header (canonical), cookie, query or form name
 	re    *regexp.Regexp // regex target
 	group bool           // regex has a capture group: only group 1 is replaced
-	jp    *jsonPath      // json target
-	tmpl  *pathTemplate  // path target
+	// prefix is a literal every match of re starts with ("" if there is
+	// none). A value that lacks it cannot match, which a byte search finds
+	// out far faster than the regex machinery: the profile's regex rules run
+	// over every textual value.
+	prefix string
+	jp     *jsonPath     // json target
+	tmpl   *pathTemplate // path target
 	// keyOnly marks a json rule of the form $..name: the member called name
 	// at any depth. It needs no automaton state, see sideRules.keyDescent.
 	keyOnly bool
@@ -177,6 +182,7 @@ func compile(p model.AnonymizationProfile, requireName bool) (*compiled, error) 
 				continue
 			}
 			cr.re, cr.group = re, re.NumSubexp() > 0
+			cr.prefix, _ = re.LiteralPrefix()
 		case model.TargetJSON:
 			jp, err := parseJSONPath(r.Selector)
 			if err != nil {

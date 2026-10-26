@@ -2,6 +2,7 @@ package model
 
 import (
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -42,7 +43,10 @@ const (
 	TargetCookie RuleTarget = "cookie"
 	// TargetJSON: Selector is a JSONPath subset applied to JSON bodies:
 	// "$.user.email", "$.items[*].card", "$.items[0].id", "$..email"
-	// (recursive descent by key name) and "$.*" wildcards.
+	// (recursive descent by key name) and "$.*" wildcards. One filter is
+	// supported, for keys that are only sometimes personal data:
+	// "$..[?(@.email || @.phone)].name" is the member "name" of any object
+	// that also has an "email" or a "phone" member.
 	TargetJSON RuleTarget = "json"
 	// TargetForm: Selector is a field name in an
 	// application/x-www-form-urlencoded body.
@@ -159,19 +163,15 @@ func DefaultAnonymizationProfile() AnonymizationProfile {
 	return AnonymizationProfile{
 		ID:          DefaultProfileID,
 		Name:        "Default",
-		Description: "Hashes auth headers, session cookies and common credential fields (passwords, tokens, API keys), fakes person names, and replaces detected PII (emails, cards, SSNs, phone numbers, IPs, JWTs, AWS keys, IBANs) with consistent fake values.",
+		Description: defaultProfileDescription,
 		Detectors: []Detector{
 			DetectEmail, DetectCreditCard, DetectSSN, DetectPhone,
 			DetectIPv4, DetectIPv6, DetectJWT, DetectAWSKey, DetectIBAN,
 		},
 		DetectorStrategy: StrategyFake,
-		RedactHeaders: []string{
-			"Authorization", "Proxy-Authorization", "Cookie", "Set-Cookie",
-			"X-Api-Key", "X-Auth-Token", "X-Access-Token", "X-Csrf-Token",
-			"X-Forwarded-For", "X-Real-Ip", "Forwarded",
-		},
-		Rules:        defaultRules(),
-		OpaqueBodies: OpaqueKeep,
+		RedactHeaders:    append([]string(nil), defaultRedactHeaders...),
+		Rules:            defaultRules(),
+		OpaqueBodies:     OpaqueKeep,
 	}
 }
 
@@ -181,8 +181,51 @@ const (
 	OpaqueFill = "fill"
 )
 
-// defaultRules are the credential and name rules of the built-in profile.
-// IDs are stable so later releases can recognise them.
+// DefaultProfileRev numbers the revisions of the built-in profile's rules and
+// header list. The store records the revision it last wrote to a database and
+// calls UpgradeDefaultProfile when the binary carries a newer one, so a
+// database created by an older release gains the new built-in rules without
+// losing the edits made to the profile.
+//
+//	1  credential and first/last name rules
+//	2  postal addresses, customer and cardholder names, a "name" next to an
+//	   e-mail or phone, XML password and token elements, more credential
+//	   query parameters and headers
+const DefaultProfileRev = 2
+
+// defaultProfileDescription is the Description of the built-in profile.
+const defaultProfileDescription = "Hashes auth headers, session cookies and common credential fields (passwords, tokens, API keys, OAuth and cloud signatures). " +
+	"Fakes person names and postal addresses in fields with recognisable names (first_name, customer_name, cardholder, address and its parts, " +
+	"and \"name\" next to an e-mail, phone or address) and replaces detected PII (emails, cards, SSNs, phone numbers, IPs, JWTs, AWS keys, IBANs) " +
+	"with consistent fake values. Names and addresses in free text, URL paths or fields with unusual names are NOT detected: add rules for those."
+
+// defaultProfileDescriptionRev1 is the description revision 1 shipped with;
+// UpgradeDefaultProfile replaces it only while the stored text still equals it.
+const defaultProfileDescriptionRev1 = "Hashes auth headers, session cookies and common credential fields (passwords, tokens, API keys), fakes person names, and replaces detected PII (emails, cards, SSNs, phone numbers, IPs, JWTs, AWS keys, IBANs) with consistent fake values."
+
+// defaultRedactHeaders are the headers whose values the built-in profile
+// always replaces with hash tokens.
+var defaultRedactHeaders = []string{
+	"Authorization", "Proxy-Authorization", "Cookie", "Set-Cookie",
+	"X-Api-Key", "X-Auth-Token", "X-Access-Token", "X-Csrf-Token",
+	"X-Forwarded-For", "X-Real-Ip", "Forwarded",
+	// Revision 2.
+	"Api-Key", "Apikey", "X-Apikey", "X-Api-Token", "X-Auth-Key", "X-Goog-Api-Key",
+	"X-Amz-Security-Token", "X-Session-Id", "X-Session-Token",
+	"X-Xsrf-Token", "X-Csrftoken", "True-Client-Ip", "Cf-Connecting-Ip",
+}
+
+// defaultSiblingNames are the members whose presence next to a "name" member
+// marks it as a person's name rather than a product, file or endpoint name.
+var defaultSiblingNames = []string{
+	"email", "emailAddress", "email_address", "phone", "phoneNumber", "phone_number",
+	"mobile", "address", "street", "city", "zip", "postal_code", "postalCode",
+	"dob", "date_of_birth", "dateOfBirth", "birthdate", "ssn", "username",
+}
+
+// defaultRules are the credential, name and address rules of the built-in
+// profile. IDs are stable so later releases can recognise them
+// (UpgradeDefaultProfile matches on them).
 func defaultRules() []AnonymizationRule {
 	var rules []AnonymizationRule
 	add := func(id, name string, t RuleTarget, sel string, st Strategy, fake FakeKind) {
@@ -209,7 +252,115 @@ func defaultRules() []AnonymizationRule {
 	for _, k := range []string{"access_token", "api_key", "apikey", "key", "token", "signature", "sig", "password", "secret", "session", "sessionid"} {
 		add("query-"+k, "Query "+k, TargetQuery, k, StrategyHash, "")
 	}
+
+	// Revision 2.
+
+	// Names that are unambiguous: nothing but people carry them.
+	for _, k := range []string{
+		"customer_name", "customerName", "cardholder", "cardholder_name", "cardholderName",
+		"holder_name", "holderName", "owner_name", "ownerName", "recipient_name", "recipientName",
+		"contact_name", "contactName", "billing_name", "shipping_name", "middle_name", "middleName", "surname",
+	} {
+		add("json-"+k, "JSON "+k, TargetJSON, "$.."+k, StrategyFake, FakeName)
+	}
+	// A bare "name" is as often a product, a file or a plan as a person, so it
+	// is faked only when the same object also carries an e-mail, phone or
+	// address member (the JSONPath sibling filter, see anonymize.parseJSONPath).
+	add("json-name", "JSON name (next to email, phone or address)", TargetJSON,
+		"$..[?(@."+strings.Join(defaultSiblingNames, " || @.")+")].name", StrategyFake, FakeName)
+	// Everything below an address object is part of the address: street, city,
+	// state, zip, country. The fake keeps lengths and character classes.
+	for _, k := range []string{
+		"address", "addresses", "billing_address", "billingAddress", "shipping_address", "shippingAddress",
+		"home_address", "homeAddress", "mailing_address", "mailingAddress", "street_address", "streetAddress",
+	} {
+		add("json-"+k, "JSON "+k, TargetJSON, "$.."+k, StrategyFake, FakeAuto)
+	}
+	// Address parts that also occur outside an address object.
+	for _, k := range []string{
+		"address1", "address2", "address_line1", "address_line2", "addressLine1", "addressLine2",
+		"street", "line1", "line2", "city", "zip", "zipcode", "zip_code", "zipCode",
+		"postal_code", "postalCode", "postcode",
+	} {
+		add("json-"+k, "JSON "+k, TargetJSON, "$.."+k, StrategyFake, FakeAuto)
+	}
+	for _, k := range []string{"first_name", "last_name", "full_name", "customer_name"} {
+		add("form-"+k, "Form "+k, TargetForm, k, StrategyFake, FakeName)
+		add("query-"+k, "Query "+k, TargetQuery, k, StrategyFake, FakeName)
+	}
+	for _, k := range []string{"street", "address"} {
+		add("form-"+k, "Form "+k, TargetForm, k, StrategyFake, FakeAuto)
+		add("query-"+k, "Query "+k, TargetQuery, k, StrategyFake, FakeAuto)
+	}
+	for _, k := range []string{"X-Customer-Name", "X-User-Name", "X-Full-Name"} {
+		add("header-"+k, "Header "+k, TargetHeader, k, StrategyFake, FakeName)
+	}
+	// OAuth and cloud credentials in query strings. "code" and "state" are
+	// left out on purpose: they are too often ordinary filters (a country
+	// code, ?state=open) and hashing them would break a replay.
+	for _, k := range []string{
+		"client_secret", "refresh_token", "id_token", "accessToken", "refreshToken", "idToken", "apiKey",
+		"auth", "auth_token", "authToken", "pwd", "passwd", "sid", "jwt", "bearer",
+		"private_token", "authenticity_token", "csrf_token", "_csrf", "otp",
+		"Signature", "X-Amz-Signature", "X-Amz-Security-Token", "X-Goog-Signature", "x-amz-signature", "x-amz-security-token",
+	} {
+		add("query-"+k, "Query "+k, TargetQuery, k, StrategyHash, "")
+	}
+	// Credentials in XML or SOAP bodies (and any other text): the element's
+	// content is replaced. The patterns start with a literal "<", so a value
+	// without one is rejected by a byte search.
+	rules = append(rules,
+		AnonymizationRule{
+			ID: "def-regex-xml-secret", Name: "XML password element", Enabled: true, Target: TargetRegex,
+			Selector: `<(?:[\w.-]+:)?(?:[Pp]assword|[Pp]asswd|[Ss]ecret|[Cc]lient[_-]?[Ss]ecret|PIN|CVV|CVC)>([^<]+)</`,
+			Scope:    ScopeBoth, Strategy: StrategyRedact,
+		},
+		AnonymizationRule{
+			ID: "def-regex-xml-token", Name: "XML token element", Enabled: true, Target: TargetRegex,
+			Selector: `<(?:[\w.-]+:)?(?:[Aa]ccess_?[Tt]oken|[Rr]efresh_?[Tt]oken|[Ii]d_?[Tt]oken|[Aa]pi_?[Kk]ey|[Tt]oken|[Ss]ession_?[Ii]d)>([^<]+)</`,
+			Scope:    ScopeBoth, Strategy: StrategyHash,
+		},
+	)
 	return rules
+}
+
+// UpgradeDefaultProfile brings a stored copy of the built-in profile, written
+// by a release whose DefaultProfileRev was fromRev, up to the current
+// revision. Rules and headers the current release defines and the stored
+// profile lacks are added (rules matched by ID, headers ignoring case);
+// everything already there, including rules the user edited or switched off,
+// is left as it is, and the description is replaced only while it is still
+// the text the old revision shipped. changed reports whether p differs.
+func UpgradeDefaultProfile(p AnonymizationProfile, fromRev int) (out AnonymizationProfile, changed bool) {
+	if fromRev >= DefaultProfileRev {
+		return p, false
+	}
+	cur := DefaultAnonymizationProfile()
+	have := make(map[string]bool, len(p.Rules))
+	for _, r := range p.Rules {
+		have[r.ID] = true
+	}
+	rules := append([]AnonymizationRule(nil), p.Rules...)
+	for _, r := range cur.Rules {
+		if !have[r.ID] {
+			rules = append(rules, r)
+			changed = true
+		}
+	}
+	p.Rules = rules
+	hdrs := append([]string(nil), p.RedactHeaders...)
+	for _, h := range cur.RedactHeaders {
+		if !slices.ContainsFunc(hdrs, func(x string) bool { return strings.EqualFold(strings.TrimSpace(x), h) }) {
+			hdrs = append(hdrs, h)
+			changed = true
+		}
+	}
+	p.RedactHeaders = hdrs
+	if p.Description == defaultProfileDescriptionRev1 {
+		p.Description = cur.Description
+		changed = true
+	}
+	return p, changed
 }
 
 // Redacted returns a copy safe to send to clients: Secret cleared and

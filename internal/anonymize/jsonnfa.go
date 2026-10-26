@@ -81,6 +81,9 @@ func (w *jsonRW) enter(parent *jframe, key []byte, idx int) childInfo {
 	}
 	if fast && parent != nil && parent.obj {
 		for _, ri := range w.r.sd.keyDescent[string(key)] {
+			if sib := w.prog[ri].jp.siblings; sib != nil && !w.siblingCheck(parent, sib) {
+				continue
+			}
 			w.addActive(info.acLo, ri)
 			// Of several rules that delete the node, report the lowest.
 			if rl := w.prog[ri]; rl.act.remove() && (info.remove == nil || rl.idx < info.remove.idx) {
@@ -126,4 +129,85 @@ func (w *jsonRW) leafChain(info *childInfo) []*rule {
 	}
 	w.chain = append(w.chain, rx[j:]...)
 	return w.chain
+}
+
+// siblingCheck reports whether the object of frame f has a member called one
+// of names (the sibling filter, see parseJSONPath). It reads the whole object,
+// so the answer does not depend on where in the object the matched member
+// stands. The scan does not move the rewriter: it works on its own copy of
+// the read position and its output is discarded.
+//
+// Reading an object once per matching member can cost O(depth * size) on
+// nested documents; the bytes read ahead are therefore capped per document
+// (about four times its size), and past the cap, or when the object cannot be
+// read to its end (a truncated capture), the answer is yes: not knowing
+// whether a name belongs to a person errs on the side of anonymizing it.
+func (w *jsonRW) siblingCheck(f *jframe, names []string) bool {
+	if w.look > w.lookMax {
+		return true
+	}
+	saved := w.pos
+	w.pos = f.objLo
+	found, complete := w.scanForKeys(names)
+	if w.pos > f.objLo {
+		w.look += w.pos - f.objLo
+	}
+	w.pos = saved
+	return found || !complete && w.lenient
+}
+
+// scanForKeys reads the members of the object whose opening brace was just
+// consumed, from w.pos, and reports whether one of them is called one of
+// names. complete is false when the input ended (or was malformed) before the
+// object did.
+func (w *jsonRW) scanForKeys(names []string) (found, complete bool) {
+	for {
+		w.skipWS()
+		if w.pos >= len(w.src) || w.src[w.pos] != '"' {
+			return found, w.pos < len(w.src) && w.src[w.pos] == '}'
+		}
+		start := w.pos
+		end, esc, err := scanString(w.src, start)
+		if err != nil {
+			return found, false
+		}
+		if !found {
+			key := w.src[start+1 : end-1]
+			if esc {
+				w.sibTmp = unescapeJSON(w.sibTmp[:0], key)
+				key = w.sibTmp
+			}
+			for _, n := range names {
+				if string(key) == n {
+					found = true
+					break
+				}
+			}
+		}
+		w.pos = end
+		w.skipWS()
+		if w.pos >= len(w.src) || w.src[w.pos] != ':' {
+			return found, false
+		}
+		w.pos++
+		if found {
+			// The answer is known: no need to read the rest.
+			return true, true
+		}
+		if w.skipValue() != nil {
+			return false, false
+		}
+		w.skipWS()
+		if w.pos >= len(w.src) {
+			return false, false
+		}
+		switch w.src[w.pos] {
+		case ',':
+			w.pos++
+		case '}':
+			return false, true
+		default:
+			return false, false
+		}
+	}
 }

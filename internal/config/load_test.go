@@ -128,7 +128,7 @@ func mustParse(t *testing.T, name, src string) *Config {
 func TestParseFullYAML(t *testing.T) {
 	c := mustParse(t, "mirage.yaml", fullYAML)
 
-	if c.Server != (Server{Admin: "127.0.0.1:8484", Data: "/var/lib/mirage/mirage.db", AdminToken: "s3cret", LogLevel: "debug", LogFormat: "json"}) {
+	if !reflect.DeepEqual(c.Server, Server{Admin: "127.0.0.1:8484", Data: "/var/lib/mirage/mirage.db", AdminToken: "s3cret", LogLevel: "debug", LogFormat: "json"}) {
 		t.Errorf("server = %+v", c.Server)
 	}
 	if len(c.Recordings) != 1 || c.Recordings[0] != (RecordingConfig{Name: "cap", Description: "captured traffic", HAR: "captures/a.har"}) {
@@ -193,6 +193,13 @@ func TestParseJSONMatchesYAML(t *testing.T) {
 		if got := mustParse(t, name, fullJSON); !reflect.DeepEqual(got, j) {
 			t.Errorf("%q: differs from the JSON decode", name)
 		}
+	}
+}
+
+func TestParseServerAllowedHosts(t *testing.T) {
+	c := mustParse(t, "c.yaml", "server:\n  allowed_hosts: [mirage.lan, \"mirage.lan:8484\"]\n")
+	if !reflect.DeepEqual(c.Server.AllowedHosts, []string{"mirage.lan", "mirage.lan:8484"}) {
+		t.Errorf("allowed_hosts = %q", c.Server.AllowedHosts)
 	}
 }
 

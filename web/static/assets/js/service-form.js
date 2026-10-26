@@ -34,7 +34,13 @@ export const durText = (v) => {
 };
 
 // ------------------------------------------------------------------------
-export async function openServiceForm({ service = null, onSaved } = {}) {
+/**
+ * @param {object} [o]
+ * @param {object|null} [o.service] the service to edit; null creates one
+ * @param {Function} [o.onSaved]
+ * @param {'max_capture_bytes'} [o.focus] control to focus when editing
+ */
+export async function openServiceForm({ service = null, onSaved, focus } = {}) {
   const editing = !!service;
   const [recordings, profiles] = await Promise.all([api.recordings().catch(() => []), api.profiles().catch(() => [])]);
   const s = service || {};
@@ -100,7 +106,7 @@ export async function openServiceForm({ service = null, onSaved } = {}) {
     listen_addr: field('Listen address', listen, { required: true, help: 'Where clients connect, e.g. :9001 or 127.0.0.1:9001.' }),
     upstream: field('Upstream', upstream, { help: 'The real API. Optional when only virtualizing.' }),
     mode: field('Mode', mode),
-    recording_id: field('Recording', recSelect, { help: 'Captured traffic is stored here (record, hybrid) and served from here (virtualize, hybrid).' }),
+    recording_id: field('Recording', recSelect),
     new_recording_name: field('New recording name', recName),
     profile_id: field('Anonymization profile', profile),
     endpoint_patterns: field('Endpoint patterns', patterns, { help: 'One path template per line. They group requests into endpoints for metrics and template matching.' }),
@@ -132,16 +138,38 @@ export async function openServiceForm({ service = null, onSaved } = {}) {
   const recSection = formSection('Recording', null, recBlock);
   const profileRow = h('div', null, F.profile_id);
   const certRow = formGrid(F.cert_file, F.key_file);
+  const isVirt = (m) => m === 'virtualize' || m === 'hybrid';
+  const startMode = s.mode || 'passthrough';
+  // What the mode does not use is folded away: virtualize reads a recording and
+  // never captures, record and passthrough never virtualize. Both sections
+  // follow the mode while it is chosen, but never fight a click on them.
+  const captureBox = collapsible('Capture', h('div', { class: 'stack' },
+    anon.el, profileRow, F.endpoint_patterns, formGrid(F.timeout, F.max_body_bytes), formGrid(F.capture_sample, F.max_capture_bytes)),
+  { open: startMode !== 'virtualize', hint: 'what is stored when traffic is recorded; not used in virtualize mode' });
   const virt = collapsible('Virtualization', h('div', { class: 'stack' },
     formGrid(F['match.query'], F['match.body']),
     formGrid(F.ignore_params, F['match.headers']),
     formGrid(F['match.selection'], F['match.miss_status']),
     h('div', null, mTemplates.el),
     formGrid(F['latency.mode'], F['latency.multiplier'], F['latency.fixed'], F['latency.jitter']),
-    formGrid(F.error_amplification, F.error_floor)), { open: (s.mode === 'virtualize' || s.mode === 'hybrid'), hint: 'used in virtualize and hybrid modes' });
+    formGrid(F.error_amplification, F.error_floor)), { open: isVirt(startMode), hint: 'used in virtualize and hybrid modes' });
+  // collapsibles sit between fieldsets (which carry their own bottom margin)
+  captureBox.classList.add('fsec-box'); virt.classList.add('fsec-box');
+  const networkSection = formSection('Network', null, F.tls, certRow, h('div', { class: 'fgrid' }, preserveHost.el, skipVerify.el));
+
+  let shownMode = startMode;
+  function followMode(m) {
+    if (m === shownMode) return;
+    shownMode = m;
+    virt.open = isVirt(m);
+    captureBox.open = m !== 'virtualize';
+    // Virtualization settings are the point of virtualizing: keep them next to the recording.
+    if (captureBox.parentNode) captureBox.parentNode.insertBefore(virt, isVirt(m) ? captureBox : null);
+  }
 
   function paint() {
     const m = mode.get();
+    followMode(m);
     recSection.hidden = m === 'passthrough';
     const isNew = recSource.get() === 'new';
     F.recording_id.hidden = isNew;
@@ -167,9 +195,7 @@ export async function openServiceForm({ service = null, onSaved } = {}) {
       h('div', { class: 'muted', id: 'mode-help', style: 'font-size:12.5px;margin-top:-6px' }),
       enabled.el),
     recSection,
-    formSection('Capture', 'What is stored when traffic is recorded.', anon.el, profileRow, F.endpoint_patterns, formGrid(F.timeout, F.max_body_bytes), formGrid(F.capture_sample, F.max_capture_bytes)),
-    formSection('Network', null, F.tls, certRow, h('div', { class: 'fgrid' }, preserveHost.el, skipVerify.el)),
-    virt);
+    ...(isVirt(startMode) ? [virt, captureBox, networkSection] : [captureBox, networkSection, virt]));
   const modeHelp = body.querySelector('#mode-help');
   const paintHelp = () => { modeHelp.textContent = MODE_HELP[mode.get()]; };
   mode.onChange(paintHelp); paintHelp();
@@ -294,7 +320,7 @@ export async function openServiceForm({ service = null, onSaved } = {}) {
     size: 'lg',
     content: body,
     footer: [btn('Cancel', { onClick: () => m.close(null) }), saveBtn],
-    initialFocus: editing ? undefined : name.input,
+    initialFocus: editing ? (focus === 'max_capture_bytes' ? capLimit.input : undefined) : name.input,
   });
   return m;
 }

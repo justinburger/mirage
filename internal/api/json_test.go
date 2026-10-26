@@ -191,6 +191,14 @@ func TestPublicMessage(t *testing.T) {
 		`replay: job rpl_1 is running: conflict`:                     `job rpl_1 is running`,
 		`plain message`:                                              `plain message`,
 		`the restore: point is gone`:                                 `the restore: point is gone`, // "restore" is not a package prefix
+		// An object named by several layers of the chain is named once.
+		`recording "rec_x": recording "rec_x": not found`:               `recording "rec_x": not found`,
+		`store: recording "rec_x": recording "rec_x": not found`:        `recording "rec_x": not found`,
+		`load profile "nope": profile "nope": not found`:                `load profile "nope": not found`,
+		`failed recording "rec_x": store: recording "rec_x": not found`: `failed recording "rec_x": not found`,
+		`listen tcp 127.0.0.1:80: bind: address already in use`:         `listen tcp 127.0.0.1:80: bind: address already in use`,
+		`copy recording rec_x: recording "r": not found`:                `copy recording rec_x: recording "r": not found`,
+		`xrecording "a": recording "a": not found`:                      `xrecording "a": recording "a": not found`, // a suffix must start a word
 	} {
 		if got := publicMessage(errors.New(in)); got != want {
 			t.Errorf("publicMessage(%q) = %q, want %q", in, got, want)

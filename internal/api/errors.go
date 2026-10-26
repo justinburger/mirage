@@ -61,12 +61,44 @@ func validationProblems(err error) []string {
 var internalPrefixes = regexp.MustCompile(`\b(?:store|ops|replay|proxy|virtual|api|har|anonymize|fault): `)
 
 // publicMessage turns an error chain into a message fit for API clients.
-func publicMessage(err error) string {
-	msg := internalPrefixes.ReplaceAllString(err.Error(), "")
+func publicMessage(err error) string { return cleanMessage(err.Error()) }
+
+// cleanMessage is publicMessage for text that is already a string, such as the
+// error a replay job recorded.
+func cleanMessage(msg string) string {
+	msg = collapseRepeats(internalPrefixes.ReplaceAllString(msg, ""))
 	for _, suffix := range []string{": conflict", ": validation failed"} {
 		msg = strings.TrimSuffix(msg, suffix)
 	}
 	return msg
+}
+
+// collapseRepeats drops a context segment of a wrapped error message that only
+// restates the one before it. Each layer names the object it works on, so a
+// chain reads 'recording "x": recording "x": not found' or 'failed recording
+// "x": recording "x": not found'; the second mention adds nothing.
+func collapseRepeats(msg string) string {
+	parts := strings.Split(msg, ": ")
+	if len(parts) < 2 {
+		return msg
+	}
+	out := parts[:1]
+	for _, p := range parts[1:] {
+		prev := out[len(out)-1]
+		if p == prev || strings.HasSuffix(prev, " "+p) {
+			continue
+		}
+		out = append(out, p)
+	}
+	return strings.Join(out, ": ")
+}
+
+// refMissing is the error for a request that names an object that does not
+// exist (a recording, profile, service or exchange id in its body or query):
+// 400 with a problem, whichever endpoint it is. A missing object that is the
+// target of the URL itself is a 404 instead.
+func refMissing(field, id string) error {
+	return invalid(field + " " + quote(id) + " does not exist")
 }
 
 // classify maps an error to the status and body of its response.

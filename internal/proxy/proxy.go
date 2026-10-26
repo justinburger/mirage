@@ -43,9 +43,13 @@
 //     on a miss Virtualizer.WriteMiss.
 //     hybrid      → Virtualizer.Serve; on a miss reverse proxy + capture.
 //     Once stored, the exchange is added to the virtualizer only if it is
-//     a GET, HEAD or OPTIONS with Error == "", status < 500 and no
-//     truncated body (so writes always reach the upstream and transient
-//     failures are not learned).
+//     a GET, HEAD or OPTIONS with Error == "", no truncated body, a status
+//     the URL alone determines (not 1xx, 206, 304, 408, 412, 416, 425, 429
+//     or 5xx) and a request without Range, If-Range, If-None-Match,
+//     If-Modified-Since, If-Match or If-Unmodified-Since (so writes always
+//     reach the upstream and transient or conditional answers are not
+//     learned). The decision is made on the service's state when the
+//     exchange is stored, not on the state the request ran with.
 //  4. metrics: Observe(endpoint, status, duration, bytes in/out, error =
 //     model.IsErrorStatus), InFlight(-1).
 //
@@ -66,8 +70,9 @@
 // Capture never blocks or slows the request path beyond copying bytes:
 //   - Service.CaptureSample is decided first; unsampled requests are proxied
 //     with no capture work (counted in CaptureSkipped). Once the recording
-//     reaches Service.MaxCaptureBytes, capture stops and ServiceStatus.Error
-//     says "capture limit reached" (traffic keeps flowing).
+//     reaches Service.MaxCaptureBytes, capture stops and ServiceStatus.Warning
+//     says "capture limit reached" (traffic keeps flowing, so it is not an
+//     Error).
 //   - Request and response bodies are teed into pooled buffers that start
 //     small (4 KiB) and grow on demand up to MaxBodyBytes (-1 = headers
 //     only) while they stream; buffers larger than 64 KiB are not returned
@@ -89,7 +94,8 @@
 //     BodyTruncated; protects against decompression bombs), moving the
 //     encoding to ContentEncoding and dropping
 //     Content-Encoding/Content-Length from the stored headers; other
-//     encodings stay as captured), apply the service's anonymizer when
+//     encodings stay as captured; under AnonymizeCapture see "Anonymized
+//     compressed bodies" below), apply the service's anonymizer when
 //     AnonymizeCapture is on (profile ProfileID or model.DefaultProfileID,
 //     loaded from the store with WithDefaults + anonymize.New and rebuilt on
 //     ProfileChanged; a stored profile without a secret is an error), then hand off to
@@ -139,6 +145,33 @@
 //     MaxBodyBytes is cut at MaxBodyBytes decoded bytes, BodyTruncated is set
 //     and BodySize is the larger of the wire size and MaxBodyBytes+1. A
 //     completely decoded body has BodySize equal to its decoded length.
+//   - Anonymized compressed bodies. When AnonymizeCapture is on, a body that is
+//     still under a content coding after the strict decode is never stored as
+//     captured, whatever the profile's opaque_bodies says: the anonymizer
+//     cannot read it, and it would keep raw values in a recording marked
+//     anonymized. A gzip or deflate stream cut by MaxBodyBytes (or corrupt
+//     after some output) is decoded as far as it goes: the decoded prefix, up
+//     to MaxBodyBytes, is anonymized and stored with BodyTruncated set and
+//     ContentEncoding recording the coding. A body under an unknown or
+//     stacked coding, or one that yields no output, is dropped: Body is empty,
+//     BodyTruncated is set and BodySize keeps the wire size.
+//   - Anonymized endpoints. The stored Exchange.Endpoint of an anonymized
+//     capture keeps the placeholders of the raw path's template ({id},
+//     {uuid}, {hex}, {token}, {email}, {date}, or a configured
+//     endpoint_patterns template) but takes its literal segments from the
+//     anonymized path, so it carries no raw value the anonymizer removed from
+//     the stored path. The live metrics label is still computed from the raw
+//     path.
+//   - Capture queue accounting. A job is charged its body bytes plus an
+//     estimate of the memory around them (exchange structs, header maps) against
+//     Deps.CaptureQueueBytes, and only the body bytes against the service's
+//     MaxCaptureBytes. Bodies are charged at their captured (possibly
+//     compressed) size when queued; once a worker has decoded and anonymized
+//     them the charge follows the stored size, and a job that no longer fits
+//     the byte bound is dropped and counted (a job alone in the queue is
+//     always kept).
+//   - A request the client abandoned before anything was written (for example
+//     during simulated virtual latency) is observed as status 0, an error.
 //   - Upstream failures before any response was read (502 or 504) store the
 //     synthetic JSON answer as the response. A failure after the response
 //     headers were sent stores the status and the partial body with Error set

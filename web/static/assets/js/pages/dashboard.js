@@ -1,7 +1,7 @@
 // Dashboard: live overview of all traffic, services and replay jobs.
 import { h } from '../dom.js';
 import { icon } from '../icons.js';
-import { state, refreshServices, refreshReplays } from '../state.js';
+import { state, refreshServices, refreshReplays, statusNotice } from '../state.js';
 import { loadHistory, aggregateRows, aggregateEventPoints, pointToRow, getRows } from '../series.js';
 import { trafficCharts, WINDOWS, savedWindow, saveWindow } from '../livecharts.js';
 import { sparkline } from '../chart.js';
@@ -168,8 +168,13 @@ function buildLive(ctx, root) {
     tErr.set(t.has ? fmtPct(t.errRate) : DASH, t.has ? 'last 10 seconds' : ' ', !t.has ? '' : t.errRate > 0.05 ? 'err' : t.errRate > 0.01 ? 'warn' : 'ok');
     tP95.set(t.has ? fmtMs(t.p95) : DASH, t.has ? 'last 10 seconds' : ' ', '');
     const running = state.services.filter((s) => s.status.running).length;
-    const errored = state.services.filter((s) => s.status.error).length;
-    tSvc.set(`${running} / ${state.services.length}`, errored ? `${errored} with errors` : running === state.services.length ? 'all running' : `${state.services.length - running} stopped`, errored ? 'err' : '');
+    // A listener that failed is an error; a running service that reports a note (capture limit reached) is only a warning.
+    const kinds = state.services.map((s) => (statusNotice(s.status) || {}).kind);
+    const errored = kinds.filter((k) => k === 'failed').length;
+    const noted = kinds.filter((k) => k === 'capture-limit' || k === 'runtime').length;
+    tSvc.set(`${running} / ${state.services.length}`,
+      errored ? `${errored} with errors` : noted ? `${noted} with warnings` : running === state.services.length ? 'all running' : `${state.services.length - running} stopped`,
+      errored ? 'err' : noted ? 'warn' : '');
     const rr = state.replays.filter((r) => r.status === 'running');
     tRep.set(String(rr.length), `${fmtInt(state.replays.length)} total jobs`, '');
     sparkRps.update(rowsBuf.slice(-60).map((r) => r.rps));
@@ -271,7 +276,8 @@ function buildLive(ctx, root) {
 
 function stateDot(r) {
   const st = r.status;
-  if (st.running) return dot('live', 'Running');
-  if (st.error) return dot('err', st.error);
+  const n = statusNotice(st);
+  if (st.running) return n ? dot('warn', `Running. ${n.text}`) : dot('live', 'Running');
+  if (n) return dot('err', n.text);
   return dot('off', r.enabled ? 'Stopped' : 'Disabled');
 }

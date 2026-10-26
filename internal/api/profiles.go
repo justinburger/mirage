@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/justinburger/mirage/internal/anonymize"
 	"github.com/justinburger/mirage/internal/model"
@@ -209,7 +210,9 @@ func (s *Server) previewAnonymization(w http.ResponseWriter, r *http.Request) er
 	}
 	var ex *model.Exchange
 	if in.ExchangeID != nil {
-		if ex, err = s.deps.Store.GetExchange(ctx, *in.ExchangeID); err != nil {
+		if ex, err = s.deps.Store.GetExchange(ctx, *in.ExchangeID); errors.Is(err, model.ErrNotFound) {
+			return refMissing("exchange_id", strconv.FormatInt(*in.ExchangeID, 10))
+		} else if err != nil {
 			return err
 		}
 	} else if ex, err = in.Exchange.Exchange(); err != nil {
@@ -235,7 +238,9 @@ func (s *Server) previewEngine(ctx context.Context, in previewRequest) (*anonymi
 			id = model.DefaultProfileID
 		}
 		stored, err := s.deps.Store.GetProfile(ctx, id)
-		if err != nil {
+		if errors.Is(err, model.ErrNotFound) {
+			return nil, refMissing("profile_id", id)
+		} else if err != nil {
 			return nil, err
 		}
 		return anonymize.New(stored.WithDefaults())

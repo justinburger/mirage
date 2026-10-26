@@ -1,6 +1,7 @@
 package model
 
 import (
+	"encoding/json"
 	"net"
 	"net/url"
 	"regexp"
@@ -231,8 +232,10 @@ func (s Service) Validate() error {
 	if !nameRE.MatchString(s.Name) {
 		p.add("name must be 1-64 chars of letters, digits, '.', '_' or '-'")
 	}
-	if _, _, err := net.SplitHostPort(s.ListenAddr); err != nil {
+	if _, port, err := net.SplitHostPort(s.ListenAddr); err != nil {
 		p.add("listen_addr %q must be host:port or :port", s.ListenAddr)
+	} else if !validPort(port) {
+		p.add("listen_addr %q has an invalid port %q (use a number from 0 to 65535)", s.ListenAddr, port)
 	}
 	if !s.Mode.Valid() {
 		p.add("mode %q must be passthrough, record, virtualize or hybrid", s.Mode)
@@ -304,13 +307,35 @@ func (s Service) Validate() error {
 	return p.err()
 }
 
+// validPort reports whether s is a decimal port number from 0 to 65535. Port
+// names ("http") are not accepted: resolving them depends on the machine's
+// services database, and a listen address should mean the same everywhere.
+func validPort(s string) bool {
+	if s == "" || len(s) > 5 {
+		return false
+	}
+	n := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+		n = n*10 + int(s[i]-'0')
+	}
+	return n <= 65535
+}
+
 // ServiceStatus is the live runtime state of a service listener.
 type ServiceStatus struct {
-	ServiceID string     `json:"service_id"`
-	Running   bool       `json:"running"`
-	Addr      string     `json:"addr,omitempty"` // resolved listen address
-	Mode      Mode       `json:"mode"`
-	Error     string     `json:"error,omitempty"` // last start/runtime error
+	ServiceID string `json:"service_id"`
+	Running   bool   `json:"running"`
+	Addr      string `json:"addr,omitempty"` // resolved listen address
+	Mode      Mode   `json:"mode"`
+	Error     string `json:"error,omitempty"` // last start/runtime error
+	// Warning is a note about something that happened while serving that
+	// leaves the service working, such as "capture limit reached": traffic
+	// keeps flowing, only capturing stopped. Cleared when the service is
+	// applied again (raising the limit, say). Error stays for failures.
+	Warning   string     `json:"warning,omitempty"`
 	StartedAt *time.Time `json:"started_at,omitempty"`
 	// Captured counts exchanges written to the recording since start.
 	Captured int64 `json:"captured"`
@@ -328,6 +353,18 @@ type ServiceStatus struct {
 	// IndexedExchanges is the size of the virtualization index (0 when not
 	// virtualizing).
 	IndexedExchanges int64 `json:"indexed_exchanges"`
+}
+
+// MarshalJSON writes started_at in UTC, like every other timestamp of the API,
+// whatever zone the clock that produced it was in. The receiver is not
+// modified.
+func (s ServiceStatus) MarshalJSON() ([]byte, error) {
+	type plain ServiceStatus // no methods: avoids recursing into MarshalJSON
+	if s.StartedAt != nil {
+		t := s.StartedAt.UTC()
+		s.StartedAt = &t
+	}
+	return json.Marshal(plain(s))
 }
 
 // VirtualStats counts virtualization activity of one service since its

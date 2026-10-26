@@ -33,6 +33,10 @@ server:
   # Bearer token required by the admin API. Empty means no authentication,
   # which is fine on localhost. Prefer passing it through the environment.
   admin_token: ${MIRAGE_ADMIN_TOKEN:-}
+  # DNS names the admin API may be reached by when there is no admin_token
+  # (IP addresses and localhost always work). Only needed behind a reverse
+  # proxy or a hosts-file name, for example [mirage.lan, mirage.lan:8484].
+  # allowed_hosts: []
   # debug, info, warn or error.
   log_level: info
   # text or json.
@@ -55,6 +59,13 @@ recordings:
 # by the profile's secret, so the same input always gives the same output.
 # The secret is generated when the profile is created and kept when this file
 # is applied again; set `secret:` only if you need it fixed.
+#
+# A profile only protects what it lists. The built-in "Default" profile
+# carries 40+ rules for common credential fields (password, token, secret, API
+# keys, ...) in JSON bodies, form bodies and query strings; a profile written
+# by hand starts empty. The demo's login is sent both as JSON and as a form
+# (examples/trafficgen does both), so the profile below needs a rule for each.
+# See GET /api/v1/profiles/default for the full list and copy what you need.
 # ---------------------------------------------------------------------------
 profiles:
   - name: strict
@@ -105,6 +116,28 @@ profiles:
         scope: request
         strategy: redact
         replacement: "[REDACTED]"
+      # The same login as an application/x-www-form-urlencoded body.
+      - name: login password (form)
+        enabled: true
+        target: form
+        selector: password
+        scope: request
+        strategy: redact
+        replacement: "[REDACTED]"
+      # Credentials in the URL show up in logs and recordings. The demo does
+      # not send any, these show the pattern.
+      - name: access token (query)
+        enabled: true
+        target: query
+        selector: access_token
+        scope: request
+        strategy: hash
+      - name: api key (query)
+        enabled: true
+        target: query
+        selector: api_key
+        scope: request
+        strategy: hash
       - name: login token
         enabled: true
         target: json

@@ -39,6 +39,10 @@ type fakeServices struct {
 
 	applyErr   error // returned by Apply
 	silentFail bool  // when applyErr is set, leave status.Error empty
+	// keepOnFail makes a failed Apply behave like proxy.Manager: the status
+	// keeps what the previous listener was (mode, running) and only gains the
+	// error; a service that was not running stays not running.
+	keepOnFail bool
 	removeErr  error
 	reloadErr  error
 	profileErr error
@@ -60,6 +64,9 @@ func (f *fakeServices) Apply(_ context.Context, svc model.Service) error {
 	}
 	if f.applyErr != nil {
 		st.Running = false
+		if prev, ok := f.status[svc.ID]; ok && f.keepOnFail {
+			st = prev
+		}
 		if !f.silentFail {
 			st.Error = f.applyErr.Error()
 		}
@@ -366,6 +373,7 @@ type request struct {
 	method, path string
 	body         any               // []byte/string sent as is, io.Reader streamed, anything else JSON-encoded
 	header       map[string]string // extra headers
+	host         string            // Host header, when not the test server's own
 	noAuth       bool
 }
 
@@ -397,6 +405,14 @@ func (e *env) send(rq request) (*http.Response, []byte) {
 	req, err := http.NewRequest(rq.method, e.ts.URL+rq.path, rd)
 	if err != nil {
 		e.t.Fatalf("NewRequest: %v", err)
+	}
+	if rq.host != "" {
+		req.Host = rq.host
+	}
+	// State-changing requests with a body must declare JSON (or multipart for
+	// the HAR import); raw bodies default to JSON unless a test says otherwise.
+	if ctype == "" && rd != nil {
+		ctype = "application/json"
 	}
 	if ctype != "" {
 		req.Header.Set("Content-Type", ctype)
@@ -562,4 +578,16 @@ func asMap(t testing.TB, data []byte) map[string]any {
 // observation is a minimal metrics observation.
 func observation(endpoint string, status int) metrics.Observation {
 	return metrics.Observation{Endpoint: endpoint, Status: status, Duration: time.Millisecond, Error: model.IsErrorStatus(status)}
+}
+
+// benchRequest is httptest.NewRequest addressed the way a browser or client on
+// the admin address would: to a loopback Host (the default, example.com, is
+// refused by the DNS-rebinding guard) and with a JSON body type.
+func benchRequest(method, target string, body io.Reader) *http.Request {
+	r := httptest.NewRequest(method, target, body)
+	r.Host = "127.0.0.1:8484"
+	if body != nil {
+		r.Header.Set("Content-Type", "application/json")
+	}
+	return r
 }

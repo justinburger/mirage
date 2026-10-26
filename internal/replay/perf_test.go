@@ -157,8 +157,13 @@ func TestMaxModeThroughput(t *testing.T) {
 	if sum.AchievedRPS < floor {
 		t.Errorf("%.0f req/s, want at least %.0f", sum.AchievedRPS, floor)
 	}
-	if !sum.Saturated || sum.MaxInFlight != 256 {
+	if sum.MaxInFlight != 256 {
 		t.Errorf("max mode should keep every worker busy: max in flight %d", sum.MaxInFlight)
+	}
+	// Every worker busy is what a closed loop is, not a sign the client fell
+	// behind, so it is not reported as saturation.
+	if sum.Saturated {
+		t.Error("max mode reported saturated")
 	}
 }
 

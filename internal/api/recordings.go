@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -274,7 +275,7 @@ func (s *Server) anonymizeRecording(w http.ResponseWriter, r *http.Request) erro
 	if _, err := s.deps.Store.GetRecording(ctx, id); err != nil {
 		return err
 	}
-	eng, err := ops.LoadEngine(ctx, s.deps.Store, in.ProfileID)
+	eng, err := s.loadEngine(ctx, in.ProfileID)
 	if err != nil {
 		return err
 	}
@@ -299,7 +300,7 @@ func (s *Server) exportRecording(w http.ResponseWriter, r *http.Request) error {
 	}
 	var eng *anonymize.Engine
 	if pid := r.URL.Query().Get("profile_id"); pid != "" {
-		if eng, err = ops.LoadEngine(ctx, s.deps.Store, pid); err != nil {
+		if eng, err = s.loadEngine(ctx, pid); err != nil {
 			return err
 		}
 	}
@@ -332,7 +333,9 @@ func (s *Server) importRecording(w http.ResponseWriter, r *http.Request) error {
 	r.Body = http.MaxBytesReader(w, r.Body, s.importLimit)
 
 	var src io.Reader = r.Body
+	multipart := false
 	if mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mt == "multipart/form-data" {
+		multipart = true
 		file, form, err := nextFilePart(r)
 		if err != nil {
 			return err
@@ -354,19 +357,46 @@ func (s *Server) importRecording(w http.ResponseWriter, r *http.Request) error {
 	var eng *anonymize.Engine
 	if profileID != "" {
 		var err error
-		if eng, err = ops.LoadEngine(ctx, s.deps.Store, profileID); err != nil {
+		if eng, err = s.loadEngine(ctx, profileID); err != nil {
 			return err
 		}
 	}
-	rec, err := ops.ImportHAR(ctx, s.deps.Store, src, strings.TrimSpace(name), eng, pathnorm.Default)
+	// An empty body reads like an empty body of the JSON endpoints, not like
+	// a HAR parse failure.
+	br := bufio.NewReaderSize(src, 4<<10)
+	if _, err := br.Peek(1); errors.Is(err, io.EOF) {
+		if multipart {
+			return badRequest("the uploaded file is empty; send a HAR document")
+		}
+		return badRequest("request body is empty; send a HAR document")
+	}
+	rec, err := ops.ImportHAR(ctx, s.deps.Store, br, strings.TrimSpace(name), eng, pathnorm.Default)
 	if err != nil {
 		if errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, model.ErrValidation) {
 			return badRequest("the upload ended before the HAR document was complete")
+		}
+		var bad *ops.InvalidHARError
+		if errors.As(err, &bad) {
+			return &httpError{status: http.StatusBadRequest, msg: "invalid HAR", problems: bad.Problems}
 		}
 		return err
 	}
 	writeJSON(w, http.StatusCreated, rec)
 	return nil
+}
+
+// loadEngine builds the engine of the profile a request names (the default
+// profile when profileID is empty). A profile that does not exist is a bad
+// request, like every other reference inside a request.
+func (s *Server) loadEngine(ctx context.Context, profileID string) (*anonymize.Engine, error) {
+	eng, err := ops.LoadEngine(ctx, s.deps.Store, profileID)
+	if errors.Is(err, model.ErrNotFound) {
+		if profileID == "" {
+			profileID = model.DefaultProfileID
+		}
+		return nil, refMissing("profile_id", profileID)
+	}
+	return eng, err
 }
 
 // filePart is the multipart "file" part, with its name.

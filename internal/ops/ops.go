@@ -60,7 +60,9 @@ func LoadEngine(ctx context.Context, st store.Store, profileID string) (*anonymi
 	}
 	p, err := st.GetProfile(ctx, profileID)
 	if err != nil {
-		return nil, fmt.Errorf("ops: load profile %q: %w", profileID, err)
+		// The store's error already names the profile; naming it again here
+		// would read 'load profile "x": profile "x": not found'.
+		return nil, fmt.Errorf("ops: load profile: %w", err)
 	}
 	if p.Secret == "" {
 		return nil, fmt.Errorf("ops: profile %q has no secret, so anonymized tokens would not be stable; regenerate its secret", profileID)

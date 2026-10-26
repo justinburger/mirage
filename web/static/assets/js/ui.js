@@ -690,26 +690,61 @@ export function chipsCtl({ value = [], placeholder = 'Type and press Enter', val
 }
 
 /** Key/value rows editor. get() -> object */
-export function kvCtl({ value = {}, keyPlaceholder = 'Header', valuePlaceholder = 'Value', addLabel = 'Add' } = {}) {
+/**
+ * Key/value rows. `masked` is the value an API read shows in place of a hidden
+ * secret (the replay API returns sensitive set_headers as "***"). A row that
+ * is loaded with that value is never filled with it: its value starts empty,
+ * is flagged as hidden, and must be typed again or the row removed. Posting
+ * the placeholder back would store it as the real value and lose the secret.
+ * `problems()` lists the rows that still need attention.
+ */
+export function kvCtl({ value = {}, keyPlaceholder = 'Header', valuePlaceholder = 'Value', addLabel = 'Add', masked } = {}) {
   const list = h('div', { class: 'kv-rows' });
-  const el = h('div', { class: 'kv-editor' }, list);
+  const note = h('div', { class: 'kv-note', role: 'status', hidden: true });
+  const el = h('div', { class: 'kv-editor' }, list, note);
+  const rows = () => [...list.querySelectorAll('.kv-row')];
+  const nameOf = (r) => r.children[0].value.trim();
+  // masked rows that were loaded hidden and have not been filled in yet
+  const pending = () => rows().filter((r) => r._hidden && r.children[1].value === '' && nameOf(r));
+  const hasMask = (r) => masked != null && r.children[1].value === masked;
+  function refresh() {
+    const open = pending();
+    rows().forEach((r) => {
+      r.classList.toggle('is-masked', open.includes(r));
+      r.classList.toggle('is-bad', hasMask(r) && !!nameOf(r));
+    });
+    const names = open.map(nameOf);
+    note.hidden = !names.length;
+    note.textContent = names.length
+      ? `The stored value of ${names.join(', ')} is hidden by the API, so it cannot be copied. Enter it again, or remove the row to send no such header.`
+      : '';
+  }
   const c = ctl(el, null, () => {
     const o = {};
-    list.querySelectorAll('.kv-row').forEach((r) => {
-      const k = r.children[0].value.trim();
+    rows().forEach((r) => {
+      const k = nameOf(r);
       if (k) o[k] = r.children[1].value;
     });
     return o;
   }, (v) => {
     list.replaceChildren();
     Object.entries(v || {}).forEach(([k, val]) => addRow(k, val));
+    refresh();
   });
+  c.problems = () => {
+    const out = [];
+    for (const r of pending()) out.push(`${nameOf(r)}: the stored value is hidden. Enter it again or remove the row.`);
+    for (const r of rows()) if (hasMask(r) && nameOf(r)) out.push(`${nameOf(r)}: ${masked} is the placeholder shown for a hidden secret, not a real value.`);
+    return out;
+  };
   function addRow(k = '', v = '') {
+    const hidden = masked != null && v === masked;
     const kin = h('input', { class: 'input mono', type: 'text', placeholder: keyPlaceholder, value: k, spellcheck: 'false', autocomplete: 'off', 'aria-label': keyPlaceholder });
-    const vin = h('input', { class: 'input mono', type: 'text', placeholder: valuePlaceholder, value: v, spellcheck: 'false', autocomplete: 'off', 'aria-label': valuePlaceholder });
-    const row = h('div', { class: 'kv-row' }, kin, vin, h('button', { type: 'button', class: 'icon-btn', 'aria-label': 'Remove row', onclick: () => { row.remove(); c.fire(); } }, icon('x', 14)));
-    kin.addEventListener('input', () => c.fire());
-    vin.addEventListener('input', () => c.fire());
+    const vin = h('input', { class: 'input mono', type: 'text', placeholder: hidden ? 'hidden: re-enter the value' : valuePlaceholder, value: hidden ? '' : v, spellcheck: 'false', autocomplete: 'off', 'aria-label': valuePlaceholder });
+    const row = h('div', { class: 'kv-row' }, kin, vin, h('button', { type: 'button', class: 'icon-btn', 'aria-label': 'Remove row', onclick: () => { row.remove(); refresh(); c.fire(); } }, icon('x', 14)));
+    row._hidden = hidden;
+    kin.addEventListener('input', () => { refresh(); c.fire(); });
+    vin.addEventListener('input', () => { refresh(); c.fire(); });
     list.appendChild(row);
     return row;
   }
@@ -823,6 +858,11 @@ export function applyProblems(fieldMap, err) {
 }
 
 export function scrollToFirstError(root) {
+  // An error inside a collapsed section (Advanced, Virtualization...) is
+  // invisible until the section is open, so open every section that holds one.
+  root.querySelectorAll('.has-error, .is-invalid').forEach((bad) => {
+    for (let d = bad.closest('details'); d; d = d.parentElement && d.parentElement.closest('details')) d.open = true;
+  });
   const el = root.querySelector('.has-error, .is-invalid, .alert-error');
   if (el) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
 }

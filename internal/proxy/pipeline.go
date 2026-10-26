@@ -4,11 +4,14 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/justinburger/mirage/internal/model"
+	"github.com/justinburger/mirage/internal/pathnorm"
 )
 
 // captureJob is one captured exchange on its way to the store.
@@ -18,15 +21,53 @@ type captureJob struct {
 	// st is the service state the request was handled with; it decides the
 	// recording, the anonymizer and the body cap.
 	st *serviceState
-	// queued is the body byte count charged against the queue bounds.
+	// queued is the body byte count charged against the queue bounds. It
+	// starts as the size of the captured (possibly still compressed) bodies
+	// and follows the exchange as the workers decode and anonymize it.
 	queued int64
+	// overhead is the estimated memory of everything that is not a body
+	// (header maps, strings, the exchange itself). It counts against the
+	// queue's byte bound but not against the service's capture limit, which
+	// is about stored body bytes.
+	overhead int64
+	// conditional marks a request that carried conditional or range headers
+	// (decided on the request as received, before anonymization).
+	conditional bool
 }
 
 // release returns the job's charge to the queue accounting. It must be called
 // exactly once, when the job leaves the pipeline.
 func (j *captureJob) release(p *pipeline) {
-	p.queuedBytes.Add(-j.queued)
+	p.queuedBytes.Add(-(j.queued + j.overhead))
 	j.svc.pending.Add(-j.queued)
+}
+
+// Estimated memory costs, in bytes, of an exchange that its bodies do not
+// cover: the structs and strings of the exchange itself, and per header value
+// the map slot, the slice and the string headers. Measured on captured
+// traffic (5 request and 2 response headers: about 1.8 KiB).
+const (
+	exchangeFixedBytes = 1024
+	headerEntryBytes   = 96
+)
+
+// exchangeOverhead estimates the memory an exchange holds besides its bodies.
+func exchangeOverhead(ex *model.Exchange) int64 {
+	n := int64(exchangeFixedBytes)
+	n += int64(len(ex.Request.Path) + len(ex.Request.RawQuery) + len(ex.Request.Host) + len(ex.Endpoint) + len(ex.Error))
+	n += headerBytes(ex.Request.Header) + headerBytes(ex.Response.Header)
+	return n
+}
+
+func headerBytes(h http.Header) int64 {
+	var n int64
+	for k, vals := range h {
+		n += int64(len(k))
+		for _, v := range vals {
+			n += headerEntryBytes + int64(len(v))
+		}
+	}
+	return n
 }
 
 // pipeline moves captured exchanges from the request path to the store:
@@ -93,8 +134,9 @@ func (p *pipeline) enqueue(j *captureJob) {
 		j.svc.dropped.Add(1)
 		return
 	}
-	if now := p.queuedBytes.Add(j.queued); now > p.maxBytes && now != j.queued {
-		p.queuedBytes.Add(-j.queued)
+	charge := j.queued + j.overhead
+	if now := p.queuedBytes.Add(charge); now > p.maxBytes && now != charge {
+		p.queuedBytes.Add(-charge)
 		j.svc.dropped.Add(1)
 		return
 	}
@@ -131,21 +173,101 @@ func (p *pipeline) work() {
 
 // process decodes and anonymizes a job and hands it to the writer. An
 // exchange whose anonymization fails is dropped: it is never stored raw.
+//
+// The bodies were charged at their encoded size when the job was queued; once
+// decoded they can be hundreds of times larger, so the charge follows them
+// (see recharge) and a job that no longer fits the queue's byte bound is
+// dropped here.
 func (p *pipeline) process(j *captureJob) {
-	decodeExchange(j.ex, j.st.bodyCap)
-	if j.st.anon != nil {
-		if err := j.st.anon.Exchange(j.ex); err != nil {
+	st := j.st
+	if st.anon != nil {
+		decodeExchangeForAnon(j.ex, st.bodyCap)
+	} else {
+		decodeExchange(j.ex, st.bodyCap)
+	}
+	if !p.recharge(j, true) {
+		p.drop(j)
+		return
+	}
+	if st.anon != nil {
+		ex := j.ex
+		rawPath := ex.Request.Path
+		if err := st.anon.Exchange(ex); err != nil {
 			p.m.log.Error("anonymizing capture; exchange dropped", "service", j.svc.id, "error", err)
 			j.svc.setRuntimeErr("capture: anonymize: " + err.Error())
 			p.drop(j)
 			return
 		}
+		// The endpoint was computed from the raw path; it must not carry what
+		// the anonymizer just removed from the stored path.
+		ex.Endpoint = anonymizedEndpoint(st.norm, ex.Request.Method, rawPath, ex.Request.Path)
+		p.recharge(j, false)
 	}
 	select {
 	case p.ready <- j:
 	case <-p.abortCh:
 		p.drop(j)
 	}
+}
+
+// recharge brings the job's queue charge in line with the bodies it holds now.
+// With enforce set it reports false when growth pushed the queue past its byte
+// bound (a job alone in the queue is always kept, like at admission); the
+// caller then drops the job, which returns the whole charge.
+func (p *pipeline) recharge(j *captureJob, enforce bool) bool {
+	body := int64(len(j.ex.Request.Body) + len(j.ex.Response.Body))
+	delta := body - j.queued
+	if delta == 0 {
+		return true
+	}
+	j.queued = body
+	now := p.queuedBytes.Add(delta)
+	j.svc.pending.Add(delta)
+	return !(enforce && delta > 0 && now > p.maxBytes && now != j.queued+j.overhead)
+}
+
+// anonymizedEndpoint returns the endpoint to store with an anonymized
+// exchange. The endpoint of the raw path is the stable grouping ("/users/{id}"
+// whatever the id became), but its literal segments are raw values the
+// anonymizer rewrote in the stored path ("/people/123-45-6789"). So the
+// result takes the segments of the endpoint of the anonymized path, except
+// where the raw path was templated: a placeholder carries no data and keeps
+// the grouping stable. A template the user configured (endpoint_patterns)
+// is kept as it is.
+func anonymizedEndpoint(n *pathnorm.Normalizer, method, rawPath, anonPath string) string {
+	rawEP := n.Endpoint(method, rawPath)
+	anonEP := n.Endpoint(method, anonPath)
+	if rawEP == anonEP {
+		return rawEP
+	}
+	_, rawT, ok1 := strings.Cut(rawEP, " ")
+	prefix, anonT, ok2 := strings.Cut(anonEP, " ")
+	if !ok1 || !ok2 {
+		return anonEP
+	}
+	if slices.Contains(n.Patterns(), rawT) {
+		return prefix + " " + rawT
+	}
+	rs, as := strings.Split(rawT, "/"), strings.Split(anonT, "/")
+	if len(rs) != len(as) {
+		return anonEP
+	}
+	for i := range as {
+		if isBuiltinPlaceholder(rs[i]) {
+			as[i] = rs[i]
+		}
+	}
+	return prefix + " " + strings.Join(as, "/")
+}
+
+// isBuiltinPlaceholder reports whether seg is one of the placeholders the
+// path normalizer substitutes for ids and other opaque values.
+func isBuiltinPlaceholder(seg string) bool {
+	switch seg {
+	case "{id}", "{uuid}", "{hex}", "{token}", "{email}", "{date}":
+		return true
+	}
+	return false
 }
 
 // batch collects jobs for one recording.
@@ -226,9 +348,15 @@ func (p *pipeline) flush(recordingID string, jobs []*captureJob) {
 
 // learn adds a stored exchange to the service's virtualizer in hybrid mode,
 // unless it is something a replay should not reproduce: writes, transient
-// failures, upstream errors and truncated bodies.
+// failures, conditional requests, upstream errors and truncated bodies.
+//
+// Whether to learn is decided on the service's state now, not on the state the
+// request was handled with: a capture still queued when the mode changes from
+// record to hybrid belongs in the new virtualizer, which was built from a
+// store that did not hold it yet. An exchange that the new virtualizer did read
+// from the store is recognized by its ID (Virtualizer.Add ignores it).
 func (p *pipeline) learn(j *captureJob) {
-	if j.st.mode != model.ModeHybrid || !learnable(j.ex) {
+	if j.conditional || !learnable(j.ex) {
 		return
 	}
 	cur := j.svc.acquire()
@@ -241,15 +369,44 @@ func (p *pipeline) learn(j *captureJob) {
 	}
 }
 
-// learnable reports whether a captured exchange may be added to the live index.
+// conditionalHeaders change the response without being part of the virtual
+// key: what they provoke (304, 206, 412, 416) says nothing about the resource.
+var conditionalHeaders = []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since", "If-Match", "If-Unmodified-Since"}
+
+// hasConditionalHeader reports whether h carries a conditional or range header.
+func hasConditionalHeader(h http.Header) bool {
+	for _, k := range conditionalHeaders {
+		if _, ok := h[k]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// learnable reports whether a captured exchange may be added to the live
+// index: a GET, HEAD or OPTIONS that completed with a status the URL alone
+// determines. Writes, upstream failures, truncated bodies, requests that
+// carried conditional or range headers and the answers that depend on
+// something other than the URL (1xx, 206, 304, 408, 412, 416, 425, 429, 5xx)
+// are not learned; the upstream is asked again.
 func learnable(ex *model.Exchange) bool {
 	switch ex.Request.Method {
 	case http.MethodGet, http.MethodHead, http.MethodOptions:
 	default:
 		return false
 	}
-	return ex.Error == "" && ex.Response.Status < 500 &&
-		!ex.Request.BodyTruncated && !ex.Response.BodyTruncated
+	if ex.Error != "" || ex.Request.BodyTruncated || ex.Response.BodyTruncated {
+		return false
+	}
+	switch st := ex.Response.Status; {
+	case st < 200, st >= 500:
+		return false
+	case st == http.StatusPartialContent, st == http.StatusNotModified, st == http.StatusRequestTimeout,
+		st == http.StatusPreconditionFailed, st == http.StatusRequestedRangeNotSatisfiable,
+		st == http.StatusTooEarly, st == http.StatusTooManyRequests:
+		return false
+	}
+	return !hasConditionalHeader(ex.Request.Header)
 }
 
 // stop finishes the pipeline: no new jobs are accepted, the queue is drained

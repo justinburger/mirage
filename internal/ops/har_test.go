@@ -272,6 +272,51 @@ func TestImportHARUsesNormalizer(t *testing.T) {
 	}
 }
 
+// Unreadable input is reported as an *InvalidHARError whose problems are plain
+// sentences: no package prefixes, no "validation failed" wrappers.
+func TestImportHARInvalidInputHasCleanProblems(t *testing.T) {
+	ctx := context.Background()
+	good := entry("https://a.example.com/ok", 200)
+	bad := entry("not a url", 200)
+	tests := []struct {
+		name  string
+		input io.Reader
+		want  string
+	}{
+		{"empty input", strings.NewReader(""), "input is empty"},
+		{"white space only", strings.NewReader(" \n\t "), "input is empty"},
+		{"not JSON", strings.NewReader("hello"), "malformed JSON at byte"},
+		{"HTML", strings.NewReader("<html>nope</html>"), "malformed JSON at byte"},
+		{"JSON without log", strings.NewReader(`{"a":1}`), `no "log" object`},
+		{"truncated document", bytes.NewReader(harDoc(t, good, good)[:150]), "end of input"},
+		{"corrupt entry", bytes.NewReader(harDoc(t, good, bad)), "entry 1"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newStore(t)
+			_, err := ImportHAR(ctx, st, tc.input, "doomed", nil, nil)
+			var ih *InvalidHARError
+			if !errors.As(err, &ih) {
+				t.Fatalf("err = %v (%T), want an *InvalidHARError", err, err)
+			}
+			if !errors.Is(err, model.ErrValidation) {
+				t.Errorf("err = %v does not wrap model.ErrValidation", err)
+			}
+			if len(ih.Problems) != 1 || !strings.Contains(ih.Problems[0], tc.want) {
+				t.Fatalf("problems = %q, want one mentioning %q", ih.Problems, tc.want)
+			}
+			for _, internal := range []string{"har:", "ops:", "validation failed", "invalid HAR", "unexpected EOF"} {
+				if strings.Contains(ih.Problems[0], internal) {
+					t.Errorf("problem %q leaks %q", ih.Problems[0], internal)
+				}
+			}
+			if !strings.HasPrefix(err.Error(), "ops: import HAR: invalid HAR: ") {
+				t.Errorf("Error() = %q", err)
+			}
+		})
+	}
+}
+
 func TestImportHARErrors(t *testing.T) {
 	ctx := context.Background()
 	good := entry("https://a.example.com/ok", 200)

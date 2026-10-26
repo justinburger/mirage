@@ -116,7 +116,8 @@ func runReplay(ctx context.Context, args []string, s streams) int {
 			"    ramp from 0 to 100 rps over 30s, step to 1000 rps and hold it (rate mode is implied)",
 			"mirage replay --data mirage.db --recording checkout --target http://staging:8080 --mode max --concurrency 128 --duration 30s --loop \\",
 			"    --json result.json --max-error-rate 0.01 --max-p99 250ms",
-			"    closed-loop throughput test; exit status 1 when the error rate exceeds 1% or p99 exceeds 250ms",
+			"    closed-loop throughput test; exit status 1 when the error rate exceeds 1% or p99 exceeds 250ms,",
+			"    and always when no request got a response (target down), even without thresholds",
 		}, s)
 	fs.StringVar(&dataPath, "data", "mirage.db", "FILE|SQLite database holding the recording")
 	fs.StringVar(&recRef, "recording", "", "ID|recording id or name to replay (with --data)")
@@ -298,8 +299,18 @@ func runReplay(ctx context.Context, args []string, s streams) int {
 	}
 
 	failures := evaluateThresholds(s.out, sum, set["max-error-rate"], maxErrRate, maxP99, runErr != nil && !interrupted)
+	// A run that sent requests but never got a single response (target down,
+	// wrong port, DNS failure) measured nothing, so it must not look like a
+	// success to a CI job that set no thresholds. Error statuses are
+	// responses: only transport failures count here.
+	noResponses := !interrupted && sum.Sent > 0 && sum.Completed == 0
+	if noResponses {
+		fmt.Fprintf(s.err, "mirage replay: every request failed: %s sent, none got a response from %s\n", fmtInt(sum.Sent), target)
+	}
 	switch {
 	case runErr != nil && !interrupted:
+		return exitFail
+	case noResponses:
 		return exitFail
 	case len(failures) > 0:
 		fmt.Fprintf(s.err, "mirage replay: thresholds exceeded: %s\n", strings.Join(failures, "; "))
@@ -352,10 +363,18 @@ func evaluateThresholds(w io.Writer, sum model.ReplaySummary, errRateSet bool, m
 			lat, which = sum.Latency, "p99"
 		}
 		limit := float64(maxP99) / float64(time.Millisecond)
-		ok := lat.P99 <= limit
-		fmt.Fprintf(tw, "  %s\t%s\t<= %s\t%s\n", which, fmtMs(lat.P99), fmtMs(limit), verdict(ok))
-		if !ok {
-			failures = append(failures, fmt.Sprintf("%s %s exceeds %s", which, fmtMs(lat.P99), fmtMs(limit)))
+		if sum.Sent > 0 && (sum.Completed == 0 || lat.Count == 0) {
+			// Requests were sent but nothing measured a latency (target down,
+			// refused connections): a 0 ms p99 would pass the gate on a run
+			// that proved nothing.
+			fmt.Fprintf(tw, "  %s\tnot measured\t<= %s\tFAIL\n", which, fmtMs(limit))
+			failures = append(failures, fmt.Sprintf("%s not measured: %s sent, none got a response", which, fmtInt(sum.Sent)))
+		} else {
+			ok := lat.P99 <= limit
+			fmt.Fprintf(tw, "  %s\t%s\t<= %s\t%s\n", which, fmtMs(lat.P99), fmtMs(limit), verdict(ok))
+			if !ok {
+				failures = append(failures, fmt.Sprintf("%s %s exceeds %s", which, fmtMs(lat.P99), fmtMs(limit)))
+			}
 		}
 	}
 	tw.Flush()

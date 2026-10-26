@@ -285,7 +285,13 @@ func TestInjectedResponseWriting(t *testing.T) {
 				t.Fatalf("success carries %s=%q", HeaderInjected, rec.Header().Get(HeaderInjected))
 			}
 		}
-		if e.Stats().Injected == 0 {
+		// Swapping errors for successes injects nothing: Stats.Injected
+		// matches the responses that carry X-Mirage-Injected (none here); the
+		// swaps are counted apart.
+		if e.Stats().Injected != 0 {
+			t.Fatalf("Stats.Injected = %d for a service that injected no errors", e.Stats().Injected)
+		}
+		if e.Suppressed() == 0 {
 			t.Fatal("swaps were not counted")
 		}
 	})

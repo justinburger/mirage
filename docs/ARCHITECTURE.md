@@ -99,13 +99,27 @@ order: metrics registry `Run` → `replay.Manager.Recover` →
 logged and does not stop the others) → `api.Server.Run` on the run context +
 admin HTTP server.
 
-Shutdown (reverse): admin HTTP server → `replay.Manager.Shutdown` →
-`proxy.Manager.Shutdown` (drains captures) → stop the registry → `store.Close`,
-all inside one 20 s deadline. `api.Server.Run` shares the run context, so
-cancelling it closes every open SSE stream, which `http.Server.Shutdown` would
-otherwise wait for; `netutil.NewConns` closes connections that never sent a
-request (browsers open them speculatively), which `Shutdown` would hold for
-five seconds.
+Shutdown, all inside one 20 s deadline (`ShutdownTimeout`), where each phase
+gets its own slice of the time that is left so that one stuck phase cannot
+starve the others:
+
+1. The admin HTTP server stops accepting and drains **alongside** the next two
+   phases (nothing in them depends on it). Requests still running after a 5 s
+   grace period have their connections closed, so a client stalled in the middle
+   of an upload is cut instead of holding up everything else. That is logged as
+   a warning and is not a shutdown error.
+2. `replay.Manager.Shutdown`: jobs are cancelled and saved with their partial
+   results, in at most 30% of the time left.
+3. `proxy.Manager.Shutdown`: listeners stop and the capture queue is drained
+   into the store, in at most 85% of what is left after step 2.
+4. Wait (at most 2 s) for admin handlers whose connections were just cut, so
+   an interrupted import can delete its partial recording; stop the registry;
+   `store.Close`.
+
+`api.Server.Run` shares the run context, so cancelling it closes every open
+SSE stream, which `http.Server.Shutdown` would otherwise wait for;
+`netutil.NewConns` closes connections that never sent a request (browsers open
+them speculatively), which `Shutdown` would hold for five seconds.
 
 The `proxy.VirtualizerFactory` adapter returns an untyped nil interface on
 error (typed-nil trap); `app` also holds the compile-time assertions that

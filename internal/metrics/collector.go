@@ -224,6 +224,13 @@ func (c *Collector) ID() string { return c.id }
 // Corrected > 0 allocates the corrected-latency state once; see Collector).
 func (c *Collector) Observe(o Observation) {
 	d := max(int64(o.Duration), 0)
+	// The corrected latency is written first: Tick reads the service
+	// histogram before the corrected one, so a request counted in a service
+	// window has its corrected latency recorded by then, and the corrected
+	// state exists before the first service sample of a replay is counted.
+	if o.Corrected > 0 {
+		c.correctedState().observe(int64(o.Corrected))
+	}
 	ep := c.endpoint(o.Endpoint)
 
 	c.classes[statusClass(o.Status)].Add(1)
@@ -241,9 +248,6 @@ func (c *Collector) Observe(o Observation) {
 	atomicMax(&c.winMinC, math.MaxInt64-d)
 	ep.latency.observe(d)
 	c.latency.observe(d)
-	if o.Corrected > 0 {
-		c.correctedState().observe(int64(o.Corrected))
-	}
 }
 
 // InFlight adjusts the in-flight gauge by delta (+1 on start, -1 on finish).

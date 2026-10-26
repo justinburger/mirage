@@ -23,6 +23,18 @@
 //     model.ErrNotFound to 404, model.ErrConflict to 409, a request body over
 //     the limit to 413, anything unexpected to 500 with a generic message (the
 //     detail is logged).
+//   - An object that a request names (a recording_id, profile_id, service_id
+//     or exchange_id in its body or query) and that does not exist is a 400
+//     with a problem such as `recording_id "rec_x" does not exist`, whichever
+//     endpoint it is. A 404 means the object addressed by the URL itself is
+//     missing. A replay that points at a recording that was deleted after the
+//     replay ran, a state conflict rather than a bad request, is a 409 when
+//     started or cloned.
+//   - Messages never carry the names of internal packages ("store:", "ops:"),
+//     and an object named by several layers of an error is named once.
+//   - A request body must be declared as JSON (Content-Type application/json
+//     or a +json type; the HAR import also takes multipart/form-data): any
+//     other type, or none, is a 415. See Authentication for why.
 //   - Request bodies are limited to 10 MiB (HAR import: 1 GiB, streamed).
 //     Unknown JSON fields are rejected with 400, except the read-only echo
 //     fields "status", "fired", "has_secret", "created_at" and "updated_at",
@@ -35,7 +47,12 @@
 // Creating or changing a service applies WithDefaults and Validate, checks
 // that the recording and profile it references exist, persists it, then calls
 // ServiceController.Apply. When Apply fails (a port in use, say) the service
-// is still saved and the response carries the status with its error. Changes
+// is still saved and the response is still 2xx (200, or 201 on create): it
+// carries the status with running=false and the error in status.error, so a
+// client must look at status after create, update, enable and mode, not at the
+// HTTP status alone. Only a clash with another Mirage service (name or listen
+// address) is a 409. status.mode is the mode of the running listener; when
+// nothing is running it is the saved service's mode. Changes
 // to one service are serialised, so the store and the running listener
 // cannot disagree about which update came last. The Apply that follows a
 // successful store write is detached from the request's cancellation, so a
@@ -46,7 +63,22 @@
 // A recording cannot be deleted (409) while an enabled service in a mode that
 // uses recordings points at it, or a replay job on it is pending or running.
 // A profile cannot be deleted (409) if it is "default" or any service or
-// replay job references it.
+// replay job references it. Deleting a service deletes the fault rules scoped
+// to it (they could never fire again), and a fault rule cannot be saved for a
+// service that does not exist.
+//
+// # Replays
+//
+// Creating a replay validates its config and checks that its recording and
+// profile exist (400 otherwise). Starting one, directly or with "start": true,
+// first checks that its recording still exists and is not empty, and answers
+// 409 at once instead of "running" followed by a failure; with "start": true a
+// job that cannot start is not left behind. The values of credential
+// set_headers are masked ("***") in every response by a fixed rule
+// (isSensitiveHeader: Authorization, Cookie, X-Api-Key and other well-known
+// names, or any name containing auth, token, secret, password, credential,
+// session, ... or ending in -key), independent of the anonymization profiles.
+// A job's error text is shown without internal package prefixes.
 //
 // # Live stream
 //
@@ -62,9 +94,28 @@
 // /metrics, needs the token as "Authorization: Bearer <token>", the cookie
 // "mirage_token" or the query parameter "access_token" (for EventSource and
 // download links). Tokens are compared in constant time. The static UI is
-// public. A state-changing request authenticated only by the cookie is
-// refused when its Origin header names another host (cross-site request
-// forgery).
+// public.
+//
+// A browser on the administrator's machine can reach the admin address, so
+// web pages are kept out in every auth mode (guardBrowsers):
+//
+//   - A state-changing request whose Origin header names another origin (or
+//     whose Sec-Fetch-Site is cross-site) is refused with 403, whatever
+//     credential it carries. CORS "simple requests" (text/plain, form
+//     encodings, no preflight) are otherwise delivered to the handler and
+//     only their response is hidden from the page.
+//   - A state-changing request with a body must be JSON (415 otherwise); the
+//     simple-request content types are exactly the ones a page can send
+//     without a preflight.
+//   - Without an admin token, the Host header must be an IP address,
+//     localhost, or one of Deps.AllowedHosts, or the request is refused with
+//     403: a page whose DNS name was rebound to the admin address is "same
+//     origin" to the browser and could otherwise read every recording. With
+//     a token, a rebinding page has no credential to present, so names are
+//     unrestricted. The health check is exempt.
+//
+// Clients that are not browsers (curl, scripts, the CLI) send no Origin and
+// notice only the Content-Type rule: use "Content-Type: application/json".
 //
 // # Static UI
 //
@@ -128,9 +179,15 @@ type Deps struct {
 	// UI is the static web UI (web.FS()); nil disables it.
 	UI         fs.FS
 	AdminToken string
-	Version    string
-	DataPath   string
-	Logger     *slog.Logger
+	// AllowedHosts are the DNS names (optionally with a port) the admin server
+	// may be addressed by when it has no AdminToken, in addition to IP
+	// addresses and localhost, which always work. A name listed here is also
+	// accepted as the Origin of state-changing requests, for a reverse proxy
+	// that presents a public name and rewrites Host.
+	AllowedHosts []string
+	Version      string
+	DataPath     string
+	Logger       *slog.Logger
 }
 
 // Server is the management API.
@@ -149,6 +206,8 @@ type Server struct {
 	// token is the SHA-256 of Deps.AdminToken; compared in constant time.
 	token    [sha256.Size]byte
 	hasToken bool
+	// allowedHosts is Deps.AllowedHosts, normalised.
+	allowedHosts []string
 
 	// svcLocks serialises store+controller changes per service; faultMu and
 	// profileMu do the same for the fault rule set and anonymization profiles.
@@ -207,10 +266,11 @@ func New(deps Deps) *Server {
 	if deps.AdminToken != "" {
 		s.token, s.hasToken = sha256.Sum256([]byte(deps.AdminToken)), true
 	}
+	s.allowedHosts = normalizeHosts(deps.AllowedHosts)
 	s.ui = newStaticUI(deps.UI, s.log)
 	s.hub = newHub(s)
 	s.routes()
-	s.handler = s.securityHeaders(s.accessLog(s.recoverPanics(s.authenticate(s.mux))))
+	s.handler = s.securityHeaders(s.accessLog(s.recoverPanics(s.authenticate(s.guardBrowsers(s.mux)))))
 	return s
 }
 

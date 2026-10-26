@@ -68,7 +68,31 @@ func TestClassifyBody(t *testing.T) {
 		{"", "plain", kindText},
 		{"", "bin\x00", kindBinary},
 		{"", "\xff\xfe", kindBinary},
-		{"application/x-custom", `{"a":1}`, kindText}, // sniffed JSON only when the type is missing
+		{"application/x-custom", `{"a":1}`, kindJSON}, // unknown types are sniffed
+		{"application/octet-stream", `{"a":1}`, kindJSON},
+		{"application/octet-stream", `plain`, kindText},
+		{"text/plain", `{"a":1}`, kindJSON},
+		{"text/html", `  [1,2]`, kindJSON},
+		{"text/plain", `[INFO] started`, kindJSON}, // looks like JSON; unparsable JSON is processed as text
+		{"text/plain", `hello {"a":1}`, kindText},
+		{"application/xml", `{"a":1}`, kindText},
+		{"application/x-amz-json-1.1", `{}`, kindJSON},
+		{"application/x-amz-json-1.0", `{}`, kindJSON},
+		{"application/vnd.acme.customer.v2", `{"a":1}`, kindJSON}, // vendor types are sniffed, not assumed binary
+		{"application/vnd.acme.customer.v2+json", `x`, kindJSON},
+		{"application/vnd.acme.customer.v2.json", `x`, kindJSON},
+		{"application/vnd.acme.export", `plain text`, kindText},
+		{"application/vnd.acme.export", "bin\x00ary", kindBinary},
+		{"application/vnd.acme.thing+xml", `<a/>`, kindText},
+		{"application/vnd.openxmlformats-officedocument.wordprocessingml.document", "hello", kindBinary},
+		{"application/vnd.android.package-archive", "hello", kindBinary},
+		{"application/x-www-form-urlencoded", `{"password":"x"}`, kindJSON}, // what curl -d sends
+		{"application/x-www-form-urlencoded", "  [1,2]\n", kindJSON},
+		{"application/x-www-form-urlencoded", `{a}=b&c=d`, kindForm},
+		{"application/x-www-form-urlencoded", `[0]=a&[1]=b`, kindForm},
+		{"application/x-www-form-urlencoded", `{weird=1&password=x`, kindForm},
+		{"application/x-ndjson", `{}`, kindNDJSON},
+		{"application/x-json-stream", `{}`, kindNDJSON},
 		{"not a media type", "text", kindText},
 	}
 	for _, c := range cases {

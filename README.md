@@ -106,7 +106,7 @@ mirage serve --admin 0.0.0.0:8484 --admin-token s3cret --log-format json
 ```
 
 The config file's `server:` section supplies defaults for `--admin`, `--data`,
-`--admin-token`, `--log-level` and `--log-format`; an explicit flag wins, and
+`--admin-token`, `--allowed-host`, `--log-level` and `--log-format`; an explicit flag wins, and
 `MIRAGE_ADMIN_TOKEN` beats the file. The rest of the file (recordings,
 profiles, services, faults) is applied at start-up by name and is idempotent;
 see [`examples/mirage.yaml`](examples/mirage.yaml) for every option. Because the
@@ -166,7 +166,10 @@ that is identical from run to run.
 The admin address serves the UI, a JSON API under `/api/v1` (documented in
 [`docs/API.md`](docs/API.md)), a Server-Sent Events stream with live per-second
 metrics at `/api/v1/stream`, and Prometheus metrics at `/metrics`. Start with
-`--admin-token` to require `Authorization: Bearer <token>`.
+`--admin-token` to require `Authorization: Bearer <token>`. Without a token the
+admin API answers only to IP addresses and `localhost` as the host in the URL
+(so a web page cannot reach it through a rebound DNS name); to use a name such
+as `mirage.lan` without a token, list it with `--allowed-host mirage.lan`.
 
 ## Performance
 

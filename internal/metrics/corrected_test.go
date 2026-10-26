@@ -593,6 +593,60 @@ func TestCorrectedObserveRacingTick(t *testing.T) {
 	t.Logf("%d windows closed while %d corrected observations raced", windows, total)
 }
 
+// TestCorrectedNeverBelowServiceUnderRacingTick checks the invariant the UI
+// charts rely on: every observation's corrected latency is at least its
+// service time, so no window may report a corrected percentile below the
+// service one, even when a Tick lands between the two writes of Observe.
+func TestCorrectedNeverBelowServiceUnderRacingTick(t *testing.T) {
+	const (
+		writers   = 8
+		perWriter = 30_000
+	)
+	c := newReplayCollector()
+	var (
+		wg   sync.WaitGroup
+		done atomic.Bool
+		bad  []model.SeriesPoint
+	)
+	check := func(p model.SeriesPoint) {
+		// 0 means the window carries no corrected samples (omitted), which
+		// is a gap, not an inverted order.
+		if p.Requests > 0 && ((p.CorrectedP95 != 0 && p.CorrectedP95 < p.P95) || (p.CorrectedP99 != 0 && p.CorrectedP99 < p.P99)) {
+			bad = append(bad, p)
+		}
+	}
+	tickerDone := make(chan struct{})
+	go func() {
+		defer close(tickerDone)
+		for i := 0; !done.Load(); i++ {
+			check(c.Tick(base.Add(time.Duration(i) * time.Second)))
+		}
+	}()
+	for w := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := rand.New(rand.NewPCG(uint64(w), 29))
+			for range perWriter {
+				// Mostly fast requests with a rare slow tail, so the window
+				// percentile is decided by few samples.
+				d := time.Millisecond
+				if r.IntN(50) == 0 {
+					d = time.Duration(10+r.IntN(40)) * time.Millisecond
+				}
+				c.Observe(correctedObs(d, d))
+			}
+		}()
+	}
+	wg.Wait()
+	done.Store(true)
+	<-tickerDone
+	check(c.Tick(base.Add(time.Hour)))
+	if len(bad) > 0 {
+		t.Fatalf("%d windows with a corrected percentile below the service one, e.g. %+v", len(bad), bad[0])
+	}
+}
+
 // TestCorrectedStress runs every operation that touches corrected data
 // concurrently, Reset included, for the race detector and for panics.
 func TestCorrectedStress(t *testing.T) {

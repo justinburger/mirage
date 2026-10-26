@@ -687,3 +687,117 @@ func TestConcurrentServiceUpdatesStayConsistent(t *testing.T) {
 		t.Errorf("%d service locks leaked", n)
 	}
 }
+
+// status.mode is the mode of the running listener. When an Apply fails and
+// nothing is running, it must follow the saved service rather than the mode of
+// a listener that no longer exists.
+func TestStatusModeFollowsTheServiceWhenNothingRuns(t *testing.T) {
+	e := newEnv(t)
+	e.svcs.keepOnFail = true
+	rec := e.seedRecording("capture", 0)
+
+	var svc ServiceWithStatus
+	e.call("POST", "/api/v1/services", validService("p2", "127.0.0.1:19291"), http.StatusCreated, &svc)
+	if svc.Status.Mode != model.ModePassthrough || svc.Status.Running {
+		t.Fatalf("created = %+v", svc.Status)
+	}
+
+	e.svcs.applyErr = errors.New("listen 127.0.0.1:19291: bind: address already in use")
+	body := validService("p2", "127.0.0.1:19291")
+	body["mode"] = "record"
+	body["recording_id"] = rec.ID
+	body["enabled"] = true
+
+	var out ServiceWithStatus
+	e.call("PUT", "/api/v1/services/"+svc.ID, body, http.StatusOK, &out)
+	if out.Mode != model.ModeRecord {
+		t.Fatalf("mode = %q", out.Mode)
+	}
+	if out.Status.Running || out.Status.Error == "" {
+		t.Fatalf("status = %+v, want not running with an error", out.Status)
+	}
+	if out.Status.Mode != model.ModeRecord {
+		t.Errorf("status.mode = %q after a failed apply, want the saved mode %q", out.Status.Mode, model.ModeRecord)
+	}
+
+	// The list and the single-service views agree.
+	var one ServiceWithStatus
+	e.call("GET", "/api/v1/services/"+svc.ID, nil, http.StatusOK, &one)
+	var list []ServiceWithStatus
+	e.call("GET", "/api/v1/services", nil, http.StatusOK, &list)
+	if one.Status.Mode != model.ModeRecord || list[0].Status.Mode != model.ModeRecord {
+		t.Errorf("GET status.mode = %q, list status.mode = %q", one.Status.Mode, list[0].Status.Mode)
+	}
+}
+
+// A listener that keeps running after a failed change (the new address could
+// not bind) still has its own mode, and status.mode must keep saying so.
+func TestStatusModeKeepsTheRunningListenersMode(t *testing.T) {
+	e := newEnv(t)
+	e.svcs.keepOnFail = true
+	rec := e.seedRecording("capture", 0)
+
+	body := validService("live", "127.0.0.1:19292")
+	body["enabled"] = true
+	var svc ServiceWithStatus
+	e.call("POST", "/api/v1/services", body, http.StatusCreated, &svc)
+	if !svc.Status.Running || svc.Status.Mode != model.ModePassthrough {
+		t.Fatalf("created = %+v", svc.Status)
+	}
+
+	e.svcs.applyErr = errors.New("listen 127.0.0.1:19293: bind: address already in use")
+	body["listen_addr"] = "127.0.0.1:19293"
+	body["mode"] = "record"
+	body["recording_id"] = rec.ID
+	var out ServiceWithStatus
+	e.call("PUT", "/api/v1/services/"+svc.ID, body, http.StatusOK, &out)
+	if !out.Status.Running || out.Status.Error == "" {
+		t.Fatalf("status = %+v, want the old listener running with the error", out.Status)
+	}
+	if out.Status.Mode != model.ModePassthrough {
+		t.Errorf("status.mode = %q, want the running listener's mode %q", out.Status.Mode, model.ModePassthrough)
+	}
+}
+
+// An Apply that fails (a port taken by another process) is not an HTTP error:
+// the service stays saved and the 2xx response carries running=false and the
+// error in its status. docs/API.md tells clients to look there.
+func TestApplyFailureIsReportedInStatusWith2xx(t *testing.T) {
+	e := newEnv(t)
+	e.svcs.applyErr = errors.New("listen 127.0.0.1:19294: bind: address already in use")
+
+	body := validService("busy", "127.0.0.1:19294")
+	body["enabled"] = true
+	var created ServiceWithStatus
+	e.call("POST", "/api/v1/services", body, http.StatusCreated, &created)
+	if created.Status.Running || !strings.Contains(created.Status.Error, "address already in use") {
+		t.Errorf("create: status = %+v", created.Status)
+	}
+
+	for _, step := range []struct{ method, path string }{
+		{"POST", "/api/v1/services/" + created.ID + "/enable"},
+		{"POST", "/api/v1/services/" + created.ID + "/mode"},
+	} {
+		var in any
+		if strings.HasSuffix(step.path, "/mode") {
+			in = map[string]any{"mode": "passthrough"}
+		}
+		var out ServiceWithStatus
+		e.call(step.method, step.path, in, http.StatusOK, &out)
+		if out.Status.Running || !strings.Contains(out.Status.Error, "address already in use") {
+			t.Errorf("%s: status = %+v", step.path, out.Status)
+		}
+	}
+	body["description"] = nil
+	delete(body, "description")
+	var out ServiceWithStatus
+	e.call("PUT", "/api/v1/services/"+created.ID, body, http.StatusOK, &out)
+	if out.Status.Running || out.Status.Error == "" {
+		t.Errorf("update: status = %+v", out.Status)
+	}
+	// It is saved all the same.
+	stored, err := e.st.GetService(context.Background(), created.ID)
+	if err != nil || !stored.Enabled {
+		t.Errorf("stored = %+v, %v", stored, err)
+	}
+}

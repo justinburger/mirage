@@ -188,8 +188,10 @@ func TestRunTimeouts(t *testing.T) {
 	if sum.Errors != 3 || sum.ErrorRate != 3.0/8 {
 		t.Errorf("errors=%d rate=%v, want 3 and 0.375", sum.Errors, sum.ErrorRate)
 	}
-	if sum.Latency.Count != 5 {
-		t.Errorf("latency covers %d requests, want only the 5 that got a response", sum.Latency.Count)
+	// A request that timed out waited for the target, so it is in the latency
+	// summaries, at least Timeout long (see TestTimeoutsReachTheLatencySummaries).
+	if sum.Latency.Count != 8 || sum.CorrectedLatency.Count != 8 || sum.Latency.Max < 100 {
+		t.Errorf("latency covers %d / %d requests, max %.1fms; want all 8 and the 100ms timeouts", sum.Latency.Count, sum.CorrectedLatency.Count, sum.Latency.Max)
 	}
 	if time.Since(start) > time.Second {
 		t.Errorf("run took %v: timeouts must bound slow requests", time.Since(start))
@@ -211,8 +213,8 @@ func TestRunTransportErrors(t *testing.T) {
 	if sum.Sent != 6 || sum.Failed != 6 || sum.Completed != 0 || sum.Timeouts != 0 || sum.Errors != 6 || sum.ErrorRate != 1 {
 		t.Errorf("summary: %+v", sum)
 	}
-	if len(sum.StatusCounts) != 0 || sum.Latency.Count != 0 {
-		t.Errorf("no response, no status or latency: %v %d", sum.StatusCounts, sum.Latency.Count)
+	if len(sum.StatusCounts) != 0 || sum.Latency.Count != 0 || sum.CorrectedLatency.Count != 0 {
+		t.Errorf("nothing was sent, so no status or latency: %v %d %d", sum.StatusCounts, sum.Latency.Count, sum.CorrectedLatency.Count)
 	}
 	// The dashboard still sees them, as errors with no status.
 	if snap := col.Snapshot(); snap.Requests != 6 || snap.Errors != 6 || snap.StatusClasses["err"] != 6 {

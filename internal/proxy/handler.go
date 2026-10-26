@@ -203,6 +203,10 @@ func (rs *reqState) observe(end time.Time) {
 	switch {
 	case !rs.completed:
 		status, isErr = 0, true // a panic (abort) ended the request
+	case !rs.rw.wrote && rs.r.Context().Err() != nil:
+		// The client went away before anything was written (for example
+		// during simulated latency): not a success.
+		status, isErr = 0, true
 	case !rs.rw.wrote:
 		status = http.StatusOK
 	}
@@ -276,7 +280,9 @@ func (rs *reqState) finishCapture() {
 	ex := rs.buildExchange(errMsg)
 	s.m.pipe.enqueue(&captureJob{
 		ex: ex, svc: s, st: rs.st,
-		queued: int64(len(ex.Request.Body) + len(ex.Response.Body)),
+		queued:      int64(len(ex.Request.Body) + len(ex.Response.Body)),
+		overhead:    exchangeOverhead(ex),
+		conditional: hasConditionalHeader(rs.r.Header),
 	})
 }
 

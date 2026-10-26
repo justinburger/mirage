@@ -10,6 +10,17 @@ import (
 	"github.com/justinburger/mirage/internal/model"
 )
 
+// The profile id appears once in the error of an unknown profile.
+func TestLoadEngineUnknownProfileNamesItOnce(t *testing.T) {
+	_, err := LoadEngine(context.Background(), newStore(t), "prof_nope")
+	if !errors.Is(err, model.ErrNotFound) {
+		t.Fatalf("err = %v", err)
+	}
+	if n := strings.Count(err.Error(), "prof_nope"); n != 1 {
+		t.Errorf("err = %q names the profile %d times, want once", err, n)
+	}
+}
+
 func TestLoadEngine(t *testing.T) {
 	ctx := context.Background()
 	st := newStore(t)

@@ -37,6 +37,7 @@ type jframe struct {
 	stLo, stHi int
 	acLo, acHi int
 	pathLen    int // len(path) including this container's own segment
+	objLo      int // objects only: offset of the first byte after the opening brace
 }
 
 // childInfo is the result of entering a child node: its state window, its
@@ -63,7 +64,11 @@ type jsonRW struct {
 	path      []byte
 	chain     []*rule
 	tmp       []byte
+	sibTmp    []byte // scratch of scanForKeys; tmp may be holding the key being entered
 	skipStk   []byte
+	// look counts the bytes scanned ahead for sibling filters in this
+	// document; lookMax bounds it, see siblingCheck.
+	look, lookMax int
 }
 
 var jsonPool = sync.Pool{New: func() any { return new(jsonRW) }}
@@ -80,6 +85,7 @@ func (r *run) rewriteJSON(src []byte, lenient bool, loc locator) ([]byte, bool, 
 	w.loc.json = nil
 	w.prog = r.sd.json
 	w.out = w.out[:0]
+	w.look, w.lookMax = 0, 4*len(src)+(64<<10)
 	w.states, w.active, w.stack = w.states[:0], w.active[:0], w.stack[:0]
 	w.path = w.path[:0]
 	if w.reporting {
@@ -400,7 +406,7 @@ func (w *jsonRW) value(info *childInfo) (pushed bool, err error) {
 		w.stack = append(w.stack, jframe{
 			obj:  c == '{',
 			stLo: info.stLo, stHi: info.stHi, acLo: info.acLo, acHi: info.acHi,
-			pathLen: len(w.path),
+			pathLen: len(w.path), objLo: w.pos,
 		})
 		return true, nil
 	case c == '"':

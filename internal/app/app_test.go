@@ -14,9 +14,11 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/justinburger/mirage/internal/config"
 	"github.com/justinburger/mirage/internal/model"
 	"github.com/justinburger/mirage/internal/store"
 )
@@ -366,6 +368,38 @@ func TestCloseWithoutRun(t *testing.T) {
 	}
 }
 
+// Without an admin token the API answers only to IP addresses, localhost and
+// the names the operator lists (--allowed-host), so a rebound DNS name cannot
+// reach it.
+func TestAllowedHostsReachTheAdminAPI(t *testing.T) {
+	get := func(a *App, host string) int {
+		t.Helper()
+		req, _ := http.NewRequest("GET", a.AdminURL()+"/api/v1/services", nil)
+		req.Host = host
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	plain, _ := startApp(t, Options{Data: store.MemoryPath})
+	if got := get(plain, "mirage.lan:8484"); got != http.StatusForbidden {
+		t.Errorf("an unlisted name: %d, want 403", got)
+	}
+	if got := get(plain, "localhost:8484"); got != http.StatusOK {
+		t.Errorf("localhost: %d, want 200", got)
+	}
+
+	listed, _ := startApp(t, Options{Data: store.MemoryPath, AllowedHosts: []string{"mirage.lan"}})
+	if got := get(listed, "mirage.lan:8484"); got != http.StatusOK {
+		t.Errorf("a listed name: %d, want 200", got)
+	}
+	if got := get(listed, "evil.example"); got != http.StatusForbidden {
+		t.Errorf("another name: %d, want 403", got)
+	}
+}
+
 func TestAdminTokenIsEnforced(t *testing.T) {
 	a, _ := startApp(t, Options{Data: store.MemoryPath, AdminToken: "s3cret"})
 	for _, c := range []struct {
@@ -491,4 +525,253 @@ func mustRecordingID(t *testing.T, a *App) string {
 		t.Fatalf("recordings: %+v, %v", recs, err)
 	}
 	return recs[0].ID
+}
+
+// A client that stalls in the middle of an admin upload keeps its connection
+// active, so the admin server cannot drain. That must not eat the time the
+// replay jobs and the capture queue need: the job stops and is saved at once,
+// and every capture the service acknowledged is on disk.
+func TestStalledAdminRequestDoesNotStarveTheOtherShutdownPhases(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"ok":1}`)
+	}))
+	defer upstream.Close()
+	db := filepath.Join(t.TempDir(), "m.db")
+	logs := &lockedBuffer{}
+	a, err := New(context.Background(), Options{Data: db, Admin: "127.0.0.1:0", Logger: testLogger(logs)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Short budgets keep the test fast; the proportions are what matter. With
+	// one shared deadline the admin phase alone would use all 3 s.
+	a.shutdownTimeout = 3 * time.Second
+	a.adminGrace = 300 * time.Millisecond
+
+	ctx := context.Background()
+	rec, err := a.Store().CreateRecording(ctx, model.Recording{Name: "captured"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed, err := a.Store().CreateRecording(ctx, model.Recording{Name: "seed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Store().AppendExchanges(ctx, seed.ID, []*model.Exchange{{
+		ServiceID: "x", StartedAt: time.Now(),
+		Request:  model.Request{Method: "GET", Path: "/a"},
+		Response: model.Response{Status: 200},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := a.Store().PutService(ctx, model.Service{
+		ID: "svc_stall", Name: "stall", ListenAddr: "127.0.0.1:0", Upstream: upstream.URL,
+		Mode: model.ModeRecord, Enabled: true, RecordingID: rec.ID,
+	}.WithDefaults())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.Run(runCtx) }()
+	eventually(t, "the service to listen", 10*time.Second, func() bool { return a.proxy.Status(svc.ID).Addr != "" })
+	svcAddr := a.proxy.Status(svc.ID).Addr
+
+	job, err := a.replay.Create(ctx, "long", model.ReplayConfig{
+		RecordingID: seed.ID, Target: upstream.URL, Mode: model.ReplayRate, Rate: 200,
+		Duration: model.Duration(5 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.replay.Start(ctx, job.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Steady traffic through the service until shutdown has finished.
+	var acked atomic.Int64
+	stopLoad := make(chan struct{})
+	loadDone := make(chan struct{})
+	go func() {
+		defer close(loadDone)
+		c := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}
+		for {
+			select {
+			case <-stopLoad:
+				return
+			default:
+			}
+			if resp, err := c.Get("http://" + svcAddr + "/x"); err == nil {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode == 200 {
+					acked.Add(1)
+				}
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+	eventually(t, "some captured traffic", 10*time.Second, func() bool { return acked.Load() > 20 })
+
+	// Headers and the start of a body, then silence: this request stays active.
+	stalled, err := net.Dial("tcp", a.AdminAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stalled.Close()
+	fmt.Fprint(stalled, "POST /api/v1/recordings/import HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\nContent-Type: application/json\r\n\r\n{")
+	time.Sleep(200 * time.Millisecond)
+
+	signalled := time.Now()
+	cancel()
+	var runErr error
+	select {
+	case runErr = <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("Run did not return")
+	}
+	took := time.Since(signalled)
+	close(stopLoad)
+	<-loadDone
+
+	if runErr != nil {
+		t.Errorf("Run returned %v; a connection cut after the grace period is not a failed shutdown\n%s", runErr, logs.String())
+	}
+	if took > 2*time.Second {
+		t.Errorf("shutdown took %v with a 300 ms admin grace and a 3 s budget\n%s", took, logs.String())
+	}
+
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	got, err := st.GetReplayJob(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.ReplayStopped {
+		t.Errorf("replay job is %s (%q), want stopped", got.Status, got.Error)
+	}
+	if got.EndedAt == nil || got.EndedAt.Sub(signalled) > time.Second {
+		t.Errorf("the replay job kept running after the signal: ended %v, signalled %v", got.EndedAt, signalled)
+	}
+
+	// The cut import cleaned up after itself before the store was closed.
+	if recs, err := st.ListRecordings(ctx); err != nil || len(recs) != 2 {
+		t.Errorf("recordings after shutdown: %d, %v (want only captured and seed)\n%s", len(recs), err, logs.String())
+	}
+	if !strings.Contains(logs.String(), "connections were closed") {
+		t.Errorf("cutting a stalled request should be logged:\n%s", logs.String())
+	}
+
+	r2, err := st.GetRecording(ctx, rec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r2.ExchangeCount != acked.Load() {
+		t.Errorf("client was acknowledged %d requests but %d exchanges were stored", acked.Load(), r2.ExchangeCount)
+	}
+}
+
+// The example configuration is what people copy, and trafficgen logs in both as
+// JSON and as a form: whatever the example's "strict" profile is labelled, no
+// credential the demo sends may be stored in clear.
+func TestExampleStrictProfileKeepsDemoCredentialsOutOfTheRecording(t *testing.T) {
+	var gotForm, gotJSON atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Add("Set-Cookie", "session=0123456789abcdef; Path=/; HttpOnly")
+		io.WriteString(w, `{"token":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln","token_type":"Bearer"}`)
+	}))
+	defer upstream.Close()
+
+	cfg, err := config.Load("../../examples/mirage.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Services) != 1 {
+		t.Fatalf("the example defines %d services, want 1", len(cfg.Services))
+	}
+	cfg.Services[0].ListenAddr = "127.0.0.1:0"
+	cfg.Services[0].Upstream = upstream.URL
+	cfg.Faults = nil
+
+	a, stop := startApp(t, Options{Data: filepath.Join(t.TempDir(), "m.db"), Config: cfg})
+	var svcAddr string
+	eventually(t, "the demo service to listen", 10*time.Second, func() bool {
+		svcs, _ := a.Store().ListServices(context.Background())
+		for _, s := range svcs {
+			if s.Name == "demo" {
+				svcAddr = a.proxy.Status(s.ID).Addr
+			}
+		}
+		return svcAddr != ""
+	})
+
+	const secret = "password123"
+	logins := []struct {
+		contentType, body string
+		flag              *atomic.Bool
+	}{
+		{"application/json", `{"email":"judy.lee@example.com","password":"` + secret + `"}`, &gotJSON},
+		{"application/x-www-form-urlencoded", "email=judy.lee%40example.com&password=" + secret, &gotForm},
+	}
+	for _, l := range logins {
+		req, _ := http.NewRequest("POST", "http://"+svcAddr+"/api/login", strings.NewReader(l.body))
+		req.Header.Set("Content-Type", l.contentType)
+		req.Header.Set("Authorization", "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln")
+		req.Header.Set("Cookie", "session=0123456789abcdef")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		l.flag.Store(true)
+	}
+	if err := stop(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !gotJSON.Load() || !gotForm.Load() {
+		t.Fatal("both logins should have been sent")
+	}
+
+	st, err := store.Open(a.opts.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	recs, err := st.ListRecordings(context.Background())
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("recordings: %v, %v", recs, err)
+	}
+	items, total, err := st.ListExchanges(context.Background(), recs[0].ID, model.ExchangeQuery{})
+	if err != nil || total != 2 {
+		t.Fatalf("exchanges: %d, %v", total, err)
+	}
+	for _, it := range items {
+		ex, err := st.GetExchange(context.Background(), it.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ex.Anonymized {
+			t.Errorf("exchange %d is not marked anonymized", ex.ID)
+		}
+		var all strings.Builder
+		all.Write(ex.Request.Body)
+		all.Write(ex.Response.Body)
+		for _, h := range []http.Header{ex.Request.Header, ex.Response.Header} {
+			for k, vs := range h {
+				all.WriteString(k + ": " + strings.Join(vs, ",") + "\n")
+			}
+		}
+		for _, raw := range []string{secret, "judy.lee", "0123456789abcdef", "eyJhbGciOiJIUzI1NiJ9"} {
+			if strings.Contains(all.String(), raw) {
+				t.Errorf("exchange %d (%s) keeps %q in clear:\nrequest body: %s\n%s", ex.ID, ex.Request.Header.Get("Content-Type"), raw, ex.Request.Body, all.String())
+			}
+		}
+	}
 }

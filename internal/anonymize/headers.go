@@ -20,7 +20,8 @@ var neverTouch = map[string]struct{}{
 // noDetect lists headers whose values are protocol metadata that look like
 // PII to the detectors: version numbers that parse as IPv4 addresses
 // (Chrome/120.0.0.0), validators made of digits, dates. Explicit rules still
-// apply to them; the detectors skip them.
+// apply to them; the detectors whose matches cannot be mistaken for such
+// metadata (metaSafeDetectors) run, the rest skip them.
 var noDetect = map[string]struct{}{
 	"User-Agent": {}, "Server": {}, "Date": {}, "Expires": {}, "Last-Modified": {},
 	"Age": {}, "Cache-Control": {}, "Pragma": {}, "Etag": {}, "If-None-Match": {},
@@ -31,6 +32,13 @@ var noDetect = map[string]struct{}{
 	"Content-Security-Policy": {}, "X-Content-Type-Options": {}, "X-Frame-Options": {},
 	"X-Xss-Protection": {}, "Sec-Ch-Ua": {}, "Sec-Ch-Ua-Mobile": {}, "Sec-Ch-Ua-Platform": {},
 }
+
+// metaSafeDetectors are the detectors that also run over the noDetect
+// headers: an e-mail address, a JWT or an AWS access key ID has a shape no
+// version number, validator or date has, and bots and SDKs do put a contact
+// address in their User-Agent. The numeric detectors (card, SSN, phone, IP,
+// IBAN) stay off there.
+const metaSafeDetectors = 1<<detEmail | 1<<detJWT | 1<<detAWS
 
 // authSchemes are the authentication schemes whose name is kept when the
 // credential after it is replaced, so "Bearer h_..." is still a well-formed
@@ -173,17 +181,18 @@ func (r *run) headerValue(name, v string, sel []*rule, redacted bool, loc *locat
 		return v, false
 	}
 	if _, ok := noDetect[name]; ok {
-		return r.regexOnly(v, loc), false
+		return r.restrictedValue(v, loc), false
 	}
 	return r.value(nil, v, loc), false
 }
 
-// regexOnly applies the regex rules without the detectors.
-func (r *run) regexOnly(s string, loc *locator) string {
+// restrictedValue applies the regex rules and then the metaSafeDetectors, for
+// headers that are mostly protocol metadata.
+func (r *run) restrictedValue(s string, loc *locator) string {
 	for _, rl := range r.sd.regex {
 		s = r.applyRegex(rl, s, loc)
 	}
-	return s
+	return r.detectWith(s, nil, loc, metaSafeDetectors)
 }
 
 // cookies anonymizes a Cookie request header ("a=1; b=2") one cookie at a

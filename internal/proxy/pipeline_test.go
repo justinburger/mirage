@@ -171,8 +171,8 @@ func TestMaxCaptureBytesStopsCapture(t *testing.T) {
 	}
 	waitFor(t, "four captures", func() bool { return e.mgr.Status(svc.ID).Captured == 4 })
 	st := e.mgr.Status(svc.ID)
-	if st.CaptureSkipped != 16 || st.Error != "capture limit reached" {
-		t.Errorf("status = %+v, want 16 skipped and the limit error", st)
+	if st.CaptureSkipped != 16 || st.Warning != "capture limit reached" || st.Error != "" || !st.Running {
+		t.Errorf("status = %+v, want 16 skipped, running, and the limit as a warning (not an error)", st)
 	}
 
 	// Raising the limit clears the error and resumes capture.
@@ -180,8 +180,8 @@ func TestMaxCaptureBytesStopsCapture(t *testing.T) {
 	if err := e.mgr.Apply(context.Background(), svc); err != nil {
 		t.Fatal(err)
 	}
-	if st := e.mgr.Status(svc.ID); st.Error != "" {
-		t.Errorf("error after raising the limit: %q", st.Error)
+	if st := e.mgr.Status(svc.ID); st.Error != "" || st.Warning != "" {
+		t.Errorf("note after raising the limit: error %q, warning %q", st.Error, st.Warning)
 	}
 	do(t, c, "GET", base+"/resumed", nil)
 	e.waitStored(svc.RecordingID, 5)

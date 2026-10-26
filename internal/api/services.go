@@ -39,13 +39,20 @@ func (s *Server) statusIndex() map[string]model.ServiceStatus {
 }
 
 // statusOf returns the runtime status of svc, taken from known when present.
+//
+// status.mode is the mode of the running listener. When nothing is running
+// (a disabled service, or one whose Apply failed) there is no listener to
+// describe, so it follows the saved service; otherwise a failed Apply would
+// leave the controller's previous mode next to the service's new one. A
+// listener that is still running (an address change that could not bind keeps
+// the old one) keeps reporting its own mode.
 func (s *Server) statusOf(svc model.Service, known map[string]model.ServiceStatus) model.ServiceStatus {
 	st, ok := known[svc.ID]
 	if !ok {
 		st = s.svcs.Status(svc.ID)
 	}
 	st.ServiceID = svc.ID
-	if st.Mode == "" {
+	if st.Mode == "" || !st.Running {
 		st.Mode = svc.Mode
 	}
 	return st
@@ -131,7 +138,7 @@ func (s *Server) updateService(w http.ResponseWriter, r *http.Request) error {
 }
 
 // deleteService answers DELETE /api/v1/services/{id}. The recordings the
-// service wrote are kept.
+// service wrote are kept; the fault rules scoped to it are deleted with it.
 func (s *Server) deleteService(w http.ResponseWriter, r *http.Request) error {
 	id := r.PathValue("id")
 	defer s.svcLocks.Lock(id)()
@@ -147,6 +154,13 @@ func (s *Server) deleteService(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	s.deps.Metrics.Remove(metrics.ServiceCollectorName(id))
+	// Fault rules scoped to the service go with it. faultMu keeps a rule being
+	// created for the service from slipping in between the two deletes.
+	s.faultMu.Lock()
+	defer s.faultMu.Unlock()
+	if err := s.deleteFaultsOf(dctx, id); err != nil {
+		return err
+	}
 	if err := s.deps.Store.DeleteService(dctx, id); err != nil {
 		return err
 	}

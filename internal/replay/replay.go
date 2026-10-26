@@ -62,12 +62,14 @@
 // time (send → body fully read) and corrected time (intended send → body
 // fully read). MaxLag is the largest intended-vs-actual send delay;
 // MaxInFlight the peak concurrency; Saturated is set when all Concurrency
-// slots were busy at least once.
+// slots were busy at least once in an open-loop run (timeline, rate). A closed
+// loop (max) keeps them busy by definition and is never saturated.
 //
-// HTTP client: a dedicated http.Transport per job (MaxIdleConnsPerHost =
-// Concurrency, MaxIdleConns = 2 × Concurrency, IdleConnTimeout 90s,
-// ForceAttemptHTTP2, DisableCompression, keep-alive dialer,
-// InsecureSkipVerify per config); requests carry a per-request Timeout
+// HTTP client: a dedicated http.Transport per job (MaxConnsPerHost =
+// MaxIdleConnsPerHost = MaxIdleConns = Concurrency, so a worker that is ready
+// before its previous connection is back in the pool waits for it instead of
+// dialing a surplus one; IdleConnTimeout 90s, ForceAttemptHTTP2,
+// DisableCompression, keep-alive dialer, InsecureSkipVerify per config); requests carry a per-request Timeout
 // context; response bodies are drained (io.Copy to io.Discard with a pooled
 // buffer) and counted. Errors: timeouts (deadline exceeded / net timeout)
 // counted in Timeouts and Failed; other transport errors in Failed.
@@ -95,8 +97,8 @@
 // by Stop, Delete and Shutdown. Start runs the job in the background on the
 // registry collector metrics.ReplayCollectorName(id) (reset at start); Start
 // on a running job returns an error wrapping model.ErrConflict. Get returns
-// the live Summary while running (refreshed at least once per second; Series
-// only for finished jobs). Stop cancels it (status stopped, partial summary
+// the live Summary while running (refreshed at least once per second) and,
+// like a finished job, its Series so far (List and Running leave it out). Stop cancels it (status stopped, partial summary
 // kept); Stop on a job that is not running returns nil. On finish the job
 // (status, error, summary, series, timestamps) is saved, and the job's
 // collector is removed from the registry 60s later (Delete removes it at
@@ -123,18 +125,37 @@
 //     quiet at the end. Planned is the rounded-up integral.
 //   - Planned follows the schedule exactly for a single pass, including the
 //     same error-amplification draws and a Duration or MaxRequests cut. For a
-//     looping timeline with a Duration it is the first pass's rate times
-//     Duration; for max mode with Loop it is MaxRequests or -1.
+//     looping timeline with a Duration it counts the requests due before
+//     Duration, as exact as the passes are alike; with a fractional
+//     ErrorAmplification over a recording that has errors each pass draws its
+//     own copies, so it is the first pass's rate times Duration, and the
+//     summary raises it to Sent if the run sends more. For max mode with Loop
+//     it is MaxRequests or -1.
 //   - SetHeaders are applied after anonymization, never before, so a token
 //     for the target is not itself hashed by the profile. A target with
 //     userinfo ("http://user:pw@host") sends it as Basic credentials when no
 //     Authorization header is set. Redirects are not followed, a 302 is a
 //     302. A SetHeaders "Host" acts as HostHeader (which wins).
-//   - Latency and CorrectedLatency cover requests that got a response;
-//     requests without one are counted in Failed (and Timeouts) and appear on
-//     the collector as status 0 with the time they took. Requests aborted by
-//     cancelling the job are not counted as failures. The first failures of a
-//     job are logged (endpoint and error only).
+//   - Latency and CorrectedLatency cover every request that waited for the
+//     target: the ones that got a response and the failures that were sent,
+//     a timeout (at least Timeout long) or a connection that broke after it
+//     was made, so a hung target cannot make the percentiles look better.
+//     Requests that never reached the target (refused or unresolvable
+//     connection, failed certificate check, request that could not be built)
+//     are in Failed only. All failures are counted in Failed (and Timeouts)
+//     and appear on the collector as status 0 with the time they took, so a
+//     caller that gates on latency must also look at Completed. Requests
+//     aborted by cancelling the job are not counted as failures. The first
+//     failures of a job are logged (endpoint and error only).
+//   - AchievedRPS is the responses received for the requests sent in the send
+//     window, over that window (the scheduler's run, ending at Duration for a
+//     time-bounded job), so the drain of slow in-flight requests that follows
+//     is not held against the generator. A closed-loop run that stops by
+//     Duration counts the responses that arrived inside the window; one that
+//     runs out of requests, and the live value while sending, is completed
+//     over the run so far.
+//   - Seeds the Manager picks are in [1, 2^53-1], so they survive the web UI's
+//     JSON parser and Edit as new replays the same schedule.
 //   - Bytes are body bytes: BytesSent request bodies as sent (after
 //     anonymization and gzip), BytesReceived response bodies as they came on
 //     the wire (compression is never undone).

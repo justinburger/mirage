@@ -17,15 +17,16 @@ import (
 // environment and the configuration file.
 type serveFlags struct {
 	admin, data, configPath, token, logLevel, logFormat string
+	allowedHosts                                        []string
 }
 
 func runServe(ctx context.Context, args []string, s streams) int {
 	var f serveFlags
 	fs := newFlagSet("serve",
 		"run the proxy services, the admin API and the web UI",
-		[]string{"[--config FILE] [--admin ADDR] [--data FILE] [--admin-token TOKEN]"},
+		[]string{"[--config FILE] [--admin ADDR] [--data FILE] [--admin-token TOKEN] [--allowed-host NAME]"},
 		[]flagGroup{
-			{"Flags", []string{"config", "admin", "data", "admin-token", "log-level", "log-format"}},
+			{"Flags", []string{"config", "admin", "data", "admin-token", "allowed-host", "log-level", "log-format"}},
 		},
 		[]string{
 			"mirage serve                                   # UI on http://127.0.0.1:8484, data in ./mirage.db",
@@ -37,6 +38,13 @@ func runServe(ctx context.Context, args []string, s streams) int {
 	fs.StringVar(&f.admin, "admin", "127.0.0.1:8484", "ADDR|listen address of the admin web UI, API and /metrics")
 	fs.StringVar(&f.data, "data", "mirage.db", "FILE|SQLite database (created if missing)")
 	fs.StringVar(&f.token, "admin-token", "", "TOKEN|require this bearer token for the admin API (default: $MIRAGE_ADMIN_TOKEN, then the config file)")
+	fs.Func("allowed-host", "NAME|DNS name (optionally name:port) the admin API may be reached by when it has no admin token; repeat for several (IP addresses and localhost always work; default: server.allowed_hosts in the config file)", func(v string) error {
+		if strings.TrimSpace(v) == "" {
+			return fmt.Errorf("must not be empty")
+		}
+		f.allowedHosts = append(f.allowedHosts, strings.TrimSpace(v))
+		return nil
+	})
 	fs.StringVar(&f.logLevel, "log-level", "info", "LEVEL|debug, info, warn or error")
 	fs.StringVar(&f.logFormat, "log-format", "text", "FORMAT|text or json")
 	if code, ok := parseFlags(fs, args, s); !ok {
@@ -65,6 +73,9 @@ func runServe(ctx context.Context, args []string, s streams) int {
 		pick("data", &f.data, sv.Data)
 		pick("log-level", &f.logLevel, sv.LogLevel)
 		pick("log-format", &f.logFormat, sv.LogFormat)
+		if !set["allowed-host"] {
+			f.allowedHosts = sv.AllowedHosts
+		}
 		if !set["admin-token"] {
 			if env := os.Getenv("MIRAGE_ADMIN_TOKEN"); env != "" {
 				f.token = env
@@ -109,12 +120,13 @@ func runServe(ctx context.Context, args []string, s streams) int {
 	}()
 
 	a, err := app.New(sigCtx, app.Options{
-		Admin:      f.admin,
-		Data:       f.data,
-		ConfigPath: f.configPath,
-		Config:     cfg,
-		AdminToken: f.token,
-		Logger:     log,
+		Admin:        f.admin,
+		Data:         f.data,
+		ConfigPath:   f.configPath,
+		Config:       cfg,
+		AdminToken:   f.token,
+		AllowedHosts: f.allowedHosts,
+		Logger:       log,
 	})
 	if err != nil {
 		fmt.Fprintf(s.err, "mirage serve: %v\n", err)

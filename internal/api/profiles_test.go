@@ -409,8 +409,9 @@ func TestAnonymizePreview(t *testing.T) {
 		}{
 			{"neither exchange nor id", map[string]any{}, 400},
 			{"both", map[string]any{"exchange_id": exID, "exchange": sample}, 400},
-			{"unknown exchange", map[string]any{"exchange_id": 987654}, 404},
-			{"unknown profile", map[string]any{"profile_id": "nope", "exchange_id": exID}, 404},
+			// References inside the request are 400s, like everywhere else.
+			{"unknown exchange", map[string]any{"exchange_id": 987654}, 400},
+			{"unknown profile", map[string]any{"profile_id": "nope", "exchange_id": exID}, 400},
 			{"bad base64", map[string]any{"exchange": badB64}, 400},
 			{"invalid inline profile", map[string]any{"profile": map[string]any{"name": "x", "rules": []map[string]any{{"name": "bad", "enabled": true, "target": "json", "selector": "$.[[", "strategy": "hash"}}}, "exchange_id": exID}, 400},
 			{"unknown field", map[string]any{"exchange_id": exID, "bogus": true}, 400},

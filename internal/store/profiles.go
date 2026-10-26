@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/justinburger/mirage/internal/model"
@@ -32,10 +33,81 @@ func scanProfile(sc scanner) (model.AnonymizationProfile, error) {
 	return p, nil
 }
 
+// defaultProfileRevKey is the settings key holding the model.DefaultProfileRev
+// the stored built-in profile was last brought up to.
+const defaultProfileRevKey = "default_profile_rev"
+
 // seedDefaultProfile inserts the built-in profile, with a fresh secret, unless
-// a profile with that ID already exists. It is safe to race with another
-// process opening the same database.
+// a profile with that ID already exists, and then upgrades a profile written
+// by an older release (see upgradeDefaultProfile). It is safe to race with
+// another process opening the same database.
 func (s *SQLite) seedDefaultProfile(ctx context.Context) error {
+	if err := s.insertDefaultProfile(ctx); err != nil {
+		return err
+	}
+	return s.upgradeDefaultProfile(ctx)
+}
+
+// upgradeDefaultProfile adds the rules and redacted headers that this release
+// built into the default profile to a database created by an older one. The
+// seed never overwrites an existing profile, so without this a database would
+// keep the rules of the release that created it for ever and stay exposed to
+// everything later releases learned to catch. Only what is missing is added
+// (rules by ID, headers ignoring case): rules the user edited, switched off
+// or added are kept, and the profile's secret and name are not touched. The
+// revision reached is recorded, so a rule the user deletes afterwards stays
+// deleted; a database already at (or beyond) this release's revision is left
+// alone.
+func (s *SQLite) upgradeDefaultProfile(ctx context.Context) error {
+	return s.write(ctx, func(tx *sql.Tx) error {
+		rev := 1 // databases from before the revision was recorded
+		var v string
+		switch err := tx.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = ?`, defaultProfileRevKey).Scan(&v); {
+		case err == nil:
+			if n, perr := strconv.Atoi(strings.TrimSpace(v)); perr == nil {
+				rev = n
+			}
+		case errors.Is(err, sql.ErrNoRows):
+		default:
+			return fmt.Errorf("store: read %s: %w", defaultProfileRevKey, err)
+		}
+		if rev >= model.DefaultProfileRev {
+			return nil
+		}
+		var data []byte
+		switch err := tx.QueryRowContext(ctx, `SELECT data FROM profiles WHERE id = ?`, model.DefaultProfileID).Scan(&data); {
+		case errors.Is(err, sql.ErrNoRows):
+			// Not there (the seed lost a race with a delete): nothing to upgrade.
+			return nil
+		case err != nil:
+			return fmt.Errorf("store: read default profile: %w", err)
+		}
+		var p model.AnonymizationProfile
+		if err := json.Unmarshal(data, &p); err != nil {
+			return fmt.Errorf("store: decode default profile: %w", err)
+		}
+		up, changed := model.UpgradeDefaultProfile(p, rev)
+		if changed {
+			enc, err := json.Marshal(up.WithDefaults())
+			if err != nil {
+				return fmt.Errorf("store: encode default profile: %w", err)
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE profiles SET data = ?, updated_at = ? WHERE id = ?`,
+				string(enc), nanos(s.nowUTC()), model.DefaultProfileID); err != nil {
+				return fmt.Errorf("store: upgrade default profile: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+			defaultProfileRevKey, strconv.Itoa(model.DefaultProfileRev), nanos(s.nowUTC())); err != nil {
+			return fmt.Errorf("store: record %s: %w", defaultProfileRevKey, err)
+		}
+		return nil
+	})
+}
+
+func (s *SQLite) insertDefaultProfile(ctx context.Context) error {
 	p := model.DefaultAnonymizationProfile().WithDefaults()
 	now := nanos(s.nowUTC())
 	data, err := json.Marshal(p)

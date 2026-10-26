@@ -411,7 +411,7 @@ func TestLearnable(t *testing.T) {
 		{"HEAD 200", mk("HEAD", 200, nil), true},
 		{"OPTIONS 204", mk("OPTIONS", 204, nil), true},
 		{"GET 404", mk("GET", 404, nil), true},
-		{"GET 429", mk("GET", 429, nil), true},
+		{"GET 429", mk("GET", 429, nil), false}, // throttling is transient, not a property of the URL
 		{"GET 499", mk("GET", 499, nil), true},
 		{"GET 500", mk("GET", 500, nil), false},
 		{"GET 503", mk("GET", 503, nil), false},

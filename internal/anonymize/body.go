@@ -38,9 +38,13 @@ func subtype(mt string) string {
 	return sub
 }
 
+// isJSONType reports whether the media type is JSON in any of its spellings:
+// json, x-json, +json suffixes (problem+json, vnd.api+json), vendor types
+// (vnd.acme.customer.v2.json) and RPC flavours (x-amz-json-1.1). Check
+// isNDJSONType first: "x-ndjson" contains "json" too. A body that does not
+// parse as JSON is processed as text anyway, so a loose match costs nothing.
 func isJSONType(mt string) bool {
-	sub := subtype(mt)
-	return sub == "json" || sub == "x-json" || strings.HasSuffix(sub, "+json")
+	return strings.Contains(subtype(mt), "json")
 }
 
 func isNDJSONType(mt string) bool {
@@ -80,7 +84,30 @@ func isBinaryType(mt string) bool {
 		"cbor", "avro", "x-thrift", "wasm", "x-www-form-urlencoded-binary":
 		return true
 	}
-	return strings.HasPrefix(sub, "grpc") || strings.HasPrefix(sub, "vnd.")
+	return strings.HasPrefix(sub, "grpc") || isBinaryVendorType(sub)
+}
+
+// binaryVendorPrefixes are vendor (vnd.*) subtypes known to be binary
+// formats. Any other vnd.* type is left to the byte sniffing: most are JSON or
+// XML under another name, and treating them all as binary stored their
+// credentials and PII in clear.
+var binaryVendorPrefixes = []string{
+	"vnd.openxmlformats", "vnd.ms-", "vnd.oasis.opendocument", "vnd.android.", "vnd.apple.",
+	"vnd.google-earth.kmz", "vnd.rar", "vnd.sqlite", "vnd.mapbox-vector-tile", "vnd.msgpack",
+	"vnd.google.protobuf", "vnd.tcpdump", "vnd.lotus", "vnd.rn-", "vnd.visio", "vnd.debian",
+	"vnd.adobe.", "vnd.sun.", "vnd.wap.wbxml", "vnd.3gpp", "vnd.amazon.ebook",
+}
+
+func isBinaryVendorType(sub string) bool {
+	if !strings.HasPrefix(sub, "vnd.") || strings.HasSuffix(sub, "+xml") || strings.HasSuffix(sub, "+yaml") {
+		return false
+	}
+	for _, p := range binaryVendorPrefixes {
+		if strings.HasPrefix(sub, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // trimPartialRune cuts an incomplete UTF-8 sequence off the end of p.
@@ -124,23 +151,63 @@ func looksJSON(b []byte) bool {
 	return false
 }
 
+// looksJSONDocument is the stricter test for a body whose declared type says
+// otherwise (curl -d sends JSON as application/x-www-form-urlencoded): it
+// opens with { or [ and, unless the capture was cut, ends with the matching
+// closer. A real urlencoded body never does.
+func looksJSONDocument(b []byte, truncated bool) bool {
+	if !looksJSON(b) {
+		return false
+	}
+	if truncated {
+		return bytes.IndexByte(b, '"') >= 0
+	}
+	first, last := byte(0), byte(0)
+	for _, c := range b {
+		if c != ' ' && c != '\t' && c != '\r' && c != '\n' {
+			first = c
+			break
+		}
+	}
+	for i := len(b) - 1; i >= 0; i-- {
+		if c := b[i]; c != ' ' && c != '\t' && c != '\r' && c != '\n' {
+			last = c
+			break
+		}
+	}
+	return first == '{' && last == '}' || first == '[' && last == ']'
+}
+
 // classifyBody decides how a body is processed from its Content-Type and, when
 // the type does not decide, from its bytes.
 func classifyBody(ct string, b []byte, truncated bool) bodyKind {
 	return classifyMedia(mediaType(ct), b, truncated)
 }
 
-// classifyMedia is classifyBody for an already parsed media type.
+// classifyMedia is classifyBody for an already parsed media type. The declared
+// type is trusted when it names a format and is checked against the bytes
+// when it can be wrong: JSON is routinely sent as text/plain, as
+// application/octet-stream, under a vendor type or, with curl -d, as a form,
+// and the credential rules must reach it all the same. A body that is not
+// JSON after all falls back to text processing.
 func classifyMedia(mt string, b []byte, truncated bool) bodyKind {
 	switch {
-	case isJSONType(mt):
-		return kindJSON
 	case isNDJSONType(mt):
 		return kindNDJSON
+	case isJSONType(mt):
+		return kindJSON
 	case mt == "application/x-www-form-urlencoded":
+		if looksJSONDocument(b, truncated) {
+			return kindJSON
+		}
 		return kindForm
 	case isBinaryType(mt):
 		return kindBinary
+	case strings.HasPrefix(mt, "text/"):
+		if looksJSON(b) {
+			return kindJSON
+		}
+		return kindText
 	case isTextType(mt):
 		return kindText
 	}
@@ -148,7 +215,7 @@ func classifyMedia(mt string, b []byte, truncated bool) bodyKind {
 	if looksBinary(b, truncated) {
 		return kindBinary
 	}
-	if mt == "" && looksJSON(b) {
+	if looksJSON(b) {
 		return kindJSON
 	}
 	return kindText

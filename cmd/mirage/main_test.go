@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/justinburger/mirage/internal/model"
 )
@@ -223,6 +224,72 @@ func TestReplayWithoutGatesIgnoresErrors(t *testing.T) {
 	failing, _ := target(t, true)
 	if code, _, stderr := runCLI(t, "replay", "--har", tinyHAR, "--target", failing.URL, "--speed", "1000", "--quiet"); code != exitOK {
 		t.Errorf("without thresholds a replay against a failing target is still a completed run: exit %d, %s", code, stderr)
+	}
+}
+
+// A run in which no request got any response (dead host, wrong port) is not a
+// success, whether or not thresholds were given: a CI job must not go green.
+func TestReplayExitsNonZeroWhenNoRequestGetsAResponse(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close() // the port is now free, so every connect is refused
+
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"no thresholds", nil},
+		{"with a threshold", []string{"--max-p99", "10s"}},
+		{"in rate mode", []string{"--stage", "200ms:50:hold", "--max-requests", "5"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := append([]string{"replay", "--har", tinyHAR, "--target", deadURL, "--speed", "1000", "--quiet"}, tc.args...)
+			code, stdout, stderr := runCLI(t, args...)
+			if code != exitFail {
+				t.Fatalf("exit %d, want %d\nstdout: %s\nstderr: %s", code, exitFail, stdout, stderr)
+			}
+			if !strings.Contains(stderr, "every request failed") {
+				t.Errorf("stderr should say why the run failed:\n%s", stderr)
+			}
+			if !strings.Contains(stdout, "completed 0") {
+				t.Errorf("the summary should still be printed:\n%s", stdout)
+			}
+		})
+	}
+}
+
+// The p99 gate must not pass a run that measured no latency at all: a 0 ms p99
+// from a dead target is "nothing measured", not "fast".
+func TestEvaluateThresholdsFailsP99WhenNothingWasMeasured(t *testing.T) {
+	var out strings.Builder
+	sum := model.ReplaySummary{Sent: 40, Completed: 0, Failed: 40}
+	failures := evaluateThresholds(&out, sum, false, 0, time.Second, false)
+	if len(failures) != 1 || !strings.Contains(failures[0], "not measured") {
+		t.Fatalf("failures = %v\n%s", failures, out.String())
+	}
+	if !strings.Contains(out.String(), "FAIL") || strings.Contains(out.String(), "PASS") {
+		t.Errorf("the table should show FAIL only:\n%s", out.String())
+	}
+
+	// A normal run still passes and fails on the number.
+	out.Reset()
+	ok := model.ReplaySummary{Sent: 40, Completed: 40}
+	ok.Latency = model.LatencySummary{Count: 40, P99: 5}
+	if f := evaluateThresholds(&out, ok, false, 0, time.Second, false); len(f) != 0 {
+		t.Errorf("fast run failed: %v", f)
+	}
+	if f := evaluateThresholds(&out, ok, false, 0, time.Millisecond, false); len(f) != 1 || !strings.Contains(f[0], "exceeds") {
+		t.Errorf("slow run: %v", f)
+	}
+}
+
+// Responses with error statuses are still responses: without thresholds the
+// run is a completed measurement (see TestReplayWithoutGatesIgnoresErrors).
+func TestReplayWithSomeResponsesIsNotFailedByTheDeadRequestRule(t *testing.T) {
+	failing, _ := target(t, true)
+	if code, _, stderr := runCLI(t, "replay", "--har", tinyHAR, "--target", failing.URL, "--speed", "1000", "--quiet"); code != exitOK || strings.Contains(stderr, "every request failed") {
+		t.Errorf("exit %d, stderr %q", code, stderr)
 	}
 }
 

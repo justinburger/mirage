@@ -194,7 +194,8 @@ func TestManagerLifecycleStartGetStop(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err := e.m.Get(ctx, job.ID)
-	if err != nil || got.Status != model.ReplayRunning || got.StartedAt == nil || got.EndedAt != nil || got.Summary == nil || got.Series != nil {
+	// Get carries the live series (empty this early); the listings do not.
+	if err != nil || got.Status != model.ReplayRunning || got.StartedAt == nil || got.EndedAt != nil || got.Summary == nil {
 		t.Fatalf("running job: %+v %v", got, err)
 	}
 	// Starting a running job is a conflict.

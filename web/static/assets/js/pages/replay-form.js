@@ -9,6 +9,11 @@ import { card, btn, field, formSection, formGrid, textCtl, numCtl, durCtl, selec
 import { fmtInt, fmtHuman, fmtPct, toGoDuration, DASH, fmtRate } from '../format.js';
 import { durText, stamp } from '../service-form.js';
 
+// The API returns the values of sensitive set_headers (Authorization, Cookie,
+// ...) as this placeholder on every read. A form filled from an existing job
+// must never send it back: it would be stored as the real header value.
+const MASKED_VALUE = '***';
+
 const MODE_TEXT = {
   timeline: 'Reproduces the recorded inter-arrival times, compressed by the speed factor. Speed 10 replays the recorded traffic shape ten times faster, with the same bursts and quiet periods.',
   rate: 'Sends at an arrival rate you choose, cycling through the recording in order. Open model: new requests keep arriving even when the target is slow, which is what exposes queueing. Use stages to ramp up.',
@@ -25,6 +30,7 @@ export async function create(ctx) {
     try { const j = await api.replay(fromId); base = j.config; baseName = `${j.name} (edited)`; } catch (_) { /* ignore */ }
   }
   const cfg = base || {};
+  const hasMaskedSecrets = Object.values(cfg.set_headers || {}).some((v) => v === MASKED_VALUE);
 
   const root = h('div', { class: 'stack' });
   root.appendChild(pageHeader({ subtitle: 'Replay recorded traffic against a target at a multiple of its original rate, error mix or concurrency.' }));
@@ -55,7 +61,7 @@ export async function create(ctx) {
   const timeout = durCtl({ value: durText(cfg.timeout) || '30s', placeholder: '30s' });
   const include = linesCtl({ value: cfg.include || [], rows: 2, placeholder: '^GET /users\n/checkout', validate: regexCheck });
   const exclude = linesCtl({ value: cfg.exclude || [], rows: 2, placeholder: '^DELETE\n/admin/', validate: regexCheck });
-  const setHeaders = kvCtl({ value: cfg.set_headers || {}, keyPlaceholder: 'Authorization', valuePlaceholder: 'Bearer staging-token', addLabel: 'Add header' });
+  const setHeaders = kvCtl({ value: cfg.set_headers || {}, keyPlaceholder: 'Authorization', valuePlaceholder: 'Bearer staging-token', addLabel: 'Add header', masked: MASKED_VALUE });
   const removeHeaders = chipsCtl({ value: cfg.remove_headers || [], placeholder: 'e.g. Cookie' });
   const hostHeader = textCtl({ value: cfg.host_header || '', placeholder: 'default: the target host', mono: true });
   const skipVerify = switchCtl({ label: 'Skip TLS verification', help: 'Accept any certificate presented by the target.', checked: !!cfg.insecure_skip_verify });
@@ -108,7 +114,7 @@ export async function create(ctx) {
     timeout: field('Request timeout', timeout, { help: 'Per request. Slow responses past this count as timeouts.' }),
     include: field('Only include requests matching', include, { help: 'RE2 regex per line, matched against "METHOD /path?query". Empty includes everything.' }),
     exclude: field('Exclude requests matching', exclude, { help: 'Same syntax. Excludes win over includes.' }),
-    set_headers: field('Set headers on every request', setHeaders, { help: 'Typically credentials that are valid for the target environment.' }),
+    set_headers: field('Set headers on every request', setHeaders, { help: hasMaskedSecrets ? 'Typically credentials that are valid for the target environment. To reuse the stored secrets unchanged, use Clone on the replay page instead of Edit as new.' : 'Typically credentials that are valid for the target environment.' }),
     remove_headers: field('Remove headers', removeHeaders, { help: 'Deleted from every request before sending, e.g. recorded Cookie headers.' }),
     host_header: field('Host header override', hostHeader, { help: 'Useful when the target is reached through a load balancer or IP address.' }),
     profile_id: field('Anonymize on the fly', profile, { help: 'Apply a profile to every request before sending. Needed when replaying a raw recording against shared environments.' }),
@@ -126,7 +132,7 @@ export async function create(ctx) {
   const shape = formSection('Load shape', null, mode.el, modeText, timelineBlock, rateBlock, maxBlock);
   const advanced = collapsible('Advanced', h('div', { class: 'stack' },
     formGrid(F.include, F.exclude), F.set_headers, formGrid(F.remove_headers, F.host_header), skipVerify.el,
-    formGrid(F.profile_id), vary.el, compare.el, formGrid(F.seed)), { hint: 'filters, headers, anonymization, seed' });
+    formGrid(F.profile_id), vary.el, compare.el, formGrid(F.seed)), { open: hasMaskedSecrets, hint: 'filters, headers, anonymization, seed' });
   const errHost = h('div');
   const multiplyGrid = formGrid(F.amplify, F.error_amplification);
   const multiplySection = formSection('Multiply the traffic', 'Independent knobs on top of the load shape.', multiplyGrid);
@@ -282,6 +288,8 @@ export async function create(ctx) {
     if (include.get().length) config.include = include.get();
     if (exclude.get().length) config.exclude = exclude.get();
     const sh = setHeaders.get();
+    const shProblems = setHeaders.problems();
+    if (shProblems.length) bail('set_headers', shProblems.join(' '));
     if (Object.keys(sh).length) config.set_headers = sh;
     if (removeHeaders.get().length) config.remove_headers = removeHeaders.get();
     if (hostHeader.get().trim()) config.host_header = hostHeader.get().trim();

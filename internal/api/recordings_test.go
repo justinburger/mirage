@@ -371,7 +371,13 @@ func TestAnonymizeRecording(t *testing.T) {
 	})
 	t.Run("errors", func(t *testing.T) {
 		before, _ := e.st.ListRecordings(context.Background())
-		e.errorOf("POST", "/api/v1/recordings/"+src.ID+"/anonymize", map[string]any{"profile_id": "prof_nope"}, http.StatusNotFound)
+		// The profile is a reference inside the request: 400, not a 404 that
+		// reads as "no such endpoint". The recording of the URL is a 404.
+		eb := e.errorOf("POST", "/api/v1/recordings/"+src.ID+"/anonymize", map[string]any{"profile_id": "prof_nope"}, http.StatusBadRequest)
+		if len(eb.Problems) != 1 || eb.Problems[0] != `profile_id "prof_nope" does not exist` {
+			t.Errorf("problems = %q", eb.Problems)
+		}
+		e.errorOf("POST", "/api/v1/recordings/rec_nope/anonymize", map[string]any{"profile_id": "prof_nope"}, http.StatusNotFound)
 		e.errorOf("POST", "/api/v1/recordings/"+src.ID+"/anonymize", map[string]any{"bogus": 1}, http.StatusBadRequest)
 		e.errorOf("POST", "/api/v1/recordings/"+src.ID+"/anonymize", map[string]any{"name": strings.Repeat("n", 300)}, http.StatusBadRequest)
 		after, _ := e.st.ListRecordings(context.Background())
@@ -436,7 +442,7 @@ func TestExportHAR(t *testing.T) {
 	})
 	t.Run("unknown profile fails cleanly, without a download header", func(t *testing.T) {
 		resp, body := e.do("GET", "/api/v1/recordings/"+rec.ID+"/export.har?profile_id=prof_nope", nil)
-		if resp.StatusCode != http.StatusNotFound {
+		if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), `profile_id \"prof_nope\" does not exist`) {
 			t.Fatalf("status %d: %s", resp.StatusCode, body)
 		}
 		if cd := resp.Header.Get("Content-Disposition"); cd != "" {
@@ -534,9 +540,9 @@ func TestImportRecordingRawBody(t *testing.T) {
 	})
 	t.Run("unknown profile", func(t *testing.T) {
 		before, _ := e.st.ListRecordings(context.Background())
-		resp, _ := e.send(request{method: "POST", path: "/api/v1/recordings/import?profile_id=prof_nope", body: doc})
-		if resp.StatusCode != http.StatusNotFound {
-			t.Errorf("status %d, want 404", resp.StatusCode)
+		resp, raw := e.send(request{method: "POST", path: "/api/v1/recordings/import?profile_id=prof_nope", body: doc})
+		if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(raw), `profile_id \"prof_nope\" does not exist`) {
+			t.Errorf("status %d, want 400: %s", resp.StatusCode, raw)
 		}
 		after, _ := e.st.ListRecordings(context.Background())
 		if len(after) != len(before) {
@@ -625,21 +631,45 @@ func TestImportRecordingErrors(t *testing.T) {
 		name   string
 		body   any
 		status int
+		// wantError and wantProblem are substrings; both empty means "any".
+		wantError   string
+		wantProblem string
 	}{
-		{"empty body", "", 400},
-		{"not JSON", "this is not json", 400},
-		{"JSON that is not HAR", `{"hello":"world"}`, 400},
-		{"truncated HAR", doc[:len(doc)/2], 400},
-		{"entry with an unusable URL", `{"log":{"entries":[{"request":{"method":"GET","url":"nonsense"},"response":{"status":200}}]}}`, 400},
+		{"empty body", "", 400, "request body is empty", ""},
+		{"white space only", " \n ", 400, "invalid HAR", "input is empty"},
+		{"not JSON", "this is not json", 400, "invalid HAR", "malformed JSON at byte"},
+		{"hello", "hello", 400, "invalid HAR", "malformed JSON at byte"},
+		{"JSON that is not HAR", `{"hello":"world"}`, 400, "invalid HAR", `no "log" object`},
+		{"truncated HAR", doc[:len(doc)/2], 400, "invalid HAR", "end of input"},
+		{"entry with an unusable URL", `{"log":{"entries":[{"request":{"method":"GET","url":"nonsense"},"response":{"status":200}}]}}`, 400, "invalid HAR", "entry 0"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			eb := e.errorOf("POST", "/api/v1/recordings/import", tc.body, tc.status)
-			if strings.Contains(eb.Error, "ops:") {
-				t.Errorf("package prefix leaked: %q", eb.Error)
+			if !strings.Contains(eb.Error, tc.wantError) {
+				t.Errorf("error = %q, want it to mention %q", eb.Error, tc.wantError)
+			}
+			if tc.wantProblem != "" && (len(eb.Problems) != 1 || !strings.Contains(eb.Problems[0], tc.wantProblem)) {
+				t.Errorf("problems = %q, want one mentioning %q", eb.Problems, tc.wantProblem)
+			}
+			// Details go in problems, as for every validation error; none of the
+			// internal wrapping reaches the client.
+			all := eb.Error + " " + strings.Join(eb.Problems, " ")
+			for _, internal := range []string{"ops:", "import HAR", "validation failed", "har:", "unexpected EOF"} {
+				if strings.Contains(all, internal) {
+					t.Errorf("%q leaks %q", all, internal)
+				}
 			}
 		})
 	}
+	// The same input in a multipart upload.
+	t.Run("empty upload", func(t *testing.T) {
+		body, ctype := multipartBody(t, nil, "empty.har", []byte{})
+		resp, raw := e.send(request{method: "POST", path: "/api/v1/recordings/import", body: body, header: map[string]string{"Content-Type": ctype}})
+		if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(raw), "uploaded file is empty") {
+			t.Errorf("status %d: %s", resp.StatusCode, raw)
+		}
+	})
 	after, _ := e.st.ListRecordings(context.Background())
 	if len(after) != len(before) {
 		t.Errorf("failed imports left %d recordings", len(after)-len(before))

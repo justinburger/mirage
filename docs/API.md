@@ -11,9 +11,37 @@ Timestamps are RFC 3339. Series timestamps (`t`) are Unix milliseconds.
 
 ## Conventions
 
-- Errors: `{"error": "message", "problems": ["field x ..."]}` with 400
-  (validation or malformed JSON), 401 (auth), 404, 409 (conflict, e.g. a
-  duplicate service name or listen address), 500.
+- Errors: `{"error": "message", "problems": ["field x ..."]}` with:
+  - 400: validation, malformed JSON, or a malformed query parameter;
+  - 401: authentication;
+  - 403: the browser protection refused the request: the `Host` is a DNS name
+    other than `localhost` or `*.localhost` (IP addresses always work) that is
+    not listed with `--allowed-host` (or `server.allowed_hosts`), on a
+    server without an admin token, or a state-changing request carries another
+    origin (`Origin` that is not the server's own host, or `Sec-Fetch-Site:
+    cross-site`). `curl` and scripts send neither and are not affected;
+  - 404: an unknown object, or an unknown path under `/api/v1`;
+  - 405: a known path with the wrong method (the `Allow` header lists the
+    methods that path accepts);
+  - 409: a conflict, for example a duplicate service name or listen address,
+    starting a replay that is already running, or deleting something in use;
+  - 413: a JSON request body over 10 MiB, or a HAR upload over 1 GiB;
+  - 415: a POST, PUT, PATCH or DELETE whose body is not declared as JSON. Send
+    `Content-Type: application/json` (`+json` types work too) with every
+    request body; the HAR import also takes `multipart/form-data`. Requests
+    without a body need no content type;
+  - 500: anything unexpected (the detail is in the server log, not the body);
+  - 503: the service or replay controller is not available (a server started
+    without one);
+  - 504: the operation timed out.
+- Optional fields are omitted from responses when they are empty or zero (Go
+  `omitempty`), so the full objects shown below list every field but a real
+  response can leave some out. Read an absent field as its zero value (`""`,
+  `0`, `false`, no list, `null`). Examples: a service without a recording has
+  no `recording_id`, a replay that has not ended has no `ended_at`, a
+  `latency` fault has no `status`, and `ServiceStatus.error` appears only
+  when there is one. Required fields such as `id`, `name`, `mode`, `status` and
+  `created_at` are always present.
 - Unknown JSON fields in request bodies are rejected (400), except read-only
   echo fields, which are accepted and ignored so a fetched object can be PUT
   back: `status`, `fired`, `has_secret`, `created_at`, `updated_at`. The id
@@ -54,6 +82,13 @@ Timestamps are RFC 3339. Series timestamps (`t`) are Unix milliseconds.
 | GET | `/api/v1/services/{id}/stats` | | `StatsSnapshot` |
 | GET | `/api/v1/services/{id}/series?since=<unix ms>` | | `[SeriesPoint]` (default: last 15 min) |
 
+Every mode except `passthrough` (`record`, `hybrid`, `virtualize`) needs a
+recording: saving a service in one of them without `recording_id` is a 400
+(`mode record needs a recording_id`). The `mode` endpoint keeps the service's
+current recording unless it is given `recording_id` or `new_recording_name`
+(which creates an empty recording and points the service at it); the two are
+mutually exclusive, and it is a 400 when the service would still have none.
+
 `Service`:
 
 ```json
@@ -87,10 +122,29 @@ Timestamps are RFC 3339. Series timestamps (`t`) are Unix milliseconds.
 `ServiceStatus`:
 
 ```json
-{"service_id":"svc_...","running":true,"addr":"[::]:9001","mode":"record","error":"",
+{"service_id":"svc_...","running":true,"addr":"[::]:9001","mode":"record","error":"","warning":"",
  "started_at":"...","captured":1520,"capture_dropped":0,"capture_skipped":0,
  "virtual_hits":0,"virtual_misses":0,"virtual_injected":0,"indexed_exchanges":0}
 ```
+
+`error` says why a service is not running (it could not start, or its listener
+died) or reports a failure found while serving, such as a capture write that
+failed. `warning` is a note about something that leaves the service working;
+today that is `capture limit reached` (the recording holds
+`max_capture_bytes` of bodies: traffic keeps flowing, only capturing stopped).
+It appears only on a running service. Both are omitted when empty and cleared
+the next time the service is applied, for example by raising the limit.
+`mode` is the mode of the running listener, or the saved service's mode when
+nothing is running. `virtual_injected` counts injected errors only, the
+responses that carry `X-Mirage-Injected`.
+
+**Saving a service that cannot start is not an HTTP error.** Create, update,
+`enable` and `mode` persist the service and then apply it to the listener. If
+the listener cannot start (a port taken by another process, say) the service
+is still saved and the response is still 2xx (200, or 201 on create), with
+`status.running: false` and the reason in `status.error`. Always read `status`
+after these calls, not just the HTTP status. Only a clash with another Mirage
+service (name or listen address) is a 409.
 
 ## Recordings and exchanges
 
@@ -107,6 +161,31 @@ Timestamps are RFC 3339. Series timestamps (`t`) are Unix milliseconds.
 | POST | `/api/v1/recordings/{id}/anonymize` | `{"profile_id":"default","name":"payments (anon)"}` | 201 `Recording` (the new copy) |
 | GET | `/api/v1/recordings/{id}/export.har` | `profile_id` (optional: anonymize on export) | HAR download (`Content-Disposition: attachment`) |
 | POST | `/api/v1/recordings/import` | raw HAR JSON body, or `multipart/form-data` with field `file`; query `name`, `profile_id` (optional) | 201 `Recording` |
+
+In a multipart upload `name` and `profile_id` may also be form fields, but the
+upload is streamed, so they are read only when they come **before** the `file`
+part; a field after it is ignored. The query parameters win over form fields.
+Without a name the file's name (without `.har`/`.json`) is used.
+
+Query parameters of the exchange list (all optional, combined with AND):
+
+| Parameter | Format |
+|---|---|
+| `method` | HTTP method, case-insensitive (`GET`) |
+| `status` | exact status code, 1 to 599 (`503`); 0 or absent means any |
+| `status_class` | an integer from 1 to 5, the hundreds digit: `5` means 500 to 599. The form `5xx` is rejected with 400 |
+| `path` | case-sensitive substring of the path plus `?query` (`/users/4`, `expand=orders`), not a pattern |
+| `endpoint` | exact endpoint template (`GET /users/{id}`) |
+| `errors` | `1` or `true` for error exchanges only: status 5xx or 429, no response at all (status 0), or a recorded transport error |
+| `offset` | rows to skip, default 0 |
+| `limit` | page size, default 100 (also for 0 or absent), silently capped at 1000: a larger value returns 1000 rows, not an error |
+| `desc` | `1` or `true` for newest first (default: oldest first, by `seq`) |
+
+A value that is not an integer, or is out of range, is a 400 that names the
+parameter.
+
+`total` is the number of exchanges matching the filters, not the page size, so
+page with `offset` until it reaches `total`.
 
 `Recording`:
 
@@ -189,6 +268,11 @@ name | phone | uuid | digits | ipv4 | credit_card | string`. `scope`:
 them with deterministic filler of the same length. Regenerating a secret
 makes new captures produce different tokens than existing recordings.
 
+`secret` is write-only: no response contains it, `has_secret` says whether one
+is stored. Leave it out when creating and the server generates one; on `PUT` an
+empty `secret` keeps the stored one and `"regenerate_secret": true` (`PUT`
+only) replaces it.
+
 `AnonChange` = `{"location":"response.body $.user.email","source":"detector:email","before":"jane@acme.io","after":"mason.reed42@example.com"}`.
 
 ## Fault injection
@@ -221,12 +305,18 @@ makes new captures produce different tokens than existing recordings.
 |---|---|---|---|
 | GET | `/api/v1/replays` | | `[ReplayJob]` newest first, no `series` |
 | POST | `/api/v1/replays` | `{"name":"10x checkout","config":ReplayConfig,"start":true}` | 201 `ReplayJob` |
-| GET | `/api/v1/replays/{id}` | | `ReplayJob` with `series` |
+| GET | `/api/v1/replays/{id}` | | `ReplayJob` with `series` (also while it runs: the live series so far) |
 | POST | `/api/v1/replays/{id}/start` | | `ReplayJob` (re-runs a finished job) |
 | POST | `/api/v1/replays/{id}/stop` | | `ReplayJob` |
 | POST | `/api/v1/replays/{id}/clone` | `{"name"?}` | 201 new pending `ReplayJob` with the same config |
 | DELETE | `/api/v1/replays/{id}` | | 204 |
 | GET | `/api/v1/replays/{id}/series?since=<unix ms>` | | `[SeriesPoint]` (live while running) |
+
+`start` runs a pending job, or runs a finished one again and replaces its
+results; on a job that is running it answers 409. `stop` is idempotent: it
+returns the job with 200 whether it was running (it waits for the result to be
+saved, with a summary of what was sent), or was pending, stopped or completed
+already.
 
 `ReplayConfig`:
 
@@ -246,9 +336,14 @@ makes new captures produce different tokens than existing recordings.
 `hold` is true, which steps straight to its rate), `max` (closed loop at
 `concurrency` workers). `amplify` > 1 is only valid in timeline mode (in
 rate mode raise the rate). `concurrency` defaults to 2048 (timeline, rate)
-or 64 (max). `seed` 0 means the server picks one and stores it, so re-runs
-and clones replay the same schedule. Values of sensitive `set_headers`
-(Authorization, Cookie, X-Api-Key, …) are returned masked as `"***"`.
+or 64 (max). `seed` 0 means the server picks one (an integer from 1 to
+2^53-1, so JavaScript clients round-trip it) and stores it, so re-runs and
+clones replay the same schedule. Values of credential-like `set_headers`
+(`Authorization`, `Cookie`, `X-Api-Key`, and any name containing `token`,
+`secret`, `password`, `session`, `signature`, ending in `-key`, …; a fixed
+rule) are returned masked as `"***"`. Posting `"***"` as the value of such a
+header is a 400, so a fetched job cannot be sent back with the mask as its
+credential; send the real value, or clone the replay to reuse the stored one.
 
 `ReplayJob`:
 
@@ -271,10 +366,22 @@ and clones replay the same schedule. Values of sensitive `set_headers`
  "max_in_flight":412,"saturated":false,"endpoints":[EndpointSummary]}
 ```
 
-`saturated` means every concurrency slot was busy at least once, so lag and
-corrected latency include client-side queueing (raise `concurrency`).
+`saturated` applies to the open-loop modes (`timeline` and `rate`): every
+concurrency slot was busy at least once, so lag and corrected latency include
+client-side queueing (raise `concurrency`). It is always `false` in `max` mode,
+which is closed loop and keeps every slot busy by design.
 `corrected_latency` is measured from each request's intended send time and
 corrects coordinated omission.
+
+`latency` and `corrected_latency` also include requests that failed after a
+connection was made (a timeout counts as at least `timeout` long); requests
+that never reached the target (connection refused, DNS or certificate
+failure) are not measured, so a dead target has `latency.count` 0 rather than
+a fast p99. `achieved_rps` is measured over the time requests were being sent,
+not the drain of slow in-flight ones. `planned` is exact for a single pass and
+for looping timelines, an estimate with fractional `error_amplification` on a
+recording that has errors (such an estimate is raised to `sent` if the run
+overshoots it), and `-1` when unknown.
 
 `LatencySummary` (milliseconds) =
 `{"count","min","mean","p50","p90","p95","p99","p999","max"}`.

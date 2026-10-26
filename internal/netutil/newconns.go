@@ -20,23 +20,23 @@ import (
 // which is fine at shutdown: the listener is closed and the client retries
 // elsewhere.
 type NewConns struct {
-	mu    sync.Mutex
-	conns map[net.Conn]struct{}
+	// conns holds the connections still in StateNew. A sync.Map keeps the hook
+	// off any shared lock: net/http calls it twice per keep-alive request
+	// (Active, Idle), and only the first call of a connection finds an entry.
+	conns sync.Map // net.Conn -> struct{}
 }
 
 // Track installs a ConnState hook on srv (chaining one that is already set)
 // and returns the tracker. Call it before the server starts serving.
 func Track(srv *http.Server) *NewConns {
-	t := &NewConns{conns: make(map[net.Conn]struct{})}
+	t := &NewConns{}
 	prev := srv.ConnState
 	srv.ConnState = func(c net.Conn, s http.ConnState) {
-		t.mu.Lock()
 		if s == http.StateNew {
-			t.conns[c] = struct{}{}
+			t.conns.Store(c, struct{}{})
 		} else {
-			delete(t.conns, c)
+			t.conns.Delete(c)
 		}
-		t.mu.Unlock()
 		if prev != nil {
 			prev(c, s)
 		}
@@ -47,15 +47,13 @@ func Track(srv *http.Server) *NewConns {
 // CloseAll closes every connection that has not sent a request yet and
 // returns how many it closed.
 func (t *NewConns) CloseAll() int {
-	t.mu.Lock()
-	conns := make([]net.Conn, 0, len(t.conns))
-	for c := range t.conns {
-		conns = append(conns, c)
-	}
-	clear(t.conns)
-	t.mu.Unlock()
-	for _, c := range conns {
-		_ = c.Close()
-	}
-	return len(conns)
+	n := 0
+	t.conns.Range(func(k, _ any) bool {
+		if _, ok := t.conns.LoadAndDelete(k); ok { // lost the race to a state change: skip
+			_ = k.(net.Conn).Close()
+			n++
+		}
+		return true
+	})
+	return n
 }

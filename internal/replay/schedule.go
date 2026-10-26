@@ -3,6 +3,7 @@ package replay
 import (
 	"math"
 	"math/rand/v2"
+	"slices"
 	"time"
 
 	"github.com/justinburger/mirage/internal/model"
@@ -148,6 +149,13 @@ func (g *timelineGen) nextRound() {
 	g.pos = 0
 }
 
+// startPass positions the generator at the first group of pass p.
+func (g *timelineGen) startPass(p int64) {
+	g.pass = p
+	g.next0 = 0
+	g.shift = g.scaled(time.Duration(float64(g.period) * float64(p)))
+}
+
 // advance moves to the next group that is scheduled at least once.
 func (g *timelineGen) advance() bool {
 	for {
@@ -156,9 +164,7 @@ func (g *timelineGen) advance() bool {
 				g.k, g.total = 0, 0
 				return false
 			}
-			g.pass++
-			g.next0 = 0
-			g.shift = g.scaled(time.Duration(float64(g.period) * float64(g.pass)))
+			g.startPass(g.pass + 1)
 		}
 		gs := g.next0
 		off := g.items[gs].off
@@ -223,10 +229,42 @@ type timelinePlan struct {
 	targetRP float64
 }
 
+// loopPlanned counts the requests a looping timeline sends before limit, by
+// the generator's own arithmetic. Every pass before the last two is complete
+// (its last request is due a whole pass before limit), so those are counted
+// as perPass each and only the passes around limit are walked. It reports
+// false when the passes are not alike: with a fractional ErrorAmplification
+// over a recording that has errors, each pass draws its own copies, so only
+// the first pass is known.
+func loopPlanned(p *prepared, cfg model.ReplayConfig, perPass int64, limit time.Duration) (int64, bool) {
+	k := cfg.ErrorAmplification
+	if k != math.Floor(k) && slices.ContainsFunc(p.items, func(it item) bool { return it.isErr() }) {
+		return 0, false
+	}
+	g := newTimelineGen(p, cfg)
+	g.loop = false
+	period := g.scaled(p.period)
+	if period <= 0 {
+		return 0, false
+	}
+	full := max(int64(limit/period)-1, 0)
+	n := full * perPass
+	for pass := full; ; pass++ {
+		g.startPass(pass)
+		if g.shift >= limit {
+			return n, true
+		}
+		for g.advance() {
+			n += g.countBefore(limit)
+		}
+	}
+}
+
 // planTimeline walks the first pass the way the generator will (same seed, so
 // the same error-amplification draws) and counts the requests. Planned is
-// exact for a single pass cut by Duration/MaxRequests, an estimate from the
-// pass rate for loops, and MaxRequests for loops with no Duration.
+// exact for a single pass cut by Duration/MaxRequests, exact for a loop with a
+// Duration unless fractional error amplification makes the passes differ (then
+// an estimate from the pass rate), and MaxRequests for loops with no Duration.
 func planTimeline(p *prepared, cfg model.ReplayConfig) timelinePlan {
 	g := newTimelineGen(p, cfg)
 	g.loop = false
@@ -245,7 +283,11 @@ func planTimeline(p *prepared, cfg model.ReplayConfig) timelinePlan {
 	case !cfg.Loop:
 		plan.planned = cut
 	case cfg.Duration > 0:
-		plan.planned = int64(math.Round(plan.targetRP * limit.Seconds()))
+		if n, ok := loopPlanned(p, cfg, perPass, limit); ok {
+			plan.planned = n
+		} else {
+			plan.planned = int64(math.Round(plan.targetRP * limit.Seconds()))
+		}
 	case cfg.MaxRequests > 0:
 		plan.planned = cfg.MaxRequests
 	default:

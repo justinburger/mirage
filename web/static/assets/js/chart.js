@@ -60,6 +60,8 @@ export class TimeChart {
     this.empty = h('div', { class: 'chart-empty' }, this.o.emptyText || 'Waiting for data…');
     this.plot = h('div', { class: 'chart-plot', style: { height: this.o.height + 'px' } }, this.canvas, this.empty, this.tip);
     this.legendEl = h('div', { class: 'chart-legend' });
+    this.legendFixed = null; // see setLegendValues
+    this.legendNote = h('span', { class: 'chart-legend-note', hidden: true });
     this.titleEl = h('div', { class: 'chart-title' }, this.o.title || '', this.o.hint ? h('span', { class: 'chart-hint' }, this.o.hint) : null);
     this.head = h('div', { class: 'chart-head' }, this.titleEl, this.o.legend ? this.legendEl : null);
     this.el = h('div', { class: 'chart' }, this.head, this.plot);
@@ -135,10 +137,28 @@ export class TimeChart {
       return { btn, val, s, i };
     });
     for (const b of this.legendBtns) this.legendEl.appendChild(b.btn);
+    this.legendEl.appendChild(this.legendNote);
+  }
+
+  /**
+   * Pins what the legend reads while nothing is hovered to fixed text per
+   * series key, e.g. the figures of a whole finished run instead of its last
+   * (partial) second. `note` says what the figures are. null goes back to the
+   * latest row.
+   */
+  setLegendValues(texts, note) {
+    this.legendFixed = texts || null;
+    this.legendNote.textContent = texts && note ? note : '';
+    this.legendNote.hidden = !(texts && note);
+    this.updateLegendValues();
   }
 
   updateLegendValues(row) {
     if (!this.o.legend) return;
+    if (!row && this.legendFixed) {
+      for (const b of this.legendBtns) b.val.textContent = this.legendFixed[b.s.key] || '';
+      return;
+    }
     for (const b of this.legendBtns) {
       let r = row || this.rows[this.rows.length - 1];
       if (!row) {
@@ -346,6 +366,9 @@ export class TimeChart {
         }
       };
       for (let i = Math.max(0, lo - 1); i < hi; i++) {
+        // A row without a value for this series (a target that is not known
+        // yet, a run shorter than the other one) is a gap, not a zero.
+        if (rows[i][s.key] == null) { if (segStart >= 0) { flush(segStart, i - 1); segStart = -1; } continue; }
         if (segStart < 0) { segStart = i; continue; }
         if (rows[i].t - rows[i - 1].t > gap) { flush(segStart, i - 1); segStart = i; }
       }

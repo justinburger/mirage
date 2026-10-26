@@ -20,9 +20,14 @@
 //     form values, query values, header values (except redacted ones),
 //     cookie values, and plain text bodies (text/*, xml, unknown text).
 //
-// Bodies. JSON bodies (Content-Type */json or +json, or sniffed when the
-// type is missing) are rewritten preserving member order, number literals and
-// unknown structure exactly; output is compact JSON. NDJSON is handled line
+// Bodies. JSON bodies (any Content-Type whose subtype contains "json"; and,
+// because JSON is routinely sent under a wrong type, any text/*, unknown,
+// missing or application/x-www-form-urlencoded body that opens like a JSON
+// document) are rewritten preserving member order, number literals and
+// unknown structure exactly; output is compact JSON. A body that turns out
+// not to be JSON is processed as text (a form falls back to its form
+// fields). Vendor types (application/vnd.*) are not assumed to be binary:
+// they are sniffed, except the few known binary families. NDJSON is handled line
 // by line. Form bodies are rewritten field by field. Other textual bodies get
 // regex rules and detectors. When a body changes, BodySize is updated and any
 // Content-Length header is fixed. A truncated body (BodyTruncated) is
@@ -48,9 +53,13 @@
 // wins (and a remove rule drops the whole part), otherwise the part is handled
 // by its own content type, so a JSON part gets JSON rules, a text part regex
 // rules, and every part the detectors. A file part (the Content-Disposition
-// carries a filename), a part with a base64 or quoted-printable
-// Content-Transfer-Encoding and a binary part are opaque and are kept or
-// filled as above. The boundary, preamble, epilogue, delimiters and part
+// carries a filename) is handled by its own Content-Type and bytes in the same
+// way, because a CSV, JSON or text export uploaded as a file is the usual
+// carrier of customer data; only a binary file (an image, a PDF, bytes that
+// are not text) is opaque. A part with a base64 or quoted-printable
+// Content-Transfer-Encoding is decoded, inspected and encoded again if it
+// changed (one that does not decode, or decodes to binary, is opaque). Opaque
+// parts are kept or filled as above. The boundary, preamble, epilogue, delimiters and part
 // headers are written back byte for byte; only part bodies change, and
 // BodySize and Content-Length follow. A multipart body inside a part is split
 // the same way, to a depth of three. A body that cannot be split (no boundary,
@@ -74,7 +83,8 @@
 // Compile everything (regexes, JSONPaths) in New. Avoid re-parsing JSON
 // more than once per body. Target: < 50µs for a typical 2 KB JSON exchange
 // with the default profile (benchmark it; BenchmarkExchangeBuiltinProfile is
-// the real built-in profile with its rules, about 15µs). Use sync.Pool for
+// the real built-in profile with its rules, about 25µs: the sample carries the
+// names and addresses the profile has faked since revision 2). Use sync.Pool for
 // HMAC state. JSONPath rules of the form $..name, which the built-in profile
 // is full of, are matched by a hash lookup of the member name instead of an
 // automaton state each, so their number does not slow the walk down.
@@ -108,6 +118,17 @@
 //     value. A value handled by a selector rule is not scanned by detectors.
 //   - Detectors also scan the request path segments, JSON object keys, query
 //     parameter names, Exchange.Error, and percent-encoded e-mail addresses.
+//     On protocol-metadata headers (User-Agent, Server, Accept-*, validators,
+//     dates) only the e-mail, JWT and AWS key detectors run: the numeric ones
+//     read version numbers as addresses and validators as cards.
+//   - The built-in profile fakes names and postal addresses where the field
+//     name says what they are (first_name, customer_name, cardholder, address
+//     and everything below it, street, city, zip, ...), and "name" only next
+//     to an e-mail, phone or address member (the JSONPath sibling filter), so
+//     product and file names survive. It does NOT find a name or address in
+//     free text, in a URL path, in a field with an unusual name, or in a bare
+//     "name" with no such neighbour: add a rule for those. Bodies of the other
+//     formats get the XML password and token elements and the detectors only.
 //   - The anonymizer never panics on input; an internal panic is recovered and
 //     returned as an error, and the caller must then discard the exchange.
 //   - Engine.Profile returns the profile without its secret (Secret empty,

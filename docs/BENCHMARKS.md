@@ -35,7 +35,8 @@ bin/benchtool load -json -d 10s -c 8 -rate 5000 -paths 100 -url $TARGET    # pac
 
 # the recording for the virtual service is filled by the "seed" service, then it is switched
 bin/benchtool load -json -d 2s -warmup 0s -c 4 -rate 800 -paths 100 -url http://127.0.0.1:$P_SEED
-curl -X POST $ADMIN/api/v1/services/$SEED/mode -d '{"mode":"virtualize","recording_id":"..."}'   # latency mode set to none
+curl -X POST $ADMIN/api/v1/services/$SEED/mode -d '{"mode":"virtualize","recording_id":"..."}'   # only mode and recording change
+curl -X PUT  $ADMIN/api/v1/services/$SEED -d "$SERVICE_JSON"   # the same service with "latency":{"mode":"none",...}
 
 # replay as the load generator
 bin/mirage replay --data $TMP/bench.db --recording bench-virt --target $TARGET \
@@ -53,7 +54,7 @@ services:
   - {name: passthrough, mode: passthrough, upstream: <upstream>, listen_addr: 127.0.0.1:<port>, enabled: true}
   - {name: record,      mode: record,      recording: bench,      anonymize_capture: false, ...}
   - {name: record-anon, mode: record,      recording: bench-anon, anonymize_capture: true,  ...}   # built-in default profile
-  - {name: seed,        mode: record,      recording: bench-virt, ...}   # later switched to virtualize with latency none
+  - {name: seed,        mode: record,      recording: bench-virt, ...}   # later switched to virtualize (mode call), then latency none (PUT)
 ```
 
 ## Results

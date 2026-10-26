@@ -34,6 +34,13 @@ remote assets fail here too) and implements **every endpoint in
   `capture_skipped` / `virtual_injected`, profile `opaque_bodies`, replay
   `max_gap` / `seed` / stage `hold`, summary `max_in_flight` / `saturated` and the
   `corrected_p95` / `corrected_p99` series.
+* Like the Go API: values of credential-like replay `set_headers` (a fixed
+  rule: `Authorization`, `Cookie`, `X-Api-Key`, anything with token, secret,
+  password, ... in the name) are returned as `"***"` on every read and a
+  posted `"***"` for one is a 400, and a record
+  or hybrid service whose recording holds `max_capture_bytes` of bodies stays
+  running with `status.warning: "capture limit reached"` (not `error`). `target_rps` of a
+  replay summary is 0 until its first second has been scheduled.
 * Validation errors in the documented `{error, problems[]}` shape (400),
   duplicate names or ports (409), unknown JSON fields rejected (400), like the
   Go server.
@@ -78,6 +85,7 @@ node web/dev/run.mjs web/dev/scenarios/screenshots.mjs --height 1180   # regener
 |---|---|
 | `interactions.mjs` | modals (Escape, backdrop, focus, inert), invalid and conflicting service creation, mode switching, disable and delete with confirmation, HAR import, exchange drawer and anonymization preview, anonymized copy, replay form validation and start/stop/clone, fault toggle and preset, profile creation with the test panel, theme toggle |
 | `interactions2.mjs` | editing a service (PUT), creating a recording from the service form, 409 handling for recordings and profiles, regenerate-secret flow, editing and deleting faults, dashboard scope and window, HAR export, settings (token, theme) |
+| `review-fixes.mjs` | regressions from the UI review: Edit as new never posts a masked `***` secret (and says which one to re-enter), a running service at its capture limit is an amber notice and not "could not start", the compare view plots corrected latency and diffs seed and headers, the service form follows the mode (Virtualization open and first, Capture folded) and opens sections that hold an error, replay chart legends show the target while running and the whole run afterwards. Changes mock data: restart the mock after it |
 | `overflow.mjs` | page-level horizontal overflow at 1440, 1280, 1024, 768 and 390 px |
 | `hover.mjs` | crosshair and tooltip, legend toggle, 5/15/60 minute window |
 | `reconnect.mjs` | live indicator through a stream outage (`/__mock/sse-drop`); the 503s it logs are expected |

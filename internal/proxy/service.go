@@ -41,14 +41,15 @@ type service struct {
 	mode      model.Mode
 	startedAt time.Time
 	opErr     string // last failed Apply or Reload; cleared by the next success
-	rtErr     string // last runtime problem (capture limit, store failure); cleared by Apply
+	rtErr     string // last runtime problem (store failure, failed anonymization); cleared by Apply
+	rtWarn    string // a runtime note that leaves the service working (capture limit); cleared by Apply
 
 	captured   atomic.Int64
 	dropped    atomic.Int64
 	skipped    atomic.Int64
 	used       atomic.Int64 // body bytes stored in the recording (capture limit)
 	pending    atomic.Int64 // body bytes of this service waiting in the capture queue
-	limitNoted atomic.Bool  // "capture limit reached" is set in lastErr
+	limitNoted atomic.Bool  // "capture limit reached" is set in rtWarn
 }
 
 func newService(m *Manager, id string) *service {
@@ -71,7 +72,7 @@ func (s *service) apply(ctx context.Context, svc model.Service) error {
 		s.cfg = svc
 		s.stop()
 		s.statMu.Lock()
-		s.mode, s.opErr, s.rtErr = svc.Mode, "", ""
+		s.mode, s.opErr, s.rtErr, s.rtWarn = svc.Mode, "", "", ""
 		s.statMu.Unlock()
 		return nil
 	}
@@ -136,7 +137,7 @@ func (s *service) apply(ctx context.Context, svc model.Service) error {
 	}
 	s.cfg = svc
 	s.statMu.Lock()
-	s.running, s.addr, s.mode, s.opErr, s.rtErr = true, s.lis.addr, svc.Mode, "", ""
+	s.running, s.addr, s.mode, s.opErr, s.rtErr, s.rtWarn = true, s.lis.addr, svc.Mode, "", "", ""
 	if fresh {
 		s.startedAt = time.Now()
 	}
@@ -176,10 +177,13 @@ func (s *service) setRuntimeErr(msg string) {
 	s.statMu.Unlock()
 }
 
-// noteLimit reports "capture limit reached" once per configuration.
+// noteLimit reports "capture limit reached" once per configuration. It is a
+// warning, not an error: the service keeps serving, only capturing stopped.
 func (s *service) noteLimit() {
 	if s.limitNoted.CompareAndSwap(false, true) {
-		s.setRuntimeErr("capture limit reached")
+		s.statMu.Lock()
+		s.rtWarn = "capture limit reached"
+		s.statMu.Unlock()
 	}
 }
 
@@ -249,6 +253,9 @@ func (s *service) status() model.ServiceStatus {
 	}
 	if out.Error == "" {
 		out.Error = s.rtErr
+	}
+	if s.running {
+		out.Warning = s.rtWarn
 	}
 	if s.running && !s.startedAt.IsZero() {
 		t := s.startedAt

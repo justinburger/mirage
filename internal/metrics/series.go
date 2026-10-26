@@ -121,6 +121,18 @@ func (c *Collector) closeWindow(sec int64) model.SeriesPoint {
 	p.Max = nsToMs(w.max)
 	if cs := c.corr.Load(); cs != nil {
 		p.CorrectedP95, p.CorrectedP99 = cs.closeWindow()
+		// A corrected latency is never below the service time of the same
+		// request, so a window's corrected percentile is never below the
+		// service one. The two histograms are read one after the other, without
+		// a lock, and a request landing between the reads can be in one window
+		// of one and the next window of the other; clamp to the known lower
+		// bound so the series never shows the impossible order.
+		if p.CorrectedP95 > 0 {
+			p.CorrectedP95 = max(p.CorrectedP95, p.P95)
+		}
+		if p.CorrectedP99 > 0 {
+			p.CorrectedP99 = max(p.CorrectedP99, p.P99)
+		}
 	}
 	c.lastInFlight = p.InFlight
 	c.pushPoint(p)
@@ -201,7 +213,7 @@ func (c *Collector) Snapshot() model.StatsSnapshot {
 		Name:     c.name,
 		Kind:     c.kind,
 		ID:       c.id,
-		Since:    time.Unix(0, c.since.Load()),
+		Since:    time.Unix(0, c.since.Load()).UTC(),
 		Errors:   c.errors.Load(),
 		BytesIn:  c.bytesIn.Load(),
 		BytesOut: c.bytesOut.Load(),

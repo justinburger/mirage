@@ -253,8 +253,11 @@ type ReplaySummary struct {
 	// Planned is the number of requests the schedule will send: exact for a
 	// single timeline/max pass (sum over items of copies × Amplify, with
 	// error items counted k times) and capped by MaxRequests; for rate mode
-	// the integral of the rate over the run; for duration-bounded loops an
-	// estimate from the pass rate; -1 when unknown.
+	// the integral of the rate over the run; for looping timelines the
+	// requests actually due before Duration (an estimate only with fractional
+	// ErrorAmplification on a recording that has errors, where each pass
+	// draws differently, and an estimate is raised to Sent if the run overshoots
+	// it); -1 when unknown.
 	Planned   int64 `json:"planned"`
 	Sent      int64 `json:"sent"`
 	Completed int64 `json:"completed"` // got a response (any status)
@@ -266,7 +269,10 @@ type ReplaySummary struct {
 	Mismatches int64 `json:"mismatches"`
 	// StatusCounts maps status code (as a string) to count.
 	StatusCounts map[string]int64 `json:"status_counts"`
-	// Latency is service time: request sent → response body fully read.
+	// Latency is service time: request sent → response body fully read. It
+	// also includes requests that failed after a connection was made (a
+	// timeout counts as at least the timeout); requests that never reached the
+	// target (connection refused, DNS, certificate) are not measured.
 	Latency LatencySummary `json:"latency"`
 	// CorrectedLatency is measured from each request's intended send time, so
 	// it includes time spent waiting for a free connection slot when the
@@ -283,7 +289,9 @@ type ReplaySummary struct {
 	MaxLag Duration `json:"max_lag"`
 	// MaxInFlight is the peak number of concurrent requests. Saturated is
 	// true when every Concurrency slot was busy at least once, so lag and
-	// corrected latency include client-side queueing: raise Concurrency.
+	// corrected latency include client-side queueing: raise Concurrency. It is
+	// only meaningful for the open-loop modes (timeline, rate) and always false
+	// in max mode, which keeps every slot busy by design.
 	MaxInFlight int64             `json:"max_in_flight"`
 	Saturated   bool              `json:"saturated"`
 	Endpoints   []EndpointSummary `json:"endpoints"`

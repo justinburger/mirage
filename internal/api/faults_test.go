@@ -292,3 +292,183 @@ func TestFaultTypesRoundTrip(t *testing.T) {
 		t.Errorf("a JSON number must mean milliseconds: %+v", byName["ms number"])
 	}
 }
+
+// Problems read like the other endpoints': the field and what is wrong with it,
+// without the injector's "rules[0] "name" (id):" label of a list the client never sent.
+func TestFaultProblemsCarryNoRuleLabel(t *testing.T) {
+	e := newEnv(t)
+	names := []string{"l", "probability", "status", `with "quotes"`, `colon: inside`, `ends with \`, "unicode ✓"}
+	for _, name := range names {
+		for _, id := range []string{"", "my-rule"} {
+			t.Run(name+"/"+id, func(t *testing.T) {
+				body := map[string]any{"name": name, "type": "latency", "probability": 1}
+				if id != "" {
+					body["id"] = id
+				}
+				eb := e.errorOf("POST", "/api/v1/faults", body, http.StatusBadRequest)
+				if len(eb.Problems) != 1 || eb.Problems[0] != "latency fault needs delay or jitter" {
+					t.Errorf("problems = %q", eb.Problems)
+				}
+			})
+		}
+	}
+
+	// Several problems at once, none labelled; the name does not leak in.
+	eb := e.errorOf("POST", "/api/v1/faults", map[string]any{"name": "status", "type": "error", "probability": 7, "status": 42}, http.StatusBadRequest)
+	if len(eb.Problems) != 2 {
+		t.Fatalf("problems = %q", eb.Problems)
+	}
+	for _, p := range eb.Problems {
+		if strings.Contains(p, "rules[") || strings.Contains(p, `"status"`) {
+			t.Errorf("problem %q carries the rule label", p)
+		}
+	}
+	// A blank name has no label at all.
+	eb = e.errorOf("POST", "/api/v1/faults", map[string]any{"name": "  ", "type": "abort", "probability": 1}, http.StatusBadRequest)
+	if len(eb.Problems) != 1 || eb.Problems[0] != "name is required" {
+		t.Errorf("blank name problems = %q", eb.Problems)
+	}
+	// The same on update.
+	var created FaultRuleWithCount
+	e.call("POST", "/api/v1/faults", faultBody("keep"), http.StatusCreated, &created)
+	bad := faultBody("keep")
+	bad["probability"] = 2
+	eb = e.errorOf("PUT", "/api/v1/faults/"+created.ID, bad, http.StatusBadRequest)
+	if len(eb.Problems) != 1 || strings.Contains(eb.Problems[0], "rules[") {
+		t.Errorf("update problems = %q", eb.Problems)
+	}
+}
+
+func TestFaultRejectsUnknownServiceAndMethods(t *testing.T) {
+	e := newEnv(t)
+	svc := e.seedService(model.Service{Name: "scoped"})
+
+	t.Run("unknown service_id", func(t *testing.T) {
+		body := faultBody("x")
+		body["service_id"] = "svc_nope"
+		eb := e.errorOf("POST", "/api/v1/faults", body, http.StatusBadRequest)
+		if len(eb.Problems) != 1 || eb.Problems[0] != `service_id "svc_nope" does not exist` {
+			t.Errorf("problems = %q", eb.Problems)
+		}
+	})
+	t.Run("methods that are not HTTP methods", func(t *testing.T) {
+		body := faultBody("x")
+		body["methods"] = []string{"post", "bogus", "Get", "a b"}
+		eb := e.errorOf("POST", "/api/v1/faults", body, http.StatusBadRequest)
+		if len(eb.Problems) != 2 {
+			t.Fatalf("problems = %q", eb.Problems)
+		}
+		joined := strings.Join(eb.Problems, " ")
+		if !strings.Contains(joined, `"bogus"`) || !strings.Contains(joined, `"a b"`) || strings.Contains(joined, `"post"`) || strings.Contains(joined, `"Get"`) {
+			t.Errorf("problems = %q", eb.Problems)
+		}
+	})
+	t.Run("all problems are reported together", func(t *testing.T) {
+		body := faultBody("x")
+		body["service_id"] = "svc_nope"
+		body["methods"] = []string{"bogus"}
+		body["probability"] = 3
+		if eb := e.errorOf("POST", "/api/v1/faults", body, http.StatusBadRequest); len(eb.Problems) != 3 {
+			t.Errorf("problems = %q", eb.Problems)
+		}
+	})
+	t.Run("update checks them too", func(t *testing.T) {
+		var created FaultRuleWithCount
+		e.call("POST", "/api/v1/faults", faultBody("ok"), http.StatusCreated, &created)
+		body := faultBody("ok")
+		body["service_id"] = "svc_nope"
+		e.errorOf("PUT", "/api/v1/faults/"+created.ID, body, http.StatusBadRequest)
+		body["service_id"] = svc.ID
+		body["methods"] = []string{"patch", "DELETE", "PROPFIND"}
+		var out FaultRuleWithCount
+		e.call("PUT", "/api/v1/faults/"+created.ID, body, http.StatusOK, &out)
+		if out.ServiceID != svc.ID || len(out.Methods) != 3 {
+			t.Errorf("out = %+v", out.FaultRule)
+		}
+	})
+	t.Run("nothing invalid was stored", func(t *testing.T) {
+		list, _ := e.st.ListFaultRules(context.Background())
+		if len(list) != 1 {
+			t.Errorf("%d rules stored, want only the valid one", len(list))
+		}
+	})
+}
+
+// A rule scoped to a service never fires once the service is gone, so it goes
+// with it; rules of other services and global rules stay.
+func TestDeletingAServiceDeletesItsFaultRules(t *testing.T) {
+	e := newEnv(t)
+	doomed := e.seedService(model.Service{Name: "doomed"})
+	other := e.seedService(model.Service{Name: "other"})
+
+	mk := func(name, serviceID string) FaultRuleWithCount {
+		body := faultBody(name)
+		if serviceID != "" {
+			body["service_id"] = serviceID
+		}
+		var out FaultRuleWithCount
+		e.call("POST", "/api/v1/faults", body, http.StatusCreated, &out)
+		return out
+	}
+	a, b := mk("on doomed 1", doomed.ID), mk("on doomed 2", doomed.ID)
+	keepOther, keepGlobal := mk("on other", other.ID), mk("global", "")
+	if len(e.inj.Rules()) != 4 {
+		t.Fatalf("injector has %d rules", len(e.inj.Rules()))
+	}
+
+	e.call("DELETE", "/api/v1/services/"+doomed.ID, nil, http.StatusNoContent, nil)
+
+	var list []FaultRuleWithCount
+	e.call("GET", "/api/v1/faults", nil, http.StatusOK, &list)
+	got := map[string]bool{}
+	for _, r := range list {
+		got[r.ID] = true
+	}
+	if got[a.ID] || got[b.ID] || !got[keepOther.ID] || !got[keepGlobal.ID] || len(list) != 2 {
+		t.Errorf("faults after the delete = %+v", list)
+	}
+	// The injector follows the store.
+	if n := len(e.inj.Rules()); n != 2 {
+		t.Errorf("injector has %d rules, want 2", n)
+	}
+	// And the rule can no longer be created for the deleted service.
+	body := faultBody("late")
+	body["service_id"] = doomed.ID
+	e.errorOf("POST", "/api/v1/faults", body, http.StatusBadRequest)
+
+	// Deleting a service with no rules still works.
+	e.call("DELETE", "/api/v1/services/"+other.ID, nil, http.StatusNoContent, nil)
+	e.call("GET", "/api/v1/faults", nil, http.StatusOK, &list)
+	if len(list) != 1 || list[0].ID != keepGlobal.ID {
+		t.Errorf("faults = %+v", list)
+	}
+}
+
+// Creating a rule for a service while that service is being deleted either
+// fails or leaves nothing behind; it never leaves a dangling rule.
+func TestFaultCreationRacesServiceDeletion(t *testing.T) {
+	for range 20 {
+		e := newEnv(t)
+		svc := e.seedService(model.Service{Name: "racer"})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			body := faultBody("racing")
+			body["service_id"] = svc.ID
+			e.do("POST", "/api/v1/faults", body)
+		}()
+		go func() {
+			defer wg.Done()
+			e.do("DELETE", "/api/v1/services/"+svc.ID, nil)
+		}()
+		wg.Wait()
+		rules, _ := e.st.ListFaultRules(context.Background())
+		if len(rules) != 0 {
+			t.Fatalf("a dangling rule survived: %+v", rules)
+		}
+		if n := len(e.inj.Rules()); n != 0 {
+			t.Fatalf("injector has %d rules", n)
+		}
+	}
+}

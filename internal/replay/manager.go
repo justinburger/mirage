@@ -128,9 +128,16 @@ func cloneJob(j model.ReplayJob) model.ReplayJob {
 	return j
 }
 
+// maxSeed is 2^53-1, the largest integer a JSON number carries exactly in a
+// browser (and any other client that parses numbers as doubles).
+const maxSeed = 1<<53 - 1
+
+// randomSeed returns a non-zero seed in [1, 2^53-1]. A 64-bit seed would be
+// rounded by the web UI, so Edit as new and the config view would show and
+// resubmit a different seed and the clone would draw a different schedule.
 func randomSeed() uint64 {
 	for {
-		if s := rand.Uint64(); s != 0 {
+		if s := rand.Uint64() & maxSeed; s != 0 {
 			return s
 		}
 	}
@@ -416,11 +423,14 @@ func (lr *liveRun) snapshot() model.ReplayJob {
 	return j
 }
 
-// Get returns a job: the live summary while it runs (no series; use Series),
-// the stored result with its series once finished.
+// Get returns a job with its series: the live summary and the points so far
+// while it runs, the stored result once finished. A client that opens a
+// running job seeds its charts from this.
 func (m *Manager) Get(ctx context.Context, id string) (model.ReplayJob, error) {
 	if lr := m.lookup(id); lr != nil {
-		return lr.snapshot(), nil
+		j := lr.snapshot()
+		j.Series = lr.run.seriesSince(0)
+		return j, nil
 	}
 	return m.st.GetReplayJob(ctx, id)
 }

@@ -44,9 +44,9 @@ func TestShutdownIsNotDelayedByAConnectionThatSentNothing(t *testing.T) {
 	}
 	defer idle.Close()
 	waitFor(t, "the connection to be tracked", func() bool {
-		nc.mu.Lock()
-		defer nc.mu.Unlock()
-		return len(nc.conns) == 1
+		n := 0
+		nc.conns.Range(func(_, _ any) bool { n++; return true })
+		return n == 1
 	})
 
 	if n := nc.CloseAll(); n != 1 {
@@ -75,9 +75,9 @@ func TestUsedConnectionsAreNotTracked(t *testing.T) {
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	waitFor(t, "the connection to be idle", func() bool {
-		nc.mu.Lock()
-		defer nc.mu.Unlock()
-		return len(nc.conns) == 0
+		n := 0
+		nc.conns.Range(func(_, _ any) bool { n++; return true })
+		return n == 0
 	})
 	if n := nc.CloseAll(); n != 0 {
 		t.Errorf("CloseAll closed %d connections that had served a request", n)

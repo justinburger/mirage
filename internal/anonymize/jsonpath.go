@@ -14,10 +14,20 @@ import (
 //	$.a[*].b  $.*    wildcards over members and elements
 //	$..key           recursive descent: `key` at any depth
 //	$..*  $..[0]     recursive descent with a wildcard or an index
+//	$..[?(@.a || @.b)].key
+//	                 `key` at any depth, but only in objects that also have a
+//	                 member `a` or `b` (the sibling filter; see below)
 //
-// Filters, slices, unions and negative indexes are rejected with a validation
-// error rather than silently ignored, so a rule can never look like it covers
-// data that it does not.
+// Slices, unions, negative indexes and every other filter are rejected with a
+// validation error rather than silently ignored, so a rule can never look like
+// it covers data that it does not.
+//
+// The sibling filter exists for keys that are only sometimes personal data: a
+// bare "name" is a person next to an "email" and a product next to a "sku".
+// The one form `$..[?(@.a || @.b || ...)].key` (parentheses and the quoted
+// form @['a'] are optional) is the whole syntax: a descendant filter on
+// member existence followed by one member name. The rewriter decides it
+// per object, looking at the whole object, so member order does not matter.
 
 const (
 	jpName = iota
@@ -51,6 +61,9 @@ func (s *jpStep) matches(obj bool, key []byte, idx int) bool {
 type jsonPath struct {
 	src   string
 	steps []jpStep
+	// siblings, when set, restricts the single step to members of objects
+	// that also have one of these members (the sibling filter).
+	siblings []string
 }
 
 func (p *jsonPath) String() string { return p.src }
@@ -61,6 +74,9 @@ func parseJSONPath(sel string) (*jsonPath, error) {
 	p := strings.TrimSpace(sel)
 	if p == "" || p[0] != '$' {
 		return nil, fmt.Errorf("JSONPath %q must start with $", sel)
+	}
+	if strings.HasPrefix(p, "$..[?") {
+		return parseSiblingFilter(sel, p)
 	}
 	jp := &jsonPath{src: sel}
 	i := 1
@@ -120,6 +136,101 @@ func parseJSONPath(sel string) (*jsonPath, error) {
 		}
 	}
 	return jp, nil
+}
+
+// filterEnd returns the offset of the ']' that closes a filter whose text
+// starts at s[0] (just after "[?"), skipping brackets inside quoted names, or
+// -1.
+func filterEnd(s string) int {
+	var quote byte
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case quote != 0:
+			if c == '\\' {
+				i++
+			} else if c == quote {
+				quote = 0
+			}
+		case c == '\'' || c == '"':
+			quote = c
+		case c == '[':
+			depth++
+		case c == ']':
+			if depth == 0 {
+				return i
+			}
+			depth--
+		}
+	}
+	return -1
+}
+
+// maxSiblingNames bounds the members a sibling filter may list.
+const maxSiblingNames = 64
+
+// parseSiblingFilter parses `$..[?(@.a || @['b'])].key` (p, already trimmed;
+// sel is the original text for messages).
+func parseSiblingFilter(sel, p string) (*jsonPath, error) {
+	bad := func(format string, args ...any) (*jsonPath, error) {
+		return nil, fmt.Errorf("JSONPath %q: "+format+" (the only filter supported is $..[?(@.a || @.b)].key)", append([]any{sel}, args...)...)
+	}
+	i := len("$..[?")
+	end := filterEnd(p[i:])
+	if end < 0 {
+		return bad("unterminated filter")
+	}
+	cond := strings.TrimSpace(p[i : i+end])
+	rest := p[i+end+1:]
+	if strings.HasPrefix(cond, "(") {
+		if !strings.HasSuffix(cond, ")") {
+			return bad("unbalanced parentheses in the filter")
+		}
+		cond = strings.TrimSpace(cond[1 : len(cond)-1])
+	}
+	var names []string
+	for _, term := range strings.Split(cond, "||") {
+		term = strings.TrimSpace(term)
+		if !strings.HasPrefix(term, "@") {
+			return bad("filter term %q must be @.member", term)
+		}
+		term = term[1:]
+		var name string
+		switch {
+		case strings.HasPrefix(term, "['") && strings.HasSuffix(term, "']"), strings.HasPrefix(term, `["`) && strings.HasSuffix(term, `"]`):
+			name = term[2 : len(term)-2]
+		case strings.HasPrefix(term, "."):
+			name = term[1:]
+		}
+		if name == "" || strings.ContainsAny(name, "*()?@,:'\"[]. \t&|=<>!") {
+			return bad("filter term %q must be @.member or @['member'] with a plain member name", "@"+term)
+		}
+		names = append(names, name)
+	}
+	if len(names) == 0 || len(names) > maxSiblingNames {
+		return bad("the filter must list between 1 and %d members", maxSiblingNames)
+	}
+	var st jpStep
+	st.descend = true
+	switch {
+	case strings.HasPrefix(rest, "."):
+		name := rest[1:]
+		if name == "" || strings.ContainsAny(name, "*()?@,:'\"[]. \t") {
+			return bad("the filter must be followed by one plain member name")
+		}
+		st.kind, st.name = jpName, name
+	case strings.HasPrefix(rest, "['") || strings.HasPrefix(rest, `["`):
+		var tmp jpStep
+		n, err := parseBracket(rest, 0, &tmp)
+		if err != nil || n != len(rest) || tmp.kind != jpName {
+			return bad("the filter must be followed by one member name")
+		}
+		st.kind, st.name = jpName, tmp.name
+	default:
+		return bad("the filter must be followed by .member")
+	}
+	return &jsonPath{src: sel, steps: []jpStep{st}, siblings: names}, nil
 }
 
 // parseBracket parses "[...]" starting at p[i] == '[' into st and returns the

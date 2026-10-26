@@ -88,8 +88,13 @@ func TestCreateReplay(t *testing.T) {
 		}
 	})
 	t.Run("errors", func(t *testing.T) {
+		// A recording the request names that does not exist is a 400 with a
+		// problem, like the other references in request bodies.
 		missingRec := replayRequest("rec_nope")
-		eb := e.errorOf("POST", "/api/v1/replays", missingRec, http.StatusNotFound)
+		eb := e.errorOf("POST", "/api/v1/replays", missingRec, http.StatusBadRequest)
+		if len(eb.Problems) != 1 || eb.Problems[0] != `recording_id "rec_nope" does not exist` {
+			t.Errorf("problems = %q", eb.Problems)
+		}
 		if strings.Contains(eb.Error, "replay:") {
 			t.Errorf("package prefix leaked: %q", eb.Error)
 		}
@@ -234,36 +239,256 @@ func TestCloneReplay(t *testing.T) {
 	e.errorOf("POST", "/api/v1/replays/"+job.ID+"/clone", map[string]any{"name": strings.Repeat("n", 300)}, http.StatusBadRequest)
 }
 
-func TestReplayUsesDefaultProfileRedactList(t *testing.T) {
+// Which set_headers are masked is a fixed rule, not a property of the default
+// anonymization profile that anyone may edit.
+func TestReplayMasksCredentialHeaders(t *testing.T) {
 	e := newEnv(t)
 	rec := e.seedRecording("source", 1)
-	// Teach the default profile one more sensitive header.
+	// Strip the default profile's redact list down to nothing: masking must not care.
 	var def model.AnonymizationProfile
 	e.call("GET", "/api/v1/profiles/default", nil, http.StatusOK, &def)
-	def.RedactHeaders = append(def.RedactHeaders, "X-Internal-Token")
+	def.RedactHeaders = []string{"X-Only-This"}
 	e.call("PUT", "/api/v1/profiles/default", def, http.StatusOK, nil)
 
+	headers := map[string]string{
+		"Authorization": "Bearer a", "Proxy-Authorization": "Basic b", "cookie": "s=1", "Set-Cookie": "s=2",
+		"X-Api-Key": "k", "X-INTERNAL-token": "t", "X-Amz-Security-Token": "aws", "X-Api-Secret": "sh",
+		"X-Auth-Token": "t2", "Ocp-Apim-Subscription-Key": "sub", "X-Session-Id": "sid", "X-Db-Password": "pw",
+		// Not credentials: shown as sent.
+		"X-Env": "stg", "X-Forwarded-For": "10.0.0.1", "X-Real-Ip": "10.0.0.2", "Forwarded": "for=10.0.0.3",
+		"Content-Type": "application/json", "User-Agent": "mirage", "Accept-Language": "en",
+	}
 	body := replayRequest(rec.ID)
-	body["config"].(map[string]any)["set_headers"] = map[string]string{"X-INTERNAL-token": "s3cret", "X-Env": "stg"}
+	body["config"].(map[string]any)["set_headers"] = headers
 	var job model.ReplayJob
 	e.call("POST", "/api/v1/replays", body, http.StatusCreated, &job)
-	if job.Config.SetHeaders["X-INTERNAL-token"] != "***" || job.Config.SetHeaders["X-Env"] != "stg" {
-		t.Errorf("set_headers = %v", job.Config.SetHeaders)
+
+	var listed []model.ReplayJob
+	e.call("GET", "/api/v1/replays", nil, http.StatusOK, &listed)
+	var fetched model.ReplayJob
+	e.call("GET", "/api/v1/replays/"+job.ID, nil, http.StatusOK, &fetched)
+	for where, got := range map[string]map[string]string{"create": job.Config.SetHeaders, "list": listed[0].Config.SetHeaders, "get": fetched.Config.SetHeaders} {
+		for name, value := range headers {
+			want := value
+			if isSensitiveHeader(name) {
+				want = maskedValue
+			}
+			if got[name] != want {
+				t.Errorf("%s: %s = %q, want %q", where, name, got[name], want)
+			}
+		}
+	}
+	for _, name := range []string{"Authorization", "X-Api-Key", "X-Amz-Security-Token", "X-Api-Secret", "X-Auth-Token"} {
+		if fetched.Config.SetHeaders[name] != maskedValue {
+			t.Errorf("%s is not masked: %q", name, fetched.Config.SetHeaders[name])
+		}
+	}
+	for _, name := range []string{"X-Env", "X-Forwarded-For", "X-Real-Ip", "Forwarded", "Content-Type"} {
+		if fetched.Config.SetHeaders[name] != headers[name] {
+			t.Errorf("%s was masked: %q", name, fetched.Config.SetHeaders[name])
+		}
+	}
+	// The stored job keeps the real values (a re-run needs them).
+	stored, _ := e.st.GetReplayJob(context.Background(), job.ID)
+	if stored.Config.SetHeaders["X-Api-Secret"] != "sh" {
+		t.Errorf("stored header = %q", stored.Config.SetHeaders["X-Api-Secret"])
 	}
 }
 
-func TestMaskJobDoesNotModifyItsInput(t *testing.T) {
+// A client that GETs a job, edits it and POSTs it back would send the mask as
+// the credential. That is a 400 naming the header, and nothing is stored.
+func TestCreateReplayRejectsMaskedSecretHeaders(t *testing.T) {
+	e := newEnv(t)
+	rec := e.seedRecording("source", 1)
+	body := replayRequest(rec.ID)
+	body["config"].(map[string]any)["set_headers"] = map[string]string{
+		"Authorization": maskedValue, "X-Api-Key": maskedValue, "X-Env": maskedValue, "Cookie": "s=1",
+	}
+	eb := e.errorOf("POST", "/api/v1/replays", body, http.StatusBadRequest)
+	if len(eb.Problems) != 2 || !strings.Contains(eb.Problems[0], "Authorization") || !strings.Contains(eb.Problems[1], "X-Api-Key") {
+		t.Errorf("problems = %q, want one each for Authorization and X-Api-Key", eb.Problems)
+	}
+	var jobs []model.ReplayJob
+	e.call("GET", "/api/v1/replays", nil, http.StatusOK, &jobs)
+	if len(jobs) != 0 {
+		t.Errorf("a rejected request left %d jobs", len(jobs))
+	}
+
+	// "***" on a header that is not a credential is just a value, and a real
+	// secret is stored.
+	body["config"].(map[string]any)["set_headers"] = map[string]string{"X-Env": maskedValue, "Authorization": "Bearer real"}
+	var job model.ReplayJob
+	e.call("POST", "/api/v1/replays", body, http.StatusCreated, &job)
+	stored, _ := e.st.GetReplayJob(context.Background(), job.ID)
+	if stored.Config.SetHeaders["Authorization"] != "Bearer real" || stored.Config.SetHeaders["X-Env"] != maskedValue {
+		t.Errorf("stored headers = %v", stored.Config.SetHeaders)
+	}
+}
+
+func TestIsSensitiveHeader(t *testing.T) {
+	for name, want := range map[string]bool{
+		"Authorization": true, "AUTHORIZATION": true, "Proxy-Authorization": true, "Cookie": true, "Set-Cookie": true,
+		"X-Api-Key": true, "X-API-KEY": true, "Api-Key": true, "ApiKey": true, "Key": true, "X-Functions-Key": true,
+		"X-Auth-Token": true, "X-Amz-Security-Token": true, "X-Api-Secret": true, "X-Client-Secret": true,
+		"X-Password": true, "X-Credentials": true, "X-Session-Token": true, " x-csrf-token ": true,
+		"X-Env": false, "Content-Type": false, "Accept": false, "User-Agent": false, "Host": false,
+		"X-Forwarded-For": false, "X-Real-Ip": false, "Forwarded": false, "Keep-Alive": false, "X-Request-Id": false,
+	} {
+		if got := isSensitiveHeader(name); got != want {
+			t.Errorf("isSensitiveHeader(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+func TestPublicJobDoesNotModifyItsInput(t *testing.T) {
 	orig := map[string]string{"Authorization": "Bearer x", "X-Env": "stg"}
 	job := model.ReplayJob{Config: model.ReplayConfig{SetHeaders: orig}}
-	masked := maskJob(job, map[string]struct{}{"authorization": {}})
+	masked := publicJob(job)
 	if orig["Authorization"] != "Bearer x" {
-		t.Error("maskJob wrote into the manager's map")
+		t.Error("publicJob wrote into the manager's map")
 	}
 	if masked.Config.SetHeaders["Authorization"] != "***" || masked.Config.SetHeaders["X-Env"] != "stg" {
 		t.Errorf("masked = %v", masked.Config.SetHeaders)
 	}
-	if got := maskJob(model.ReplayJob{}, nil); got.Config.SetHeaders != nil {
+	if got := publicJob(model.ReplayJob{}); got.Config.SetHeaders != nil {
 		t.Errorf("job without headers = %+v", got)
+	}
+}
+
+// A replay that points at a recording or profile that does not exist is a bad
+// request, answered the way POST /services answers it.
+func TestCreateReplayUnknownReferencesAre400(t *testing.T) {
+	e := newEnv(t)
+	rec := e.seedRecording("source", 3)
+
+	body := replayRequest("rec_nope")
+	eb := e.errorOf("POST", "/api/v1/replays", body, http.StatusBadRequest)
+	if len(eb.Problems) != 1 || !strings.Contains(eb.Problems[0], `recording_id "rec_nope" does not exist`) {
+		t.Errorf("unknown recording: %+v", eb)
+	}
+
+	body = replayRequest(rec.ID)
+	body["config"].(map[string]any)["profile_id"] = "prof_nope"
+	eb = e.errorOf("POST", "/api/v1/replays", body, http.StatusBadRequest)
+	if len(eb.Problems) != 1 || !strings.Contains(eb.Problems[0], `profile_id "prof_nope" does not exist`) {
+		t.Errorf("unknown profile: %+v", eb)
+	}
+
+	body = replayRequest("rec_nope")
+	body["config"].(map[string]any)["profile_id"] = "prof_nope"
+	eb = e.errorOf("POST", "/api/v1/replays", body, http.StatusBadRequest)
+	if len(eb.Problems) != 2 {
+		t.Errorf("both references: %+v", eb)
+	}
+
+	// Config problems still win: they are reported before any lookup.
+	body = replayRequest("rec_nope")
+	body["config"].(map[string]any)["mode"] = "teleport"
+	eb = e.errorOf("POST", "/api/v1/replays", body, http.StatusBadRequest)
+	for _, p := range eb.Problems {
+		if strings.Contains(p, "does not exist") {
+			t.Errorf("a reference problem next to a config problem: %q", p)
+		}
+	}
+	if jobs, _ := e.st.ListReplayJobs(context.Background()); len(jobs) != 0 {
+		t.Errorf("%d jobs created by refused requests", len(jobs))
+	}
+}
+
+// Starting a replay that cannot have anything to send fails at once, with a
+// 409, instead of answering "running" and failing a moment later.
+func TestReplayStartFailsAtOnceWithoutTraffic(t *testing.T) {
+	e := newEnv(t)
+	empty := e.seedRecording("empty", 0)
+	full := e.seedRecording("full", 4)
+
+	t.Run("create with start on an empty recording", func(t *testing.T) {
+		body := replayRequest(empty.ID)
+		body["start"] = true
+		eb := e.errorOf("POST", "/api/v1/replays", body, http.StatusConflict)
+		if !strings.Contains(eb.Error, "empty") || !strings.Contains(eb.Error, "nothing to replay") {
+			t.Errorf("error = %q", eb.Error)
+		}
+		if jobs, _ := e.st.ListReplayJobs(context.Background()); len(jobs) != 0 {
+			t.Errorf("%d jobs left behind", len(jobs))
+		}
+		if len(e.rpls.Running()) != 0 {
+			t.Error("a job is running")
+		}
+	})
+
+	t.Run("a pending job on an empty recording can exist but not start", func(t *testing.T) {
+		var job model.ReplayJob
+		e.call("POST", "/api/v1/replays", replayRequest(empty.ID), http.StatusCreated, &job)
+		eb := e.errorOf("POST", "/api/v1/replays/"+job.ID+"/start", nil, http.StatusConflict)
+		if !strings.Contains(eb.Error, "empty") {
+			t.Errorf("error = %q", eb.Error)
+		}
+		var again model.ReplayJob
+		e.call("GET", "/api/v1/replays/"+job.ID, nil, http.StatusOK, &again)
+		if again.Status != model.ReplayPending {
+			t.Errorf("status = %q after a refused start", again.Status)
+		}
+	})
+
+	t.Run("the recording of a finished job was deleted", func(t *testing.T) {
+		gone := e.seedRecording("doomed", 2)
+		var job model.ReplayJob
+		e.call("POST", "/api/v1/replays", replayRequest(gone.ID), http.StatusCreated, &job)
+		e.call("POST", "/api/v1/replays/"+job.ID+"/start", nil, http.StatusOK, nil)
+		e.rpls.finish(job.ID, model.ReplayCompleted, nil)
+		e.call("DELETE", "/api/v1/recordings/"+gone.ID, nil, http.StatusNoContent, nil)
+
+		for _, step := range []string{"/start", "/clone"} {
+			eb := e.errorOf("POST", "/api/v1/replays/"+job.ID+step, nil, http.StatusConflict)
+			if !strings.Contains(eb.Error, "no longer exists") {
+				t.Errorf("%s: error = %q", step, eb.Error)
+			}
+			if n := strings.Count(eb.Error, gone.ID); n != 1 {
+				t.Errorf("%s: error names the recording %d times: %q", step, n, eb.Error)
+			}
+			if strings.Contains(eb.Error, "store:") {
+				t.Errorf("%s: package prefix leaked: %q", step, eb.Error)
+			}
+		}
+		var again model.ReplayJob
+		e.call("GET", "/api/v1/replays/"+job.ID, nil, http.StatusOK, &again)
+		if again.Status != model.ReplayCompleted {
+			t.Errorf("status = %q: a refused start must not touch the job", again.Status)
+		}
+	})
+
+	t.Run("a recording with traffic still starts", func(t *testing.T) {
+		var job model.ReplayJob
+		e.call("POST", "/api/v1/replays", replayRequest(full.ID), http.StatusCreated, &job)
+		e.call("POST", "/api/v1/replays/"+job.ID+"/start", nil, http.StatusOK, &job)
+		if job.Status != model.ReplayRunning {
+			t.Errorf("status = %q", job.Status)
+		}
+		// Starting a running job is still the manager's conflict.
+		e.errorOf("POST", "/api/v1/replays/"+job.ID+"/start", nil, http.StatusConflict)
+	})
+}
+
+// What a failed job recorded is shown without the internal package prefixes
+// and without the repeated object names of the error chain.
+func TestReplayJobErrorIsSanitized(t *testing.T) {
+	e := newEnv(t)
+	rec := e.seedRecording("source", 1)
+	job := e.seedReplay("broken", rec.ID, model.ReplayFailed)
+	job.Error = `failed recording "rec_x": store: recording "rec_x": not found`
+	if _, err := e.st.PutReplayJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	var got model.ReplayJob
+	e.call("GET", "/api/v1/replays/"+job.ID, nil, http.StatusOK, &got)
+	if got.Error != `failed recording "rec_x": not found` {
+		t.Errorf("error = %q", got.Error)
+	}
+	var list []model.ReplayJob
+	e.call("GET", "/api/v1/replays", nil, http.StatusOK, &list)
+	if len(list) != 1 || list[0].Error != got.Error {
+		t.Errorf("list error = %+v", list)
 	}
 }
 

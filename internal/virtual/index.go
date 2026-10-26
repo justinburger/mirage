@@ -39,8 +39,9 @@ type shard struct {
 // lines. A lookup bumps the stripe chosen by its exact-level key hash.
 type counters struct {
 	hits, misses, injected atomic.Int64
+	suppressed             atomic.Int64
 	level                  [3]atomic.Int64
-	_                      [80]byte
+	_                      [72]byte
 }
 
 // entry holds the candidates of one key. cands is guarded by the shard lock
@@ -190,7 +191,7 @@ func (e *Engine) insert(ex *model.Exchange, bulk bool) {
 
 	size := int64(len(ex.Request.Body) + len(ex.Response.Body))
 	lazyItem := e.st != nil && ex.ID != 0 && (e.lazy || e.resident.Load()+size > e.opts.MaxResidentBytes)
-	it := newItem(ex, lazyItem)
+	it := e.indexItem(ex, lazyItem)
 	it.ep = ep
 	it.params = params
 	if lazyItem {
@@ -220,11 +221,84 @@ func (e *Engine) insert(ex *model.Exchange, bulk bool) {
 		key = append(kb[:0], keyTemplate)
 		key = append(key, endpoint...)
 		e.put(key, it, bulk)
+		// A request is looked up under the endpoint of the engine's current
+		// normalizer. A stored endpoint that is one of the current
+		// endpoint_patterns is authoritative (the stored path may have been
+		// anonymized). Any other was produced by another normalizer (a HAR
+		// import, endpoint_patterns edited after recording): index the item
+		// under the current normalizer's template of the path too.
+		if _, known := e.patterns[strings.TrimPrefix(endpoint, method+" ")]; !known {
+			key = append(kb[:0], keyTemplate)
+			key = append(key, method...)
+			key = append(key, ' ')
+			key = append(key, e.norm.Template(path)...)
+			if string(key[1:]) != endpoint {
+				e.put(key, it, bulk)
+			}
+		}
 	}
 }
 
-// newItem builds the indexed form of ex. In lazy mode the item keeps a copy of
-// the exchange without bodies.
+// indexItem builds the indexed form of ex. In lazy mode the item keeps a copy
+// of the exchange without bodies.
+//
+// What the index needs from an exchange besides its response body is the
+// request-side keys (computed by the caller before this) and the response
+// headers (copied into the item), so the item keeps a slim exchange: the
+// request headers, the request body and the response header map are released.
+// The item holds a trimmed copy; ex itself is left as it was. An exchange
+// reached through a Match no longer carries the request headers or body nor
+// the response header map.
+func (e *Engine) indexItem(ex *model.Exchange, lazy bool) *item {
+	it := newItem(ex, lazy)
+	if it.ex == ex {
+		c := *ex
+		it.ex = &c
+	}
+	it.ex.Request.Header, it.ex.Request.Body, it.ex.Response.Header = nil, nil, nil
+	it.hdrs = e.internHeaders(it.hdrs)
+	return it
+}
+
+// maxInternedHeaderSets bounds the table of shared header sets: API responses
+// that all differ (request ids, etags) would otherwise make the table as big
+// as the index it is meant to shrink.
+const maxInternedHeaderSets = 4096
+
+// internHeaders returns a shared copy of hs when an identical header set was
+// seen before, so that thousands of responses with the same headers hold one
+// set. hs must not be modified afterwards.
+func (e *Engine) internHeaders(hs []hdr) []hdr {
+	if len(hs) == 0 {
+		return hs
+	}
+	var kb [256]byte
+	k := kb[:0]
+	for _, h := range hs {
+		k = append(k, h.key...)
+		k = append(k, 0)
+		for _, v := range h.vals {
+			k = append(k, v...)
+			k = append(k, 0)
+		}
+		k = append(k, 1)
+	}
+	e.internMu.Lock()
+	defer e.internMu.Unlock()
+	if shared, ok := e.interned[string(k)]; ok {
+		return shared
+	}
+	if len(e.interned) < maxInternedHeaderSets {
+		if e.interned == nil {
+			e.interned = make(map[string][]hdr)
+		}
+		e.interned[string(k)] = hs
+	}
+	return hs
+}
+
+// newItem builds the item for ex without changing it (lazy: the item holds a
+// copy without bodies).
 func newItem(ex *model.Exchange, lazy bool) *item {
 	it := &item{
 		status: ex.Response.Status,
@@ -346,8 +420,13 @@ func (e *Engine) lookup(r *http.Request, body []byte, m *Match) bool {
 	stripe.level[levelOf(m.Level)].Add(1)
 	if e.cfg.ampOn {
 		e.amplify(m)
-		if m.Injected {
+		switch {
+		case !m.Injected:
+		case m.Synthetic || (m.it != nil && m.it.isErr):
 			stripe.injected.Add(1)
+		default:
+			// An error swapped for a recorded success: nothing was injected.
+			stripe.suppressed.Add(1)
 		}
 	}
 	return true

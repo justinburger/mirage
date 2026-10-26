@@ -151,17 +151,25 @@ function modeSummary(c) {
 }
 
 // ---------------------------------------------------------------- detail
-function targetFn(job) {
-  const c = job.config;
+/**
+ * The target arrival rate at `sec` seconds into a run, or undefined while it is
+ * not known. Rate mode follows its configuration. Timeline mode has no single
+ * configured rate (it follows the recorded shape), so the server's running
+ * average, summary.target_rps, stands in; it is empty until the first second
+ * has been scheduled. `getJob` returns the job as it is now, because the page
+ * outlives the object it was opened with.
+ */
+function targetFn(getJob) {
+  const c = getJob().config;
   if (c.mode === 'rate') {
     if (c.stages && c.stages.length) {
       const st = c.stages.map((s) => ({ d: durMs(s.duration) / 1000, rate: s.rate, hold: !!s.hold }));
       // A stage ramps linearly from the previous rate, or with hold steps straight to its rate.
       return (sec) => { let acc = 0, prev = 0; for (const s of st) { if (sec <= acc + s.d) return s.hold ? s.rate : prev + (s.rate - prev) * ((sec - acc) / s.d); acc += s.d; prev = s.rate; } return prev; };
     }
-    return () => c.rate || 0;
+    return () => c.rate || undefined;
   }
-  return () => (job.summary && job.summary.target_rps) || 0;
+  return () => { const j = getJob(); const t = j.summary && j.summary.target_rps; return t > 0 ? t : undefined; };
 }
 
 const LAT_ROWS = [['min', 'Min'], ['mean', 'Mean'], ['p50', 'p50'], ['p90', 'p90'], ['p95', 'p95'], ['p99', 'p99'], ['p999', 'p99.9'], ['max', 'Max']];
@@ -300,8 +308,9 @@ export async function detail(ctx) {
   }
 
   // ---- charts
-  const startedMs = job.started_at ? Date.parse(job.started_at) : 0;
-  const tfn = targetFn(job);
+  // Both follow the job: a pending job has no start yet, and "Run again" gives it a new one.
+  let startedMs = job.started_at ? Date.parse(job.started_at) : 0;
+  const tfn = targetFn(() => job);
   const showTarget = job.config.mode !== 'max';
   const mk = (title, series, yFormat, tipFormat) => new TimeChart({ title, series, windowMs: null, xMode: 'elapsed', xBase: startedMs, yFormat, tipFormat, height: 190, gapMs: 15000 });
   const cRps = mk('Achieved vs target rate', [{ key: 'rps', label: 'achieved', color: 'c1', area: true }, ...(showTarget ? [{ key: 'target', label: 'target', color: 'c5', dash: [6, 4], width: 1.5 }] : [])], fmtRate, (v) => `${fmtCompact(v)} /s`);
@@ -312,10 +321,36 @@ export async function detail(ctx) {
   const allCharts = [cRps, cLat, cErr, cIn];
   ctx.onCleanup(() => allCharts.forEach((c) => c.destroy()));
   chartsHost.appendChild(h('div', { class: 'charts-2' }, card({ body: cRps.el }), card({ body: cLat.el }), card({ body: cErr.el }), card({ body: cIn.el })));
-  const rowOf = (pt) => { const r = pointToRow(pt); r.target = tfn((r.t - startedMs) / 1000); return r; };
+  const stamp = (r) => { r.target = tfn((r.t - startedMs) / 1000); return r; };
+  const rowOf = (pt) => stamp(pointToRow(pt));
   function setChartRows(points) {
     const rows = points.map(rowOf);
     allCharts.forEach((c) => c.setRows(rows));
+  }
+  // Rows drawn before the target was known carry none: stamp them again once it is.
+  let targetStamped = tfn(0) !== undefined;
+  function restampRows() {
+    const rows = getRows(name).map((r) => stamp({ ...r }));
+    allCharts.forEach((c) => c.setRows(rows));
+  }
+  function syncStart() {
+    startedMs = job.started_at ? Date.parse(job.started_at) : 0;
+    allCharts.forEach((c) => { c.o.xBase = startedMs; });
+  }
+
+  // While a run is live the legends read its latest second. Once it is over
+  // they read the whole run, like the cards above: the last second of a run is
+  // a partial bucket (a few requests, the tail of the errors), not the result.
+  function paintLegends() {
+    const s = job.summary;
+    if (!(DONE(job.status) && s && s.completed > 0)) { allCharts.forEach((c) => c.setLegendValues(null)); return; }
+    const secs = durMs(s.elapsed) / 1000;
+    const per = (n) => `${fmtCompact(n)} /s`;
+    const note = 'whole run';
+    cRps.setLegendValues({ rps: per(s.achieved_rps), target: s.target_rps ? per(s.target_rps) : '' }, note);
+    cLat.setLegendValues({ p50: fmtMs(s.latency.p50), p95: fmtMs(s.latency.p95), p99: fmtMs(s.latency.p99), cp99: fmtMs(s.corrected_latency.p99) }, note);
+    cErr.setLegendValues({ errors: secs > 0 ? per(s.errors / secs) : '' }, note);
+    cIn.setLegendValues({ in_flight: `peak ${fmtInt(s.max_in_flight)}` }, note);
   }
 
   // ---- status codes + endpoints
@@ -374,7 +409,7 @@ export async function detail(ctx) {
 
   // ---- lifecycle
   function paintAll() {
-    paintHeader(); paintSaturated(); paintProgress(); paintStats(); paintLatency(); paintStatus(); paintEndpoints(); paintConfig();
+    paintHeader(); paintSaturated(); paintProgress(); paintStats(); paintLatency(); paintStatus(); paintEndpoints(); paintConfig(); paintLegends();
     const pending = job.status === 'pending';
     chartsHost.hidden = pending;
     epHost.hidden = !(job.summary && job.summary.completed);
@@ -383,6 +418,7 @@ export async function detail(ctx) {
     try { job = await api.replay(id); } catch (e) { toastError(e); return; }
     if (!ctx.isActive()) return;
     mergeHistory(name, job.series || []);
+    syncStart();
     if (resetCharts || DONE(job.status)) setChartRows(job.series || []);
     paintAll();
   }
@@ -411,6 +447,7 @@ export async function detail(ctx) {
     if (!cur) return;
     job = { ...job, status: cur.status, summary: cur.summary || job.summary };
     if (cur.status !== lastStatus) { lastStatus = cur.status; reload(true); return; }
+    if (!targetStamped && tfn(0) !== undefined) { targetStamped = true; restampRows(); }
     paintSaturated(); paintProgress(); paintStats(); paintLatency(); paintStatus(); paintEndpoints();
     if (job.status === 'running') paintHeader();
   });
@@ -482,10 +519,12 @@ function summaryCompare(ja, jb) {
   const A = ja.summary, B = jb.summary;
   const rows = [];
   const add = (label, a, b, fmt, better, o = {}) => rows.push({ label, a, b, fmt, better, ...o });
+  // A metric a run did not measure is not 0: say so instead of showing 0 as an improvement.
+  const NA = h('span', { class: 'muted', title: 'Not measured: compare_status was off for this run' }, 'n/a');
   add('Achieved rate', A.achieved_rps, B.achieved_rps, (v) => `${fmtRate(v)} /s`, BETTER_HIGH);
   add('Target rate', A.target_rps, B.target_rps, (v) => (v ? `${fmtRate(v)} /s` : 'max'), null);
   add('Error rate', A.error_rate, B.error_rate, fmtPct, BETTER_LOW);
-  add('Status mismatches', A.mismatches, B.mismatches, fmtInt, BETTER_LOW);
+  add('Status mismatches', ja.config.compare_status ? A.mismatches : null, jb.config.compare_status ? B.mismatches : null, fmtInt, BETTER_LOW);
   add('Failed (no response)', A.failed, B.failed, fmtInt, BETTER_LOW);
   add('Timeouts', A.timeouts, B.timeouts, fmtInt, BETTER_LOW);
   rows.push({ section: 'Service time' });
@@ -502,7 +541,7 @@ function summaryCompare(ja, jb) {
     h('thead', null, h('tr', null, h('th', null, 'Metric'), h('th', { class: 'num' }, 'A'), h('th', { class: 'num' }, 'B'), h('th', { class: 'num' }, 'Change (B vs A)'))),
     h('tbody', null, rows.map((r) => (r.section
       ? h('tr', null, h('td', { colspan: 4, style: 'padding-top:14px;font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-3);font-weight:650' }, r.section))
-      : h('tr', null, h('td', null, r.label), h('td', { class: 'num' }, r.fmt(r.a)), h('td', { class: 'num', style: 'font-weight:600' }, r.fmt(r.b)), deltaCell(r.a, r.b, r.better, r.fmt))))));
+      : h('tr', null, h('td', null, r.label), h('td', { class: 'num' }, r.a == null ? NA.cloneNode(true) : r.fmt(r.a)), h('td', { class: 'num', style: 'font-weight:600' }, r.b == null ? NA.cloneNode(true) : r.fmt(r.b)), deltaCell(r.a, r.b, r.better, r.fmt))))));
   return card({
     title: 'Summary',
     subtitle: h('span', null, h('a', { href: `#/replays/${encodeURIComponent(ja.id)}` }, ja.name), '  vs  ', h('a', { href: `#/replays/${encodeURIComponent(jb.id)}` }, jb.name)),
@@ -511,15 +550,20 @@ function summaryCompare(ja, jb) {
 }
 
 function configDiff(ja, jb) {
-  const keys = ['recording_id', 'target', 'mode', 'speed', 'max_gap', 'rate', 'stages', 'amplify', 'error_amplification', 'concurrency', 'duration', 'loop', 'max_requests', 'timeout', 'include', 'exclude', 'host_header', 'insecure_skip_verify', 'profile_id', 'vary_clones', 'compare_status'];
+  const keys = ['recording_id', 'target', 'mode', 'speed', 'max_gap', 'rate', 'stages', 'amplify', 'error_amplification', 'concurrency', 'duration', 'loop', 'max_requests', 'timeout', 'include', 'exclude', 'set_headers', 'remove_headers', 'host_header', 'insecure_skip_verify', 'profile_id', 'vary_clones', 'compare_status', 'seed'];
   const fmtV = (v) => (v === undefined || v === '' ? DASH : typeof v === 'object' ? JSON.stringify(v) : String(v));
   const diffs = keys.filter((k) => JSON.stringify(ja.config[k]) !== JSON.stringify(jb.config[k]));
+  // The API hides the values of sensitive set_headers, so two different secrets look the same here.
+  const hidesSecrets = [ja, jb].some((j) => Object.values(j.config.set_headers || {}).some((v) => v === '***'));
+  const secretNote = hidesSecrets ? h('p', { class: 'muted', style: 'font-size:12.5px;margin-top:8px' }, 'Values of secret headers are hidden by the API (***), so a changed secret does not show up here.') : null;
   return card({
     title: 'What changed between the runs',
     body: diffs.length
-      ? h('table', { class: 'table table-dense' }, h('thead', null, h('tr', null, h('th', null, 'Setting'), h('th', null, 'A'), h('th', null, 'B'))),
-        h('tbody', null, diffs.map((k) => h('tr', null, h('td', null, h('code', null, k)), h('td', { class: 'mono wrap-any' }, fmtV(ja.config[k])), h('td', { class: 'mono wrap-any' }, fmtV(jb.config[k]))))))
-      : h('p', { class: 'muted' }, 'The two runs used identical settings.'),
+      ? h('div', null,
+        h('table', { class: 'table table-dense' }, h('thead', null, h('tr', null, h('th', null, 'Setting'), h('th', null, 'A'), h('th', null, 'B'))),
+          h('tbody', null, diffs.map((k) => h('tr', null, h('td', null, h('code', null, k)), h('td', { class: 'mono wrap-any' }, fmtV(ja.config[k])), h('td', { class: 'mono wrap-any' }, fmtV(jb.config[k])))))),
+        secretNote)
+      : h('div', null, h('p', { class: 'muted' }, 'The two runs used identical settings.'), secretNote),
   });
 }
 
@@ -536,18 +580,29 @@ function chartCompare(ja, jb, store) {
   for (let s = 0; s <= max; s++) {
     const a = ma.get(s), b = mb.get(s);
     if (!a && !b) continue;
-    rows.push({ t: s * 1000, a_rps: a ? a.rps : undefined, b_rps: b ? b.rps : undefined, a_p95: a ? a.p95 : undefined, b_p95: b ? b.p95 : undefined, a_p99: a ? a.p99 : undefined, b_p99: b ? b.p99 : undefined, a_err: a ? a.errors : undefined, b_err: b ? b.errors : undefined });
+    rows.push({
+      t: s * 1000, a_rps: a ? a.rps : undefined, b_rps: b ? b.rps : undefined,
+      a_p95: a ? a.p95 : undefined, b_p95: b ? b.p95 : undefined, a_p99: a ? a.p99 : undefined, b_p99: b ? b.p99 : undefined,
+      // corrected = from the intended send time; this is what shows queueing on the sender or the target
+      a_cp95: a ? a.cp95 : undefined, b_cp95: b ? b.cp95 : undefined, a_cp99: a ? a.cp99 : undefined, b_cp99: b ? b.cp99 : undefined,
+      a_err: a ? a.errors : undefined, b_err: b ? b.errors : undefined,
+    });
   }
-  const mk = (title, ka, kb, yf, tf) => {
-    const c = new TimeChart({ title, series: [{ key: ka, label: 'A', color: 'c1' }, { key: kb, label: 'B', color: 'c3' }], windowMs: null, xMode: 'elapsed', xBase: 0, yFormat: yf, tipFormat: tf, height: 190, gapMs: 15000 });
+  // `corrected`: [A key, B key] drawn dashed in the same colors, so a run that
+  // looked fine by service time but queued shows it.
+  const mk = (title, ka, kb, yf, tf, corrected) => {
+    const series = [{ key: ka, label: 'A', color: 'c1' }, { key: kb, label: 'B', color: 'c3' }];
+    if (corrected) series.push({ key: corrected[0], label: 'A corrected', color: 'c1', dash: [6, 4], width: 1.5 }, { key: corrected[1], label: 'B corrected', color: 'c3', dash: [6, 4], width: 1.5 });
+    const c = new TimeChart({ title, series, windowMs: null, xMode: 'elapsed', xBase: 0, yFormat: yf, tipFormat: tf, height: 190, gapMs: 15000 });
+    if (corrected) c.setHint('dashed = corrected, from the intended send time');
     c.setRows(rows);
     store.push(c);
     return card({ body: c.el });
   };
   return h('div', { class: 'charts-2' },
     mk('Achieved rate', 'a_rps', 'b_rps', fmtRate, (v) => `${fmtCompact(v)} /s`),
-    mk('Latency p95', 'a_p95', 'b_p95', fmtMsShort, fmtMs),
-    mk('Latency p99', 'a_p99', 'b_p99', fmtMsShort, fmtMs),
+    mk('Latency p95', 'a_p95', 'b_p95', fmtMsShort, fmtMs, ['a_cp95', 'b_cp95']),
+    mk('Latency p99', 'a_p99', 'b_p99', fmtMsShort, fmtMs, ['a_cp99', 'b_cp99']),
     mk('Errors per second', 'a_err', 'b_err', fmtCompact, (v) => `${fmtCompact(v)} /s`));
 }
 

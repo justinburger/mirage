@@ -221,7 +221,7 @@ func TestBuiltinProfileEveryRuleWorks(t *testing.T) {
 	// Every rule is enabled for both sides and reached the compiled form.
 	for _, sd := range []*sideRules{&e.c.req, &e.c.resp} {
 		got := map[model.RuleTarget]int{
-			model.TargetJSON: len(sd.json), model.TargetQuery: 0, model.TargetForm: 0,
+			model.TargetJSON: len(sd.json), model.TargetRegex: len(sd.regex), model.TargetQuery: 0, model.TargetForm: 0, model.TargetHeader: 0,
 		}
 		for _, rs := range sd.query {
 			got[model.TargetQuery] += len(rs)
@@ -229,7 +229,10 @@ func TestBuiltinProfileEveryRuleWorks(t *testing.T) {
 		for _, rs := range sd.form {
 			got[model.TargetForm] += len(rs)
 		}
-		for _, tg := range []model.RuleTarget{model.TargetJSON, model.TargetQuery, model.TargetForm} {
+		for _, rs := range sd.header {
+			got[model.TargetHeader] += len(rs)
+		}
+		for _, tg := range []model.RuleTarget{model.TargetJSON, model.TargetQuery, model.TargetForm, model.TargetHeader, model.TargetRegex} {
 			if got[tg] != counts[tg] {
 				t.Errorf("%s rules compiled: %d, profile has %d", tg, got[tg], counts[tg])
 			}
@@ -259,16 +262,31 @@ func TestBuiltinProfileEveryRuleWorks(t *testing.T) {
 		switch r.Target {
 		case model.TargetJSON:
 			key := strings.TrimPrefix(r.Selector, "$..")
+			// The sibling filter form: the rule only applies next to one of
+			// the listed members, and must leave the member alone without it.
+			sib := ""
+			if strings.HasPrefix(r.Selector, "$..[?") {
+				jp, err := parseJSONPath(r.Selector)
+				if err != nil {
+					t.Errorf("%s: %v", r.Name, err)
+					continue
+				}
+				key, sib = jp.steps[0].name, `,"`+jp.siblings[len(jp.siblings)-1]+`":"S"`
+				alone := anonResp(t, e, "application/json", `{"`+key+`":"`+val+`","other":1}`)
+				if !strings.Contains(alone, val) {
+					t.Errorf("%s: applied to a %q without any of its siblings: %s", r.Name, key, alone)
+				}
+			}
 			if key == r.Selector || key == "" {
 				t.Errorf("%s: unexpected selector %q", r.Name, r.Selector)
 				continue
 			}
 			for name, body := range map[string]string{
-				"root member":      `{"` + key + `":"` + val + `"}`,
-				"nested member":    `{"a":{"b":[{"` + key + `":"` + val + `","other":"keep"}]}}`,
-				"beside siblings":  `{"id":7,"` + key + `":"` + val + `","note":"hello"}`,
-				"inside an array":  `[{"x":1},{"` + key + `":"` + val + `"}]`,
-				"after a big text": `{"pad":"` + strings.Repeat("p", 300) + `","` + key + `":"` + val + `"}`,
+				"root member":      `{"` + key + `":"` + val + `"` + sib + `}`,
+				"nested member":    `{"a":{"b":[{"` + key + `":"` + val + `","other":"keep"` + sib + `}]}}`,
+				"beside siblings":  `{"id":7,"` + key + `":"` + val + `","note":"hello"` + sib + `}`,
+				"inside an array":  `[{"x":1},{"` + key + `":"` + val + `"` + sib + `}]`,
+				"after a big text": `{"pad":"` + strings.Repeat("p", 300) + `","` + key + `":"` + val + `"` + sib + `}`,
 			} {
 				for side, anon := range map[string]func() string{
 					"request":  func() string { return string(anonReq(t, e, "application/json", body).Body) },
@@ -334,6 +352,25 @@ func TestBuiltinProfileEveryRuleWorks(t *testing.T) {
 				t.Errorf("%s: neighbours changed: %q", r.Name, req.RawQuery)
 			}
 			expect(t, r, q.Get(r.Selector))
+		case model.TargetHeader:
+			h := reqHeaders(t, e, http.Header{"X-Other": {"keep"}, r.Selector: {val}})
+			if h.Get("X-Other") != "keep" {
+				t.Errorf("%s: neighbours changed: %v", r.Name, h)
+			}
+			expect(t, r, h.Get(r.Selector))
+		case model.TargetRegex:
+			element := map[string]string{"def-regex-xml-secret": "password", "def-regex-xml-token": "token"}[r.ID]
+			if element == "" {
+				t.Errorf("%s: no sample for regex rule %s", r.Name, r.ID)
+				continue
+			}
+			out := anonResp(t, e, "application/xml", "<a><b>keep</b><"+element+">"+val+"</"+element+"></a>")
+			inner := strings.TrimSuffix(strings.TrimPrefix(out, "<a><b>keep</b><"+element+">"), "</"+element+"></a>")
+			if inner == out {
+				t.Errorf("%s: unexpected output %q", r.Name, out)
+				continue
+			}
+			expect(t, r, inner)
 		default:
 			t.Errorf("%s: unexpected target %s", r.Name, r.Target)
 		}

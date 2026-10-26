@@ -76,6 +76,9 @@ type Server struct {
 	AdminToken string `json:"admin_token,omitempty"` // bearer token for the admin API
 	LogLevel   string `json:"log_level,omitempty"`   // debug, info, warn, error
 	LogFormat  string `json:"log_format,omitempty"`  // text or json
+	// AllowedHosts are DNS names the admin API may be reached by when it has
+	// no admin token (IP addresses and localhost always work).
+	AllowedHosts []string `json:"allowed_hosts,omitempty"`
 }
 
 // RecordingConfig ensures a recording exists.

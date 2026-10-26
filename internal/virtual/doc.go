@@ -25,14 +25,26 @@
 // lists (and sequential cursors) follow (StartedAt, Seq) order, because Seq
 // is completion order, not arrival order. Template-level keys and endpoint
 // pools use the stored Exchange.Endpoint when non-empty (it was computed from
-// the raw path) and compute it with the Normalizer only otherwise.
+// the raw path) and compute it with the Normalizer only otherwise. A stored
+// endpoint that is not one of the Normalizer's own patterns may come from
+// another normalizer (HAR import, endpoint_patterns edited after recording),
+// so the exchange is also indexed under the Normalizer's template of its path;
+// a stored endpoint that is one of the Normalizer's patterns is authoritative.
 //
 // Ownership and immutability: Add takes ownership of the exchange it is
 // given (callers do not touch it afterwards; Build's exchanges come fresh
 // from the store). Indexed exchanges are immutable: Lookup and Respond never
 // mutate ex.Header or ex.Body (Date, Content-Length and X-Mirage-* go to the
 // response header map only). The gzip cache is built at most once per
-// exchange (sync.Once). Add after Close is a no-op.
+// exchange (sync.Once). Add after Close is a no-op. An exchange that Build
+// already read from the store (ID not above the highest ID Build saw) is
+// ignored by Add, so a capture stored while the engine was being built is not
+// indexed twice.
+//
+// The index keeps a trimmed copy of each exchange: Match.Exchange has no
+// request headers, no request body and no response header map (the response
+// headers live in the item, shared between items that have identical sets).
+// The exchange passed to Add is not modified.
 //
 // Lookup is the hot path (target ≥ 50k lookups/s per core, no allocation
 // beyond key building). Avoid one global RWMutex: shard the index (e.g. 64
@@ -111,9 +123,10 @@
 //     goroutine sees a reproducible sequence.
 //   - Error amplification pools are per endpoint (the stored endpoint of the
 //     matched exchange) with atomic counters, so it costs no lock. Both
-//     directions (adding and removing errors) mark the Match Injected and count
-//     in Stats.Injected; X-Mirage-Injected: error is sent only when an error
-//     was injected. An injected synthetic 503 reuses the latency of the
+//     directions (adding and removing errors) mark the Match Injected;
+//     Stats.Injected counts only the injected errors (the responses that carry
+//     X-Mirage-Injected: error), the errors swapped for successes are counted
+//     by Engine.Suppressed. An injected synthetic 503 reuses the latency of the
 //     exchange that was matched.
 //   - Build asks the store only for what it needs: request bodies when the
 //     body is matched on, response bodies when they stay resident. With

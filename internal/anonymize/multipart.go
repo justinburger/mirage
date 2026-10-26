@@ -2,7 +2,10 @@ package anonymize
 
 import (
 	"bytes"
+	"encoding/base64"
+	"io"
 	"mime"
+	"mime/quotedprintable"
 	"strings"
 )
 
@@ -177,7 +180,8 @@ type partInfo struct {
 	name        string // Content-Disposition name
 	hasFilename bool   // Content-Disposition carries a filename: a file part
 	contentType string
-	encoded     bool // Content-Transfer-Encoding base64 or quoted-printable
+	encoded     bool   // Content-Transfer-Encoding base64 or quoted-printable
+	transfer    string // "base64" or "quoted-printable" when encoded
 }
 
 // parsePartHeaders reads the headers of a part (raw bytes up to and including
@@ -202,9 +206,9 @@ func parsePartHeaders(h []byte) partInfo {
 		case strings.EqualFold(key, "Content-Type"):
 			pi.contentType = val
 		case strings.EqualFold(key, "Content-Transfer-Encoding"):
-			switch strings.ToLower(val) {
+			switch v := strings.ToLower(val); v {
 			case "base64", "quoted-printable":
-				pi.encoded = true
+				pi.encoded, pi.transfer = true, v
 			}
 		}
 	}
@@ -258,12 +262,105 @@ func dispositionParams(v string) (name string, hasFilename bool) {
 	return name, hasFilename
 }
 
+// filePart anonymizes the body of a part that carries a filename or a
+// Content-Transfer-Encoding. A file is what it says it is, not what its
+// disposition says: a text, CSV, JSON or XML upload is the typical way a
+// customer export reaches an API, so the part is classified by its own
+// Content-Type and bytes like any other body and only genuinely binary
+// content (an image, a PDF, a zip, bytes that are not text) is opaque. A
+// base64 or quoted-printable part is decoded first and, if it changed,
+// encoded again; one that does not decode, or decodes to binary, is opaque.
+func (r *run) filePart(body []byte, info partInfo, cut bool, loc *locator) ([]byte, bool) {
+	switch info.transfer {
+	case "base64":
+		return r.base64Part(body, info.contentType, cut, loc)
+	case "quoted-printable":
+		return r.quotedPrintablePart(body, info.contentType, cut, loc)
+	}
+	return r.inspect(body, info.contentType, cut, loc)
+}
+
+// base64Part handles a part with Content-Transfer-Encoding base64. The
+// re-encoded text keeps the line length and line break the part used.
+func (r *run) base64Part(body []byte, ct string, cut bool, loc *locator) ([]byte, bool) {
+	raw := make([]byte, 0, len(body))
+	for _, c := range body {
+		if c != '\r' && c != '\n' && c != ' ' && c != '\t' {
+			raw = append(raw, c)
+		}
+	}
+	var tail []byte
+	if cut {
+		// A cut capture may end inside a four-character group.
+		n := len(raw) &^ 3
+		raw, tail = raw[:n], raw[n:]
+	}
+	dec := make([]byte, base64.StdEncoding.DecodedLen(len(raw)))
+	n, err := base64.StdEncoding.Decode(dec, raw)
+	if err != nil || n == 0 {
+		return r.opaque(body, loc)
+	}
+	dec = dec[:n]
+	if classifyMedia(mediaType(ct), dec, cut) == kindBinary {
+		return r.opaque(body, loc)
+	}
+	nb, changed := r.inspect(dec, ct, cut, loc)
+	if !changed {
+		return nil, false
+	}
+	width, nl := 0, ""
+	if i := bytes.IndexByte(body, '\n'); i >= 0 {
+		nl = "\n"
+		if i > 0 && body[i-1] == '\r' {
+			i--
+			nl = "\r\n"
+		}
+		width = i
+	}
+	enc := base64.StdEncoding.EncodeToString(nb)
+	var out []byte
+	if width <= 0 || width >= len(enc) {
+		out = append(out, enc...)
+	} else {
+		for len(enc) > 0 {
+			k := min(width, len(enc))
+			out = append(out, enc[:k]...)
+			enc = enc[k:]
+			if len(enc) > 0 {
+				out = append(out, nl...)
+			}
+		}
+	}
+	return append(out, tail...), true
+}
+
+// quotedPrintablePart handles a part with Content-Transfer-Encoding
+// quoted-printable. A cut capture may end inside an escape, so only a part
+// that decodes cleanly is inspected.
+func (r *run) quotedPrintablePart(body []byte, ct string, cut bool, loc *locator) ([]byte, bool) {
+	dec, err := io.ReadAll(quotedprintable.NewReader(bytes.NewReader(body)))
+	if err != nil || cut || len(dec) == 0 || classifyMedia(mediaType(ct), dec, false) == kindBinary {
+		return r.opaque(body, loc)
+	}
+	nb, changed := r.inspect(dec, ct, false, loc)
+	if !changed {
+		return nil, false
+	}
+	var buf bytes.Buffer
+	w := quotedprintable.NewWriter(&buf)
+	if _, err := w.Write(nb); err != nil || w.Close() != nil {
+		return r.opaque(body, loc)
+	}
+	return buf.Bytes(), true
+}
+
 // multipartBody anonymizes a multipart body part by part. Text parts (no
 // filename, a textual or missing Content-Type) are processed like the rest of
 // the engine would process a value or body of that type: a form rule whose
 // selector is the part name wins, otherwise the part is handled by its content
-// type (JSON, form, text with regex rules and detectors). File parts and
-// binary parts are opaque: kept, or filled when OpaqueBodies is "fill". The
+// type (JSON, form, text with regex rules and detectors). File parts are
+// handled the same way by their own Content-Type and bytes (see filePart);
+// only binary parts are opaque: kept, or filled when OpaqueBodies is "fill". The
 // boundary, delimiters and part headers are written back byte for byte; only
 // part bodies change, and a part removed by a `remove` form rule disappears
 // with its delimiter and headers. A malformed multipart body is handled by
@@ -310,7 +407,7 @@ func (r *run) multipartBody(b []byte, ct string, truncated bool, loc *locator) (
 		var changed, drop bool
 		switch {
 		case info.hasFilename || info.encoded:
-			nb, changed = r.opaque(body, &l)
+			nb, changed = r.filePart(body, info, cut, &l)
 		default:
 			sel := r.sd.form[info.name]
 			switch rl := removes(sel); {

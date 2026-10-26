@@ -91,15 +91,21 @@ const numShards = 64
 // Engine is a virtualized service backed by one recording. It is safe for
 // concurrent use; Add may run while requests are being served.
 type Engine struct {
-	st   store.Store
-	opts Options
-	cfg  config
-	seed maphash.Seed
-	norm *pathnorm.Normalizer
-	rng  rng
+	st       store.Store
+	opts     Options
+	cfg      config
+	seed     maphash.Seed
+	norm     *pathnorm.Normalizer
+	patterns map[string]struct{} // norm's endpoint_patterns
+	rng      rng
 
 	shards [numShards]shard
 	stats  [numShards]counters
+
+	// builtMaxID is the highest exchange ID Build read from the store. Add
+	// ignores an exchange up to it: the build already indexed it. Set by Build
+	// before the engine is shared.
+	builtMaxID int64
 
 	count    atomic.Int64 // exchanges indexed (Len)
 	resident atomic.Int64 // request+response body bytes held in memory
@@ -108,6 +114,9 @@ type Engine struct {
 
 	epMu sync.Mutex
 	eps  map[string]*epool // endpoint → error-rate pools
+
+	internMu sync.Mutex
+	interned map[string][]hdr // shared response header sets (see internHeaders)
 
 	cache *bodyCache // lazy bodies; nil without a store
 	synth *bodyEntry // body of the synthetic 503
@@ -168,6 +177,7 @@ func Build(ctx context.Context, st store.Store, opts Options) (*Engine, error) {
 				return err
 			}
 		}
+		e.builtMaxID = max(e.builtMaxID, ex.ID)
 		e.insert(ex, true)
 		return nil
 	})
@@ -207,6 +217,10 @@ func NewEngine(st store.Store, opts Options) *Engine {
 		now:  time.Now,
 	}
 	e.rng.init(opts.Seed)
+	e.patterns = make(map[string]struct{})
+	for _, p := range e.norm.Patterns() {
+		e.patterns[p] = struct{}{}
+	}
 	e.cfg = newConfig(opts, svc)
 	for i := range e.shards {
 		e.shards[i].m = make(map[string]*entry)
@@ -263,8 +277,15 @@ func (e *Engine) Lazy() bool { return e.lazy }
 
 // Add indexes one exchange (hybrid mode, tests). The engine takes ownership
 // of ex: the caller must not touch it afterwards. Add after Close is a no-op.
+//
+// An exchange that Build already read from the store (its ID is not above the
+// highest ID Build saw) is ignored, so a capture that was stored while the
+// engine was being built is not indexed twice.
 func (e *Engine) Add(ex *model.Exchange) {
 	if ex == nil || e.closed.Load() {
+		return
+	}
+	if ex.ID != 0 && ex.ID <= e.builtMaxID {
 		return
 	}
 	e.insert(ex, false)
@@ -295,8 +316,20 @@ func (e *Engine) Serve(w http.ResponseWriter, r *http.Request, body []byte) bool
 // for error rates although they are never served.
 func (e *Engine) Len() int { return int(e.count.Load()) }
 
+// Suppressed returns how many responses error amplification below 1 replaced
+// by a recorded success. They are not part of Stats.Injected, which counts the
+// errors that were injected (the responses that carry X-Mirage-Injected).
+func (e *Engine) Suppressed() int64 {
+	var n int64
+	for i := range e.stats {
+		n += e.stats[i].suppressed.Load()
+	}
+	return n
+}
+
 // Stats returns activity counters (Hits, Misses, Injected, Indexed,
-// ByLevel). ByLevel always has the keys "exact", "path" and "template".
+// ByLevel). Injected counts injected errors only (see Suppressed). ByLevel
+// always has the keys "exact", "path" and "template".
 func (e *Engine) Stats() model.VirtualStats {
 	var hits, misses, injected int64
 	var lv [3]int64
