@@ -190,7 +190,8 @@ func TestDecodeErrors(t *testing.T) {
 		{"log is string", `{"log":"x"}`, nil, "must be an object"},
 		{"entries is object", `{"log":{"entries":{}}}`, nil, "log.entries"},
 		{"truncated", `{"log":{"version":"1.2","entries":[{"request":{"method":"GET"`, nil, ""},
-		{"truncated after entries", `{"log":{"entries":[`, nil, "unexpected end"},
+		// Go 1.26 says "unexpected EOF", Go 1.27 "unexpected end of JSON input".
+		{"truncated after entries", `{"log":{"entries":[`, nil, "unexpected"},
 		{"bad entry reports index", `{"log":{"entries":[{"request":{"method":"GET","url":"http://x/"}},{"startedDateTime":"yesterday"}]}}`, nil, "entry 1"},
 		{"bad size", `{"log":{"entries":[{"request":{"headersSize":"big"}}]}}`, nil, "invalid size"},
 		{"startedDateTime not string", `{"log":{"entries":[{"startedDateTime":12345}]}}`, nil, "expected a string"},

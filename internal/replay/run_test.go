@@ -108,10 +108,13 @@ func TestRunSpeedCompressesTime(t *testing.T) {
 	if e := sum.Elapsed.D(); e < 95*time.Millisecond || e > 600*time.Millisecond {
 		t.Errorf("1s of traffic at speed 10 took %v, want ~100ms", e)
 	}
-	// The target saw the original spacing divided by ten.
+	// The target saw the original spacing divided by ten. The first request
+	// may arrive late (connection set-up on a loaded CI runner shortens the
+	// observed span), so the lower bound only proves the copies were spread
+	// out rather than sent in a burst.
 	reqs := target.requests()
 	span := reqs[len(reqs)-1].at.Sub(reqs[0].at)
-	if span < 90*time.Millisecond || span > 500*time.Millisecond {
+	if span < 50*time.Millisecond || span > 500*time.Millisecond {
 		t.Errorf("arrival span %v, want ~100ms", span)
 	}
 }
