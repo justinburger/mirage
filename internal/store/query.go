@@ -85,7 +85,7 @@ func (s *SQLite) ListExchanges(ctx context.Context, recordingID string, q model.
 	)
 	err := s.read(ctx, func(tx *sql.Tx) error {
 		// One snapshot for the existence check, the count and the page.
-		err := tx.QueryRowContext(ctx, `SELECT exchange_count FROM recordings WHERE id = ?`, recordingID).Scan(&total)
+		err := tx.QueryRowContext(ctx, `SELECT exchange_count FROM recordings WHERE id = ? AND deleted_at IS NULL`, recordingID).Scan(&total)
 		if errors.Is(err, sql.ErrNoRows) {
 			return notFound("recording", recordingID)
 		}
@@ -163,7 +163,7 @@ func (s *SQLite) IterateExchanges(ctx context.Context, recordingID string, opts 
 	var upTo int64
 	err := s.rdb.QueryRowContext(ctx, `
 		SELECT COALESCE((SELECT MAX(seq) FROM exchanges WHERE recording_id = r.id), 0)
-		FROM recordings r WHERE r.id = ?`, recordingID).Scan(&upTo)
+		FROM recordings r WHERE r.id = ? AND r.deleted_at IS NULL`, recordingID).Scan(&upTo)
 	if errors.Is(err, sql.ErrNoRows) {
 		return notFound("recording", recordingID)
 	}

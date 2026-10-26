@@ -67,6 +67,21 @@ func (k *keyer) digest(domain, value string) [sha256.Size]byte {
 	return out
 }
 
+// digestBytes is digest for a byte slice: the same HMAC as digest(domain,
+// string(value)) without copying a possibly large body into a string.
+func (k *keyer) digestBytes(domain string, value []byte) [sha256.Size]byte {
+	m := k.pool.Get().(*macState)
+	m.h.Reset()
+	n := copy(m.buf[:], domain)
+	m.buf[n] = 0
+	m.h.Write(m.buf[:n+1])
+	m.h.Write(value)
+	m.h.Sum(m.sum[:0])
+	out := m.sum
+	k.pool.Put(m)
+	return out
+}
+
 // hashToken returns the deterministic token for v: "h_" followed by 16 hex
 // characters. The token is URL-safe, so it can replace path segments, query
 // values and cookie values without escaping.
@@ -93,18 +108,48 @@ type prng struct {
 
 func newPRNG(seed [sha256.Size]byte) prng { return prng{state: seed} }
 
+// refill replaces the used-up state with the hash of the previous state and a
+// counter.
+func (p *prng) refill() {
+	var buf [sha256.Size + 8]byte
+	copy(buf[:], p.state[:])
+	binary.BigEndian.PutUint64(buf[sha256.Size:], p.ctr)
+	p.ctr++
+	p.state = sha256.Sum256(buf[:])
+	p.pos = 0
+}
+
 func (p *prng) byte() byte {
 	if p.pos == len(p.state) {
-		var buf [sha256.Size + 8]byte
-		copy(buf[:], p.state[:])
-		binary.BigEndian.PutUint64(buf[sha256.Size:], p.ctr)
-		p.ctr++
-		p.state = sha256.Sum256(buf[:])
-		p.pos = 0
+		p.refill()
 	}
 	b := p.state[p.pos]
 	p.pos++
 	return b
+}
+
+// fill writes the next len(dst) bytes of the stream to dst, exactly the bytes
+// byte would return one at a time, but a block at a time.
+func (p *prng) fill(dst []byte) {
+	for len(dst) > 0 {
+		if p.pos == len(p.state) {
+			p.refill()
+		}
+		n := copy(dst, p.state[p.pos:])
+		p.pos += n
+		dst = dst[n:]
+	}
+}
+
+// opaqueFill returns len(b) bytes of deterministic filler for the opaque body
+// b. The stream is seeded by the HMAC of b itself, so equal bodies get equal
+// filler, different bodies get different filler, and the filler reveals
+// nothing about b without the key.
+func (k *keyer) opaqueFill(b []byte) []byte {
+	p := newPRNG(k.digestBytes("opaque", b))
+	out := make([]byte, len(b))
+	p.fill(out)
+	return out
 }
 
 // intn returns a value in [0, n) for 0 < n <= 1<<24 with negligible bias.

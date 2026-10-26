@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/justinburger/mirage/internal/model"
@@ -105,20 +104,4 @@ func isUniqueViolation(err error) bool {
 		return true
 	}
 	return false
-}
-
-// violatedColumn extracts "table.column" from a UNIQUE failure message such
-// as "constraint failed: UNIQUE constraint failed: services.name (2067)".
-func violatedColumn(err error) string {
-	const marker = "UNIQUE constraint failed: "
-	msg := err.Error()
-	i := strings.Index(msg, marker)
-	if i < 0 {
-		return ""
-	}
-	col := msg[i+len(marker):]
-	if j := strings.IndexAny(col, " ("); j >= 0 {
-		col = col[:j]
-	}
-	return col
 }

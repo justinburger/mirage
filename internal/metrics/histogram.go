@@ -378,6 +378,23 @@ func (s *sparseCounts) add(idx int, n uint64) {
 	s.total += n
 }
 
+// addDiff appends every bucket whose count in cur differs from prev, with the
+// difference, and advances prev to cur. A bucket that went down (a Reset raced
+// the scan) is resynchronised but not added.
+func (s *sparseCounts) addDiff(cur *[numBuckets]atomic.Uint64, prev *[numBuckets]uint64) {
+	for i := range cur {
+		v := cur[i].Load()
+		p := prev[i]
+		if v == p {
+			continue
+		}
+		prev[i] = v
+		if v > p {
+			s.add(i, v-p)
+		}
+	}
+}
+
 // walk is walkDense for a sparse bucket list; qs must be ascending.
 func (s *sparseCounts) walk(qs []float64, out []int64) {
 	var buf [8]uint64

@@ -116,6 +116,7 @@ func withRespBody(b []byte) exOpt {
 	return func(e *model.Exchange) { e.Response.Body, e.Response.BodySize = b, int64(len(b)) }
 }
 func withStart(t time.Time) exOpt { return func(e *model.Exchange) { e.StartedAt = t } }
+func withAnonymized(a bool) exOpt { return func(e *model.Exchange) { e.Anonymized = a } }
 
 // appendN appends n default exchanges to a recording and returns them.
 func appendN(t testing.TB, s *SQLite, rec string, n int, opts ...exOpt) []*model.Exchange {

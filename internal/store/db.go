@@ -63,6 +63,21 @@ type SQLite struct {
 	// now is the clock; tests replace it.
 	now func() time.Time
 
+	// deleteChunk is the most exchange rows one DeleteRecording transaction
+	// removes; afterPurgeChunk, when set (tests only), runs after each chunk
+	// with the number of rows it removed.
+	deleteChunk     int
+	afterPurgeChunk func(recordingID string, rows int)
+
+	// bg runs purges that outlive the call that started them: the remainder of
+	// a DeleteRecording whose context ended, and recordings found half deleted
+	// at Open. Close cancels bgCtx and waits for bgWG.
+	bgCtx    context.Context
+	bgCancel context.CancelFunc
+	bgMu     sync.Mutex // guards bgClosed against bgWG.Add racing bgWG.Wait
+	bgClosed bool
+	bgWG     sync.WaitGroup
+
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -73,12 +88,14 @@ type SQLite struct {
 // readable by its owner only because it holds anonymization secrets and
 // captured traffic. The special path ":memory:" opens a private in-memory
 // database: every Open returns an independent database that disappears on
-// Close.
+// Close. A DeleteRecording that an earlier process left unfinished is
+// completed in the background.
 func Open(path string) (*SQLite, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("store: database path is empty")
 	}
-	s := &SQLite{path: path, mem: path == MemoryPath, now: time.Now}
+	s := &SQLite{path: path, mem: path == MemoryPath, now: time.Now, deleteChunk: deleteChunkRows}
+	s.bgCtx, s.bgCancel = context.WithCancel(context.Background())
 
 	var wdsn, rdsn string
 	if s.mem {
@@ -169,7 +186,7 @@ func (s *SQLite) connect(wdsn, rdsn string) (err error) {
 	if s.getExchange, err = s.rdb.PrepareContext(ctx, getExchangeSQL); err != nil {
 		return fmt.Errorf("store: prepare get: %w", err)
 	}
-	return nil
+	return s.resumePurges(ctx)
 }
 
 func (s *SQLite) describe() string {
@@ -184,6 +201,14 @@ func (s *SQLite) describe() string {
 // finish; new ones fail.
 func (s *SQLite) Close() error {
 	s.closeOnce.Do(func() {
+		// Stop background purges first; whatever they did not finish is
+		// resumed by the next Open.
+		s.bgMu.Lock()
+		s.bgClosed = true
+		s.bgMu.Unlock()
+		s.bgCancel()
+		s.bgWG.Wait()
+
 		var errs []error
 		if s.insertExchange != nil {
 			errs = append(errs, s.insertExchange.Close())

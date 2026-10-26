@@ -17,6 +17,10 @@ var benchPaths = []struct{ name, path string }{
 	{"email", "/api/v1/users/jane.doe@example.com/prefs"},
 	{"trailing_slash_query", "/api/v1/users/42/?expand=orders&limit=50"},
 	{"deep", "/a/b/c/d/e/f/g/h/42/i/j/k/l/m/n/o/p/q/r/s/t/u/v/w/x/y/z"},
+	// Added with hash tokens and escaped-path classification.
+	{"hash_token", "/api/v1/users/h_3f9a1c0b7d2e4a51/orders"},
+	{"escaped_email", "/api/v1/users/jane.doe%40example.com/prefs"},
+	{"escaped_literal", "/files/a%20b/report%20final.txt"},
 }
 
 func BenchmarkTemplate(b *testing.B) {
@@ -78,7 +82,10 @@ func BenchmarkTemplateWithPatterns(b *testing.B) {
 }
 
 func BenchmarkClassify(b *testing.B) {
-	for _, seg := range []string{"users", "42", "123e4567-e89b-12d3-a456-426614174000", "abcdefghij1234567890", "jane@example.com", "2024-01-31"} {
+	for _, seg := range []string{
+		"users", "42", "123e4567-e89b-12d3-a456-426614174000", "abcdefghij1234567890", "jane@example.com", "2024-01-31",
+		"h_3f9a1c0b7d2e4a51", "jane%40example.com", "%31%32%33",
+	} {
 		b.Run(seg, func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {

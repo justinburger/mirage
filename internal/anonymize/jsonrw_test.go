@@ -3,7 +3,10 @@ package anonymize
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net/http"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -629,4 +632,147 @@ func TestJSONEveryPrefix(t *testing.T) {
 			t.Fatalf("prefix %d changed:\n got  %q\n want %q", i, got, doc[:i])
 		}
 	}
+}
+
+// slowJSONMatcher returns a copy of e that matches every json rule through
+// the automaton, without the member-name index for $..name rules.
+func slowJSONMatcher(e *Engine) *Engine {
+	c := *e.c
+	c.req.keyDescent, c.resp.keyDescent = nil, nil
+	s := *e
+	s.c = &c
+	return &s
+}
+
+func TestKeyDescentRulesCompileToTheIndex(t *testing.T) {
+	e := mustEngine(t, bareProfile(
+		rl(model.TargetJSON, "$..email", model.StrategyHash),
+		rl(model.TargetJSON, "$..['odd key']", model.StrategyHash),
+		rl(model.TargetJSON, "$.user.email", model.StrategyHash),
+		rl(model.TargetJSON, "$..user.email", model.StrategyHash),
+		rl(model.TargetJSON, "$..*", model.StrategyHash),
+		rl(model.TargetJSON, "$..[0]", model.StrategyHash),
+		rl(model.TargetJSON, "$.email", model.StrategyHash),
+		withScope(rl(model.TargetJSON, "$..resp", model.StrategyHash), model.ScopeResponse),
+	))
+	wantReq := map[string][]int32{"email": {0}, "odd key": {1}}
+	if !reflect.DeepEqual(e.c.req.keyDescent, wantReq) {
+		t.Errorf("request index = %v, want %v", e.c.req.keyDescent, wantReq)
+	}
+	if got := e.c.resp.keyDescent["resp"]; !reflect.DeepEqual(got, []int32{int32(len(e.c.resp.json) - 1)}) {
+		t.Errorf("response index for resp = %v (json rules %d)", got, len(e.c.resp.json))
+	}
+	var keyOnly []string
+	for _, r := range e.c.req.json {
+		if r.keyOnly {
+			keyOnly = append(keyOnly, r.jp.src)
+		}
+	}
+	if !reflect.DeepEqual(keyOnly, []string{"$..email", "$..['odd key']"}) {
+		t.Errorf("keyOnly rules = %v", keyOnly)
+	}
+	if mustEngine(t, bareProfile(rl(model.TargetJSON, "$.a.b", model.StrategyHash))).c.req.keyDescent != nil {
+		t.Error("an engine without $..name rules should have no index")
+	}
+}
+
+// TestKeyDescentMatchesTheAutomaton compares the member-name index with the
+// plain automaton on random documents and rule sets.
+func TestKeyDescentMatchesTheAutomaton(t *testing.T) {
+	rnd := rand.New(rand.NewSource(7))
+	keys := []string{"a", "b", "c", "email", "odd key", "x"}
+	strategies := []model.Strategy{model.StrategyHash, model.StrategyRedact, model.StrategyRemove, model.StrategyMask}
+	selectors := []string{"$..a", "$..b", "$..email", "$..['odd key']", "$.a.b", "$..a.b", "$.x[*]", "$..c[0]", "$.*", "$..x", "$.a..b", "$..*"}
+
+	var genVal func(depth int) string
+	genVal = func(depth int) string {
+		switch n := rnd.Intn(7); {
+		case n == 0 && depth < 5, n == 1 && depth < 5:
+			var sb strings.Builder
+			sb.WriteByte('{')
+			for i, m := 0, rnd.Intn(4); i < m; i++ {
+				if i > 0 {
+					sb.WriteByte(',')
+				}
+				fmt.Fprintf(&sb, "%q:%s", keys[rnd.Intn(len(keys))], genVal(depth+1))
+			}
+			sb.WriteByte('}')
+			return sb.String()
+		case n == 2 && depth < 5:
+			var sb strings.Builder
+			sb.WriteByte('[')
+			for i, m := 0, rnd.Intn(4); i < m; i++ {
+				if i > 0 {
+					sb.WriteByte(',')
+				}
+				sb.WriteString(genVal(depth + 1))
+			}
+			sb.WriteByte(']')
+			return sb.String()
+		case n == 3:
+			return strconv.Itoa(rnd.Intn(1000))
+		case n == 4:
+			return "null"
+		}
+		return fmt.Sprintf("%q", fmt.Sprintf("v%d jane@acme.io", rnd.Intn(50)))
+	}
+
+	changedDocs, docs := 0, 0
+	defer func() {
+		if changedDocs < docs/4 {
+			t.Errorf("only %d of %d random documents were changed: the comparison is too weak", changedDocs, docs)
+		}
+	}()
+	for iter := 0; iter < 400; iter++ {
+		var rules []model.AnonymizationRule
+		for i, n := 0, 1+rnd.Intn(6); i < n; i++ {
+			sel := selectors[rnd.Intn(len(selectors))]
+			rules = append(rules, rl(model.TargetJSON, sel, strategies[rnd.Intn(len(strategies))]))
+		}
+		if rnd.Intn(3) == 0 {
+			rules = append(rules, rl(model.TargetRegex, `v1\d`, model.StrategyHash))
+		}
+		fast := mustEngine(t, testProfile(rules...))
+		slow := slowJSONMatcher(fast)
+		for d := 0; d < 6; d++ {
+			doc := genVal(0)
+			if doc[0] != '{' && doc[0] != '[' {
+				doc = "{" + `"a":` + doc + "}"
+			}
+			run := func(e *Engine) (string, []model.AnonChange) {
+				ex := &model.Exchange{
+					Request: model.Request{Header: http.Header{}},
+					Response: model.Response{
+						Header: http.Header{"Content-Type": {"application/json"}},
+						Body:   []byte(doc), BodySize: int64(len(doc)),
+					},
+				}
+				changes, err := e.ExchangeWithReport(ex)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(ex.Response.Body), changes
+			}
+			gotOut, gotCh := run(fast)
+			wantOut, wantCh := run(slow)
+			docs++
+			if gotOut != doc {
+				changedDocs++
+			}
+			if gotOut != wantOut {
+				t.Fatalf("rules %v\n doc: %s\nfast: %s\nslow: %s", selectorsOf(rules), doc, gotOut, wantOut)
+			}
+			if !reflect.DeepEqual(gotCh, wantCh) {
+				t.Fatalf("rules %v\n doc: %s\nfast report: %v\nslow report: %v", selectorsOf(rules), doc, gotCh, wantCh)
+			}
+		}
+	}
+}
+
+func selectorsOf(rules []model.AnonymizationRule) []string {
+	var out []string
+	for _, r := range rules {
+		out = append(out, r.Selector+"/"+string(r.Strategy))
+	}
+	return out
 }

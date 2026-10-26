@@ -24,11 +24,41 @@
 // type is missing) are rewritten preserving member order, number literals and
 // unknown structure exactly; output is compact JSON. NDJSON is handled line
 // by line. Form bodies are rewritten field by field. Other textual bodies get
-// regex rules and detectors. Binary bodies and bodies that are still
-// compressed are left alone (see the implementation notes). When a body
-// changes, BodySize is updated and any Content-Length header is fixed.
-// A truncated body (BodyTruncated) is processed best-effort: JSON is
-// rewritten as far as it goes, everything else as text.
+// regex rules and detectors. When a body changes, BodySize is updated and any
+// Content-Length header is fixed. A truncated body (BodyTruncated) is
+// processed best-effort: JSON is rewritten as far as it goes, everything else
+// as text.
+//
+// Opaque bodies. A body the engine cannot inspect is "opaque": a binary
+// content type (image/*, application/pdf, protobuf, ...), unparsable binary
+// bytes (an unknown or missing type with binary content, or a JSON-typed body
+// that is neither JSON nor text), or a body that is still compressed (its
+// Header still carries a Content-Encoding other than identity). The profile's OpaqueBodies setting
+// decides what happens to it. "keep" (the default) stores it unchanged. "fill"
+// replaces it with deterministic filler of exactly the same length: bytes of
+// the keyed PRNG, seeded by the HMAC of the original body, so equal bodies get
+// equal filler, different bodies get different filler, and no original byte
+// is kept. BodySize and Content-Length stay as they were, and the change is
+// reported at "request.body" or "response.body" with source "opaque_bodies"
+// (the report states the size, never the bytes).
+//
+// Multipart. A multipart/form-data body with a boundary is processed part by
+// part. A text part (no filename, a textual or missing Content-Type) is
+// anonymized like a form field: a form rule whose selector is the part name
+// wins (and a remove rule drops the whole part), otherwise the part is handled
+// by its own content type, so a JSON part gets JSON rules, a text part regex
+// rules, and every part the detectors. A file part (the Content-Disposition
+// carries a filename), a part with a base64 or quoted-printable
+// Content-Transfer-Encoding and a binary part are opaque and are kept or
+// filled as above. The boundary, preamble, epilogue, delimiters and part
+// headers are written back byte for byte; only part bodies change, and
+// BodySize and Content-Length follow. A multipart body inside a part is split
+// the same way, to a depth of three. A body that cannot be split (no boundary,
+// no delimiter, a part cut off in its headers, no closing delimiter unless the
+// capture was truncated) is malformed and falls back to the opaque handling:
+// filled under "fill"; under "keep" kept if binary and scanned as text, like
+// any body of unknown type, if textual. A truncated capture is split as far as
+// it goes.
 //
 // Fake kinds must preserve format: email → "<word>.<word><nn>@example.com"
 // style (domain example.com/.net/.org only); phone keeps punctuation and
@@ -43,7 +73,11 @@
 // Performance. Engine is immutable after New and safe for concurrent use.
 // Compile everything (regexes, JSONPaths) in New. Avoid re-parsing JSON
 // more than once per body. Target: < 50µs for a typical 2 KB JSON exchange
-// with the default profile (benchmark it). Use sync.Pool for HMAC state.
+// with the default profile (benchmark it; BenchmarkExchangeBuiltinProfile is
+// the real built-in profile with its rules, about 15µs). Use sync.Pool for
+// HMAC state. JSONPath rules of the form $..name, which the built-in profile
+// is full of, are matched by a hash lookup of the member name instead of an
+// automaton state each, so their number does not slow the walk down.
 //
 // Safety. Anonymization must never panic on malformed input; on a body it
 // cannot parse it falls back to text processing. The redact strategy default
@@ -53,11 +87,11 @@
 //
 // Where this package goes beyond, or interprets, the rules above:
 //
-//   - A body counts as "still compressed" when a Content-Encoding header
-//     survives, or when ContentEncoding is set and the bytes are plainly
-//     compressed (gzip, zlib, zstd magic, or not text). A body the proxy
-//     decoded keeps its original encoding name in ContentEncoding; that body
-//     is plain text and is anonymized.
+//   - A body counts as "still compressed" (opaque) when a Content-Encoding
+//     header other than identity survives, or when ContentEncoding is set and
+//     the bytes are plainly compressed (gzip, zlib, zstd magic, or not text).
+//     A body the proxy decoded keeps its original encoding name in
+//     ContentEncoding; that body is plain text and is anonymized.
 //   - A truncated JSON body is rewritten by the same streaming rewriter in a
 //     lenient mode that stops where the capture stopped, so JSONPath rules
 //     still redact the fields in the retained prefix. Anything that is not
@@ -76,4 +110,11 @@
 //     parameter names, Exchange.Error, and percent-encoded e-mail addresses.
 //   - The anonymizer never panics on input; an internal panic is recovered and
 //     returned as an error, and the caller must then discard the exchange.
+//   - Engine.Profile returns the profile without its secret (Secret empty,
+//     HasSecret set), as model.AnonymizationProfile.Redacted does.
+//   - Rule keys (JSON member names, query and form names, part names) match
+//     exactly, including case: the built-in profile lists the usual spellings
+//     (password, accessToken, access_token, ...) rather than matching loosely.
+//   - A new part body, filled or not, never contains a line starting with the
+//     part's own delimiter, so a short boundary cannot be hit by chance.
 package anonymize

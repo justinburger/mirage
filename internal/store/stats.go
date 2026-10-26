@@ -29,7 +29,7 @@ func (s *SQLite) EndpointStats(ctx context.Context, recordingID string) ([]model
 	groups := map[string]*endpointAcc{}
 	err := s.read(ctx, func(tx *sql.Tx) error {
 		var n int64
-		err := tx.QueryRowContext(ctx, `SELECT exchange_count FROM recordings WHERE id = ?`, recordingID).Scan(&n)
+		err := tx.QueryRowContext(ctx, `SELECT exchange_count FROM recordings WHERE id = ? AND deleted_at IS NULL`, recordingID).Scan(&n)
 		if errors.Is(err, sql.ErrNoRows) {
 			return notFound("recording", recordingID)
 		}

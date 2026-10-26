@@ -127,7 +127,11 @@ func looksJSON(b []byte) bool {
 // classifyBody decides how a body is processed from its Content-Type and, when
 // the type does not decide, from its bytes.
 func classifyBody(ct string, b []byte, truncated bool) bodyKind {
-	mt := mediaType(ct)
+	return classifyMedia(mediaType(ct), b, truncated)
+}
+
+// classifyMedia is classifyBody for an already parsed media type.
+func classifyMedia(mt string, b []byte, truncated bool) bodyKind {
 	switch {
 	case isJSONType(mt):
 		return kindJSON
@@ -177,27 +181,16 @@ func stillCompressed(h http.Header, contentEncoding string, b []byte) bool {
 // body anonymizes one body and keeps BodySize and Content-Length consistent.
 func (r *run) body(body *[]byte, size *int64, truncated bool, contentEncoding string, h http.Header, ct string) {
 	b := *body
-	if len(b) == 0 || stillCompressed(h, contentEncoding, b) {
+	if len(b) == 0 {
 		return
 	}
 	loc := locator{side: r.side, where: "body"}
 	var nb []byte
-	changed := false
-	switch classifyBody(ct, b, truncated) {
-	case kindBinary:
-		return
-	case kindJSON:
-		nb, changed = r.jsonBody(b, truncated, loc)
-	case kindNDJSON:
-		nb, changed = r.ndjsonBody(b, truncated, loc)
-	case kindForm:
-		loc.form = true
-		s := string(b)
-		if ns := r.params(s, r.sd.form, &loc); ns != s {
-			nb, changed = []byte(ns), true
-		}
-	default:
-		nb, changed = r.textBody(b, &loc)
+	var changed bool
+	if stillCompressed(h, contentEncoding, b) {
+		nb, changed = r.opaque(b, &loc)
+	} else {
+		nb, changed = r.inspect(b, ct, truncated, &loc)
 	}
 	if !changed {
 		return
@@ -219,6 +212,51 @@ func (r *run) body(body *[]byte, size *int64, truncated bool, contentEncoding st
 	}
 }
 
+// inspect anonymizes the bytes of a body whose Content-Type is ct (a whole
+// body, or one part of a multipart body) and returns the new bytes. changed
+// is false when nothing needs to be written back.
+func (r *run) inspect(b []byte, ct string, truncated bool, loc *locator) (nb []byte, changed bool) {
+	mt := mediaType(ct)
+	if mt == "multipart/form-data" || (r.mpDepth > 0 && strings.HasPrefix(mt, "multipart/")) {
+		return r.multipartBody(b, ct, truncated, loc)
+	}
+	switch classifyMedia(mt, b, truncated) {
+	case kindBinary:
+		return r.opaque(b, loc)
+	case kindJSON:
+		return r.jsonBody(b, truncated, *loc)
+	case kindNDJSON:
+		return r.ndjsonBody(b, truncated, *loc)
+	case kindForm:
+		l := *loc
+		l.form = true
+		s := string(b)
+		if ns := r.params(s, r.sd.form, &l); ns != s {
+			return []byte(ns), true
+		}
+		return nil, false
+	default:
+		return r.textBody(b, loc)
+	}
+}
+
+// opaque handles a body the engine cannot inspect: binary content, a body
+// still carrying a Content-Encoding, a binary or malformed multipart part.
+// With OpaqueBodies "keep" it is left alone. With "fill" it is replaced by
+// deterministic filler of the same length (see keyer.opaqueFill) and the
+// replacement is reported with source "opaque_bodies".
+func (r *run) opaque(b []byte, loc *locator) ([]byte, bool) {
+	if !r.c.fill || len(b) == 0 {
+		return nil, false
+	}
+	nb := r.k.opaqueFill(b)
+	if r.rep != nil && !r.rep.full() {
+		n := itoa(len(b))
+		r.rep.add(loc, "opaque_bodies", "["+n+" opaque bytes]", "["+n+" filler bytes]")
+	}
+	return nb, true
+}
+
 func (r *run) textBody(b []byte, loc *locator) ([]byte, bool) {
 	s := string(b)
 	ns := r.text(s, loc)
@@ -230,7 +268,9 @@ func (r *run) textBody(b []byte, loc *locator) ([]byte, bool) {
 
 // jsonBody rewrites a JSON body. A truncated body is rewritten as far as it
 // goes. Anything that does not parse falls back to text processing, so a
-// malformed document is still scanned by the regex rules and the detectors.
+// malformed document is still scanned by the regex rules and the detectors;
+// under OpaqueBodies "fill" a document that does not parse and is binary is
+// filled instead.
 func (r *run) jsonBody(b []byte, truncated bool, loc locator) ([]byte, bool) {
 	mark := 0
 	if r.rep != nil {
@@ -246,6 +286,10 @@ func (r *run) jsonBody(b []byte, truncated bool, loc locator) ([]byte, bool) {
 	if errors.Is(err, errJSONTrailing) {
 		// Several documents back to back: handle them line by line.
 		return r.ndjsonBody(b, truncated, loc)
+	}
+	if r.c.fill && looksBinary(b, truncated) {
+		// Not JSON and not text either: nothing in it can be inspected.
+		return r.opaque(b, &loc)
 	}
 	return r.textBody(b, &loc)
 }

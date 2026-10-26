@@ -1,6 +1,9 @@
 package pathnorm
 
-import "strings"
+import (
+	"net/url"
+	"strings"
+)
 
 // Placeholders emitted by the heuristic classifier.
 const (
@@ -17,11 +20,25 @@ const (
 	minTokenLen = 20
 	uuidLen     = 36
 	dateLen     = len("2024-01-31")
+
+	// Mirage's own anonymization hash tokens: "h_" followed by exactly
+	// hashHexLen lowercase hex characters.
+	hashPrefix   = "h_"
+	hashHexLen   = 16
+	hashTokenLen = len(hashPrefix) + hashHexLen
 )
 
-// classify returns the placeholder for one raw path segment, or "" when the
-// segment is kept literally.
-func classify(seg string) string {
+// classify returns the placeholder for one path segment as it appears in an
+// escaped path, or "" when the segment is kept literally. The segment is
+// classified percent-decoded ("jane%40acme.io" is an {email}); one that fails
+// to decode is classified as it is. Segments without a '%' are not copied.
+func classify(seg string) string { return classifyText(seg, true) }
+
+// classifyText classifies seg. With decode set, a seg containing a '%' is
+// first percent-decoded and the result classified (never decoded again); a
+// seg that fails to decode, or any seg with decode unset, is classified as
+// it is, a '%' being an ordinary character.
+func classifyText(seg string, decode bool) string {
 	n := len(seg)
 	if n == 0 {
 		return ""
@@ -52,8 +69,18 @@ func classify(seg string) string {
 			other++
 		}
 	}
+	if digits == n {
+		return tokID
+	}
+	// A '%' counts as "other", so segments made only of letters, digits, '-'
+	// and '_' (most of them) never get here.
+	if decode && other > 0 && strings.IndexByte(seg, '%') >= 0 {
+		if dec, err := url.PathUnescape(seg); err == nil {
+			return classifyText(dec, false)
+		}
+	}
 	switch {
-	case digits == n:
+	case n == hashTokenLen && unders == 1 && other == 0 && isHashToken(seg):
 		return tokID
 	case other == 0 && dashes == 0 && unders == 0 && alpha == hexAlpha:
 		// Only hex digits. All-digit segments were handled above.
@@ -95,6 +122,20 @@ func isUUID(s string) bool {
 	return true
 }
 
+// isHashToken reports whether s is one of Mirage's anonymization hash tokens:
+// "h_" followed by exactly 16 lowercase hex characters.
+func isHashToken(s string) bool {
+	if len(s) != hashTokenLen || s[:len(hashPrefix)] != hashPrefix {
+		return false
+	}
+	for i := len(hashPrefix); i < len(s); i++ {
+		if c := s[i]; !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func isHexDigit(c byte) bool {
 	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
 }
@@ -131,18 +172,15 @@ func daysIn(year, month int) int {
 	return 31
 }
 
-// isEmail reports whether a raw path segment looks like an email address:
-// a non-empty local part, an "@" (or its escape "%40"), and a dotted domain
-// with a TLD of at least two characters containing a letter.
+// isEmail reports whether a decoded path segment looks like an email
+// address: a non-empty local part, an "@", and a dotted domain with a TLD of
+// at least two characters containing a letter.
 func isEmail(s string) bool {
-	at, atLen := strings.LastIndexByte(s, '@'), 1
+	at := strings.LastIndexByte(s, '@')
 	if at < 0 {
-		at, atLen = strings.LastIndex(s, "%40"), 3
-		if at < 0 {
-			return false
-		}
+		return false
 	}
-	local, domain := s[:at], s[at+atLen:]
+	local, domain := s[:at], s[at+1:]
 	if local == "" || domain == "" {
 		return false
 	}

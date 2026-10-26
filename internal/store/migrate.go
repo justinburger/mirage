@@ -132,6 +132,37 @@ var migrations = []migration{
 			updated_at INTEGER NOT NULL
 		) WITHOUT ROWID`,
 	}},
+
+	// Version 2 drops the UNIQUE constraint on services.listen_addr. SQLite
+	// cannot drop a constraint in place, so the table is rebuilt (nothing
+	// references it). Uniqueness of listen addresses moved into PutService,
+	// which compares host-normalised addresses and ignores port 0 (every
+	// service on ":0" gets its own free port). The name stays UNIQUE.
+	{version: 2, name: "services: listen_addr uniqueness moves to PutService", stmts: []string{
+		`CREATE TABLE services_v2 (
+			id           TEXT PRIMARY KEY,
+			name         TEXT NOT NULL UNIQUE,
+			listen_addr  TEXT NOT NULL,
+			mode         TEXT NOT NULL,
+			enabled      INTEGER NOT NULL,
+			recording_id TEXT NOT NULL,
+			created_at   INTEGER NOT NULL,
+			updated_at   INTEGER NOT NULL,
+			data         TEXT NOT NULL
+		)`,
+		`INSERT INTO services_v2 (id, name, listen_addr, mode, enabled, recording_id, created_at, updated_at, data)
+			SELECT id, name, listen_addr, mode, enabled, recording_id, created_at, updated_at, data FROM services`,
+		`DROP TABLE services`,
+		`ALTER TABLE services_v2 RENAME TO services`,
+	}},
+
+	// Version 3 adds the tombstone DeleteRecording sets before it purges a
+	// recording's exchanges in chunks. A recording with deleted_at set is
+	// invisible to every read and write; a leftover one is purged when the
+	// database is next opened.
+	{version: 3, name: "recordings: deleted_at tombstone", stmts: []string{
+		`ALTER TABLE recordings ADD COLUMN deleted_at INTEGER`,
+	}},
 }
 
 // latestVersion is the schema version this build understands.

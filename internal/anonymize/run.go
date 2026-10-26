@@ -69,6 +69,7 @@ type locator struct {
 	form  bool   // body is a form
 	line  int    // 1-based NDJSON line, 0 if not NDJSON
 	json  []byte // JSON path while rewriting a JSON body
+	part  string // "multipart.<name>" of the part being processed; only set while a report is collected
 }
 
 func (l *locator) String() string {
@@ -86,6 +87,10 @@ func (l *locator) String() string {
 	if l.line > 0 {
 		sb.WriteString(" line ")
 		sb.WriteString(itoa(l.line))
+	}
+	if l.part != "" {
+		sb.WriteByte(' ')
+		sb.WriteString(l.part)
 	}
 	switch {
 	case l.form:
@@ -122,6 +127,8 @@ type run struct {
 	sd    *sideRules
 	side  string
 	chain []*rule // scratch for merged rule chains
+	// mpDepth is how many multipart bodies enclose the body being processed.
+	mpDepth int
 }
 
 func (r *run) setSide(request bool) {

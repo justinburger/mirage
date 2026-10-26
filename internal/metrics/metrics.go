@@ -56,6 +56,29 @@
 // looking up an endpoint that already exists takes no lock and allocates
 // nothing; new endpoints (at most MaxEndpoints per collector) take a mutex.
 //
+// # Corrected latency
+//
+// Replay jobs measure latency twice: Observation.Duration is service time and
+// Observation.Corrected is the latency from the request's intended send time,
+// which keeps a slow target from hiding its own queueing delay (coordinated
+// omission). Corrected is optional, and 0 means not measured, so services never
+// set it. The first observation with Corrected > 0 allocates a second
+// cumulative histogram and per-window state (about 70 KiB) behind an atomic
+// pointer; before that, and for every service collector, nothing is allocated
+// and Observe pays one branch. Afterwards Observe adds one more lock-free
+// histogram record and stays allocation-free. Tick cuts the corrected data into
+// the same one-second windows as the rest (difference against the previous
+// Tick, window extremes clamping the quantiles) and fills
+// model.SeriesPoint.CorrectedP95 and CorrectedP99 for windows that have
+// corrected observations; other points leave them 0 (omitted from JSON).
+// Snapshot sets model.StatsSnapshot.CorrectedLatency, cumulative since Since,
+// once something was measured and leaves it nil otherwise.
+// Collector.CorrectedLatency returns a copy of the histogram (nil when not
+// measured) for the replay summary, and WritePrometheus adds
+// mirage_corrected_request_duration_seconds for collectors that measured it.
+// Reset clears the corrected data along with the rest. There is no corrected
+// per-endpoint or "recent" view.
+//
 // Deviations and additions to the contract, all deliberate:
 //
 //   - Statuses outside 100-599 (and 0) are counted under the "err" class, not
@@ -70,7 +93,12 @@
 //   - Collector.Reset leaves the in-flight gauge alone (it tracks live
 //     requests whose completion will decrement it).
 //   - WritePrometheus adds per-endpoint families next to the ones in the
-//     contract; see WritePrometheus.
+//     contract, and mirage_corrected_request_duration_seconds for replay
+//     collectors that measured corrected latency; see WritePrometheus.
+//   - Observation.Corrected, SeriesPoint.CorrectedP95/P99,
+//     StatsSnapshot.CorrectedLatency and Collector.CorrectedLatency carry
+//     coordinated-omission-corrected latency for replay jobs; see "Corrected
+//     latency" above.
 package metrics
 
 const (

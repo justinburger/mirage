@@ -11,12 +11,20 @@
 //     segments first, then longer patterns). Matching ignores a trailing
 //     slash difference.
 //   - Otherwise each segment is classified heuristically:
-//     all digits → {id}; UUID (any version, any case) → {uuid};
+//     all digits → {id}; a Mirage anonymization hash token ("h_" plus
+//     exactly 16 lowercase hex characters, e.g. h_3f9a1c0b7d2e4a51) → {id};
+//     UUID (any version, any case) → {uuid};
 //     hex string of length ≥ 16 → {hex}; long opaque token (≥ 20 chars of
 //     [A-Za-z0-9_-] with both letters and digits) → {token};
 //     an email address → {email}; ISO date (2024-01-31) → {date};
-//     anything else is kept literally. Percent-escapes are kept as is.
-//   - Query strings are ignored (callers pass r.URL.Path or Request.Path).
+//     anything else is kept literally, in its original escaped form.
+//   - Callers pass the escaped path (r.URL.EscapedPath(), which is what
+//     model.Request.Path holds), never r.URL.Path. Segments are classified
+//     percent-decoded but literal segments are returned exactly as given, so
+//     "/users/jane%40acme.io" → "/users/{email}", "/n/%31%32%33" →
+//     "/n/{id}" and "/a%20b/42" → "/a%20b/{id}".
+//   - Query strings are ignored (a query is never part of an escaped path,
+//     but one that is passed along is cut off at the first "?").
 //   - Template and Endpoint are pure, allocation-light, safe for concurrent
 //     use, and fast (< 1µs for typical paths; benchmark it).
 //   - Endpoint(method, path) = strings.ToUpper(method) + " " + Template(path).
@@ -28,9 +36,22 @@
 //
 //   - Segments are classified in the order the contract lists them, except
 //     that "all digits" is checked first, so a 20-digit number is {id}, not
-//     {hex}. Classification looks at the raw (still percent-escaped)
-//     segment, with one exception: an email address whose "@" is written
-//     "%40" is still recognised.
+//     {hex}. A hash token never overlaps with another class (it has an
+//     underscore and is 18 characters long), so its position does not matter;
+//     "H_…", "h_" plus 15 or 17 hex characters, and uppercase hex digits are
+//     not hash tokens.
+//   - Percent-decoding uses net/url.PathUnescape, so "+" stays a plus. Each
+//     segment is decoded on its own, once: "%2541" decodes to the text "%41",
+//     which is not decoded again. A segment that fails to decode (a stray "%"
+//     or a bad hex pair, as in "100%" or "%zz") is classified as it is, with
+//     the "%" an ordinary character. Decoding may produce a "/" ("a%2Fb"):
+//     the segment was split before decoding, so it stays one segment. Because
+//     the decoded text is what counts, "jane%20doe%40acme.io" is not an email
+//     (a space cannot appear in a local part) while "jane%2Bx%40acme.io" is.
+//     Only segments that contain a "%" are decoded (one allocation each);
+//     paths without escapes are classified without copying.
+//   - Passing an unescaped path (r.URL.Path) is a caller error: a literal "%"
+//     followed by two hex digits would be read as an escape.
 //   - A trailing slash is dropped from the template ("/users/" and "/users"
 //     are the same endpoint), and so is everything from the first "?" on.
 //     The root path and the empty path are both "/". The OPTIONS target "*"
@@ -120,7 +141,9 @@ func (n *Normalizer) Patterns() []string {
 	return out
 }
 
-// Template returns the endpoint template for a path.
+// Template returns the endpoint template for a path. The path is the escaped
+// path (r.URL.EscapedPath()): segments are classified percent-decoded and
+// literal ones come back in their escaped form.
 func (n *Normalizer) Template(path string) string {
 	var stack [192]byte
 	out, s, inBuf := n.normalize(stack[:0], path)
@@ -130,7 +153,8 @@ func (n *Normalizer) Template(path string) string {
 	return s
 }
 
-// Endpoint returns "METHOD template".
+// Endpoint returns "METHOD template"; path is the escaped path, as for
+// Template.
 func (n *Normalizer) Endpoint(method, path string) string {
 	var stack [192]byte
 	buf := appendUpper(stack[:0], method)

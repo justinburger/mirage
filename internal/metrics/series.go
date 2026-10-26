@@ -3,6 +3,7 @@ package metrics
 import (
 	"math"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/justinburger/mirage/internal/model"
@@ -92,38 +93,11 @@ func (c *Collector) closeWindow(sec int64) model.SeriesPoint {
 	// request that is counted in the next one.
 	w.requests = delta(c.latency.count.Load(), &c.prevCount)
 	w.sum = delta(c.latency.sum.Load(), &c.prevSum)
-	for i := range c.latency.counts {
-		v := c.latency.counts[i].Load()
-		p := c.prev[i]
-		if v == p {
-			continue
-		}
-		c.prev[i] = v
-		if v > p { // v < p only after a Reset raced the scan
-			w.add(i, v-p)
-		}
-	}
-	mn := c.winMinC.Swap(0)
-	w.max = c.winMax.Swap(0)
-	if w.total == 0 && w.requests == 0 {
-		// Extremes without an observation: Observe publishes them before its
-		// bucket and count, so a request is mid-flight. Hand them to the next
-		// window, where the request will be counted, instead of losing them.
-		if w.max > 0 {
-			atomicMax(&c.winMax, w.max)
-		}
-		if mn != 0 {
-			atomicMax(&c.winMinC, mn)
-		}
-		w.min, w.max = 0, 0
-	} else {
-		if mn != 0 {
-			w.min = math.MaxInt64 - mn
-		}
-		if mn == 0 || w.min > w.max {
-			w.min = w.max
-		}
-	}
+	w.addDiff(&c.latency.counts, c.prev)
+	// A window with extremes but no observation means a request is mid-flight
+	// (Observe publishes the extremes before its bucket and count); the
+	// extremes are handed to the next window, where it will be counted.
+	w.min, w.max = takeExtremes(&c.winMax, &c.winMinC, w.total > 0 || w.requests > 0)
 	w.bytesOut = delta(c.bytesOut.Load(), &c.prevOut)
 	w.bytesIn = delta(c.bytesIn.Load(), &c.prevIn)
 	w.errors = delta(c.errors.Load(), &c.prevErrs)
@@ -145,9 +119,38 @@ func (c *Collector) closeWindow(sec int64) model.SeriesPoint {
 		p.P99 = nsToMs(min(max(v[2], w.min), w.max))
 	}
 	p.Max = nsToMs(w.max)
+	if cs := c.corr.Load(); cs != nil {
+		p.CorrectedP95, p.CorrectedP99 = cs.closeWindow()
+	}
 	c.lastInFlight = p.InFlight
 	c.pushPoint(p)
 	return p
+}
+
+// takeExtremes swaps the smallest and largest value observed since the last
+// call out of maxA and minCA (the latter holds math.MaxInt64-min, 0 meaning
+// none yet) and returns them in ns. counted says whether the window holds an
+// observation. If not, the extremes belong to a request that is still
+// mid-flight: they are put back for the next window and (0, 0) is returned.
+func takeExtremes(maxA, minCA *atomic.Int64, counted bool) (lo, hi int64) {
+	mn := minCA.Swap(0)
+	hi = maxA.Swap(0)
+	if !counted {
+		if hi > 0 {
+			atomicMax(maxA, hi)
+		}
+		if mn != 0 {
+			atomicMax(minCA, mn)
+		}
+		return 0, 0
+	}
+	if mn != 0 {
+		lo = math.MaxInt64 - mn
+	}
+	if mn == 0 || lo > hi {
+		lo = hi
+	}
+	return lo, hi
 }
 
 // delta returns cur-*prev (never negative) and advances *prev to cur.
@@ -190,7 +193,9 @@ func (c *Collector) Series(sinceMs int64) []model.SeriesPoint {
 // the last closed window; RPS10, ErrorRate10 and Recent cover the last 10
 // closed windows (or fewer, averaged over the windows that exist, while the
 // collector is younger than that). Endpoints carries the SnapshotEndpoints
-// busiest endpoints.
+// busiest endpoints. CorrectedLatency is the cumulative latency from the
+// requests' intended send times, set only once an observation carried one (it
+// is nil for services).
 func (c *Collector) Snapshot() model.StatsSnapshot {
 	s := model.StatsSnapshot{
 		Name:     c.name,
@@ -209,6 +214,10 @@ func (c *Collector) Snapshot() model.StatsSnapshot {
 	}
 	s.Latency = c.latency.Summary()
 	s.Requests = s.Latency.Count
+	if cs := c.corr.Load(); cs != nil && cs.latency.Count() > 0 {
+		l := cs.latency.Summary()
+		s.CorrectedLatency = &l
+	}
 
 	c.mu.Lock()
 	s.RPS, s.RPS10, s.ErrorRate10, s.Recent = c.recentStats()

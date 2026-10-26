@@ -38,9 +38,14 @@ func (w *jsonRW) enter(parent *jframe, key []byte, idx int) childInfo {
 		info.stHi, info.acHi = info.stLo, info.acLo
 		return info
 	}
+	// Rules of the form $..name have no automaton state: they are matched by
+	// member name below.
+	fast := w.r.sd.keyDescent != nil
 	if parent == nil {
-		for ri := range w.prog {
-			w.states = append(w.states, mkState(ri, 0))
+		for ri, rl := range w.prog {
+			if !(fast && rl.keyOnly) {
+				w.states = append(w.states, mkState(ri, 0))
+			}
 		}
 	} else {
 		for _, st := range w.states[parent.stLo:parent.stHi] {
@@ -72,6 +77,15 @@ func (w *jsonRW) enter(parent *jframe, key []byte, idx int) childInfo {
 		// redacting every leaf.
 		if parent != nil && info.remove == nil && w.prog[ri].act.remove() {
 			info.remove = w.prog[ri]
+		}
+	}
+	if fast && parent != nil && parent.obj {
+		for _, ri := range w.r.sd.keyDescent[string(key)] {
+			w.addActive(info.acLo, ri)
+			// Of several rules that delete the node, report the lowest.
+			if rl := w.prog[ri]; rl.act.remove() && (info.remove == nil || rl.idx < info.remove.idx) {
+				info.remove = rl
+			}
 		}
 	}
 	info.acHi = len(w.active)

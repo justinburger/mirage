@@ -22,6 +22,9 @@ type rule struct {
 	group bool           // regex has a capture group: only group 1 is replaced
 	jp    *jsonPath      // json target
 	tmpl  *pathTemplate  // path target
+	// keyOnly marks a json rule of the form $..name: the member called name
+	// at any depth. It needs no automaton state, see sideRules.keyDescent.
+	keyOnly bool
 }
 
 // sideRules indexes the rules that apply to one side of an exchange.
@@ -33,6 +36,12 @@ type sideRules struct {
 	path   []*rule
 	json   []*rule
 	regex  []*rule
+	// keyDescent indexes the keyOnly json rules by member name; the values
+	// are positions in json, ascending. The built-in profile is made of
+	// dozens of such rules, and matching them with a hash lookup per member
+	// instead of one automaton state each keeps the walk cost independent of
+	// their number. nil when there are none.
+	keyDescent map[string][]int32
 }
 
 func newSideRules() sideRules {
@@ -58,6 +67,13 @@ func (s *sideRules) add(r *rule) {
 		s.path = append(s.path, r)
 	case model.TargetJSON:
 		s.json = append(s.json, r)
+		if r.keyOnly {
+			if s.keyDescent == nil {
+				s.keyDescent = map[string][]int32{}
+			}
+			name := r.jp.steps[0].name
+			s.keyDescent[name] = append(s.keyDescent[name], int32(len(s.json)-1))
+		}
 	case model.TargetRegex:
 		s.regex = append(s.regex, r)
 	}
@@ -69,6 +85,7 @@ type compiled struct {
 	secret  []byte
 	detMask uint16
 	detAct  [numDetectors]action
+	fill    bool // OpaqueBodies "fill": replace bodies the engine cannot inspect
 	redact  map[string]struct{}
 	req     sideRules
 	resp    sideRules
@@ -100,6 +117,7 @@ func compile(p model.AnonymizationProfile, requireName bool) (*compiled, error) 
 	}
 
 	c := &compiled{
+		fill:   p.OpaqueBodies == model.OpaqueFill,
 		redact: map[string]struct{}{},
 		req:    newSideRules(),
 		resp:   newSideRules(),
@@ -168,6 +186,7 @@ func compile(p model.AnonymizationProfile, requireName bool) (*compiled, error) 
 				continue
 			}
 			cr.jp = jp
+			cr.keyOnly = len(jp.steps) == 1 && jp.steps[0].descend && jp.steps[0].kind == jpName
 		case model.TargetPath:
 			t, err := parsePathTemplate(r.Selector)
 			if err != nil {

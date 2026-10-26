@@ -69,8 +69,10 @@ func New(p model.AnonymizationProfile) (*Engine, error) {
 }
 
 // Profile returns the profile the engine was built from, with defaults
-// applied. The returned value shares no memory with the engine.
-func (e *Engine) Profile() model.AnonymizationProfile { return cloneProfile(e.prof) }
+// applied and the secret removed (model.AnonymizationProfile.Redacted: Secret
+// is empty and HasSecret says whether there was one), so it is safe to hand
+// to API clients. The returned value shares no memory with the engine.
+func (e *Engine) Profile() model.AnonymizationProfile { return cloneProfile(e.prof).Redacted() }
 
 // WithSalt returns an engine with the same rules whose hash and fake outputs
 // are keyed by secret and salt. The same value maps to a different token under

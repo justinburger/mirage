@@ -3,6 +3,8 @@ package anonymize
 import (
 	"bytes"
 	"encoding/json"
+	"io"
+	"mime/multipart"
 	"net/http"
 	"reflect"
 	"strconv"
@@ -15,7 +17,7 @@ import (
 
 var (
 	fuzzOnce    sync.Once
-	fuzzEngines [4]*Engine // default, rules, rules (second instance), detectors off
+	fuzzEngines [5]*Engine // default, rules, rules (second instance), detectors off, rules + opaque fill
 )
 
 // fuzzProfile exercises every kind of rule and every detector.
@@ -57,6 +59,11 @@ func fuzzSetup(t testing.TB) {
 		if fuzzEngines[3], err = New(off); err != nil {
 			panic(err)
 		}
+		fill := fuzzProfile()
+		fill.OpaqueBodies = model.OpaqueFill
+		if fuzzEngines[4], err = New(fill); err != nil {
+			panic(err)
+		}
 	})
 }
 
@@ -80,6 +87,17 @@ func FuzzExchange(f *testing.F) {
 		{"/", "", "A", "B", "application/json", `{"odd key":["x"],"user":{"a":"b@c.de","b":12345678901234567890}}`, false, 2},
 		{"/", "", "A", "B", "application/json", "{\"a\":\"\\ud83d\\ude00 \\u0040 \\ud800\"}", false, 0},
 		{"/", "", "A", "B", "application/json", "\xef\xbb\xbf{}", false, 0},
+		{"/up", "", "X", "y", "multipart/form-data; boundary=bb",
+			"pre\r\n--bb\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nhunter2\r\n--bb\r\nContent-Disposition: form-data; name=\"f\"; filename=\"a.bin\"\r\nContent-Type: image/png\r\n\r\n\x89PNG\x00jane@acme.io\r\n--bb\r\nContent-Disposition: form-data; name=\"m\"\r\nContent-Type: application/json\r\n\r\n{\"email\":\"a@b.co\",\"secret\":1}\r\n--bb--\r\npost", false, 4},
+		{"/up", "", "Content-Length", "99", "multipart/form-data; boundary=bb",
+			"--bb\nContent-Disposition: form-data; name=\"token\"\n\nabc\n--bb\nContent-Disposition: form-data; name=\"secret\"\n\ns\n--bb--", false, 1},
+		{"/up", "", "X", "y", "multipart/form-data; boundary=bb",
+			"--bb\r\nContent-Disposition: form-data; name=\"a\"; filename=\"x\"\r\n\r\n0123456789\r\n--bb\r\nContent-Disposition: form-data; na", true, 4},
+		{"/up", "", "X", "y", "multipart/form-data; boundary=bb",
+			"--bb\r\nContent-Type: multipart/mixed; boundary=in\r\n\r\n--in\r\nContent-Disposition: file; filename=\"f\"\r\n\r\nzzz\r\n--in--\r\n--bb--", false, 4},
+		{"/up", "", "X", "y", "multipart/form-data", "--bb\r\n\r\nno boundary jane@acme.io", false, 4},
+		{"/up", "", "Content-Encoding", "gzip", "image/png", "\x89PNG\r\n\x1a\n\x00\x00", false, 4},
+		{"/up", "", "X", "y", "multipart/form-data; boundary=\"a b\"", "--a b\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\nx\r\n--a b--", false, 4},
 	}
 	for _, s := range seeds {
 		f.Add(s.path, s.query, s.hname, s.hval, s.ct, []byte(s.body), s.truncated, s.mode)
@@ -180,6 +198,30 @@ func FuzzExchange(f *testing.F) {
 			}
 		}
 
+		// A multipart body the engine could split stays multipart with the
+		// same parts and the same part headers, and what the standard library
+		// could read, it can still read.
+		if !truncated && mediaType(ct) == "multipart/form-data" && getHeader(ex.Request.Header, "Content-Encoding") == "" && hname != "Content-Encoding" {
+			if b := boundaryOf(ct); b != "" {
+				if in, ok := splitMultipart(body, b, false); ok {
+					out, ok := splitMultipart(ex.Request.Body, b, false)
+					if !ok || len(out) != len(in) {
+						t.Fatalf("multipart structure changed (split ok %v, %d -> %d parts):\n in:  %q\n out: %q", ok, len(in), len(out), body, ex.Request.Body)
+					}
+					for i := range in {
+						if !bytes.Equal(body[in[i].hdrLo:in[i].bodyLo], ex.Request.Body[out[i].hdrLo:out[i].bodyLo]) {
+							t.Fatalf("part %d headers changed:\n in:  %q\n out: %q", i, body, ex.Request.Body)
+						}
+					}
+					if want, ok := stdlibParts(body, b); ok {
+						if got, ok := stdlibParts(ex.Request.Body, b); !ok || !reflect.DeepEqual(want, got) {
+							t.Fatalf("the standard library no longer reads the body the same way (ok %v):\n in:  %q\n out: %q\nwant %v\n got %v", ok, body, ex.Request.Body, want, got)
+						}
+					}
+				}
+			}
+		}
+
 		// The path keeps its shape: same number of segments, no new delimiters.
 		if strings.Count(ex.Request.Path, "/") != strings.Count(path, "/") {
 			t.Fatalf("path segments changed: %q -> %q", path, ex.Request.Path)
@@ -195,6 +237,26 @@ func FuzzExchange(f *testing.F) {
 			t.Fatalf("second pass failed: %v", err)
 		}
 	})
+}
+
+// stdlibParts lists the form names and file names of a multipart body as
+// net/http would read them; ok is false when the standard library cannot read
+// the whole body.
+func stdlibParts(body []byte, boundary string) (parts []string, ok bool) {
+	mr := multipart.NewReader(bytes.NewReader(body), boundary)
+	for {
+		p, err := mr.NextPart()
+		if err == io.EOF {
+			return parts, true
+		}
+		if err != nil {
+			return nil, false
+		}
+		if _, err := io.Copy(io.Discard, p); err != nil {
+			return nil, false
+		}
+		parts = append(parts, p.FormName()+"|"+p.FileName()+"|"+p.Header.Get("Content-Type"))
+	}
 }
 
 // TestFuzzSeedsRun makes the seed corpus part of the ordinary test run.

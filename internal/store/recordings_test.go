@@ -67,6 +67,9 @@ func TestRecordingCRUD(t *testing.T) {
 	})
 }
 
+// TestUpdateRecordingTouchesOnlyEditableFields: only Name, Description and
+// Labels are editable. Source and Anonymized belong to CreateRecording and
+// AppendExchanges, the counters and timestamps to AppendExchanges.
 func TestUpdateRecordingTouchesOnlyEditableFields(t *testing.T) {
 	backends(t, func(t *testing.T, s *SQLite) {
 		clock := newClock(s)
@@ -78,9 +81,10 @@ func TestUpdateRecordingTouchesOnlyEditableFields(t *testing.T) {
 
 		clock.Advance(time.Minute)
 		out, err := s.UpdateRecording(ctx(), model.Recording{
-			ID: rec.ID, Name: "renamed", Description: "new desc", Source: "har", Anonymized: true,
+			ID: rec.ID, Name: "renamed", Description: "new desc",
 			Labels: map[string]string{"x": "y"},
 			// None of the following may take effect.
+			Source: "har", Anonymized: true,
 			ServiceID: "svc_other", ExchangeCount: 1000, ErrorCount: 1000, Bytes: 1000,
 			CreatedAt: baseTime.AddDate(-5, 0, 0), FirstAt: ptr(baseTime.AddDate(-5, 0, 0)),
 		})
@@ -88,7 +92,7 @@ func TestUpdateRecordingTouchesOnlyEditableFields(t *testing.T) {
 			t.Fatal(err)
 		}
 		want := before
-		want.Name, want.Description, want.Source, want.Anonymized = "renamed", "new desc", "har", true
+		want.Name, want.Description = "renamed", "new desc"
 		want.Labels = map[string]string{"x": "y"}
 		want.UpdatedAt = clock.Now()
 		if !reflect.DeepEqual(out, want) {
@@ -102,6 +106,13 @@ func TestUpdateRecordingTouchesOnlyEditableFields(t *testing.T) {
 		out, err = s.UpdateRecording(ctx(), model.Recording{ID: rec.ID, Name: "renamed"})
 		if err != nil || out.Labels != nil {
 			t.Errorf("clearing labels: %+v, %v", out.Labels, err)
+		}
+
+		// The flags cannot be cleared through UpdateRecording either.
+		anon, _ := s.CreateRecording(ctx(), model.Recording{Name: "anon", Source: "har", Anonymized: true})
+		out, err = s.UpdateRecording(ctx(), model.Recording{ID: anon.ID, Name: "anon2", Source: "proxy", Anonymized: false})
+		if err != nil || !out.Anonymized || out.Source != "har" || out.Name != "anon2" {
+			t.Errorf("update of Source/Anonymized took effect: %+v, %v", out, err)
 		}
 	})
 }
@@ -209,4 +220,78 @@ func TestDeleteRecordingFreesDiskSpace(t *testing.T) {
 	if err := s.wdb.QueryRow(`PRAGMA freelist_count`).Scan(&free); err != nil || free != 0 {
 		t.Errorf("freelist_count = %d, %v", free, err)
 	}
+}
+
+// TestAppendMaintainsAnonymizedFlag: Recording.Anonymized is owned by
+// CreateRecording (initial value) and AppendExchanges. Appending to an empty
+// recording sets it to whether every appended exchange is anonymized; on a
+// non-empty one it can only be cleared, never set.
+func TestAppendMaintainsAnonymizedFlag(t *testing.T) {
+	type step struct {
+		anon []bool // Anonymized of each appended exchange; nil = append an empty batch
+		want bool   // the recording's flag afterwards
+	}
+	cases := []struct {
+		name    string
+		created bool
+		steps   []step
+	}{
+		{"empty, created plain, all anonymized -> true", false, []step{{[]bool{true, true}, true}}},
+		{"empty, created anonymized, all anonymized -> true", true, []step{{[]bool{true}, true}}},
+		{"empty, created anonymized, one plain -> false", true, []step{{[]bool{false}, false}}},
+		{"empty, created anonymized, mixed batch -> false", true, []step{{[]bool{true, false, true}, false}}},
+		{"empty, created plain, mixed batch -> false", false, []step{{[]bool{true, false}, false}}},
+		{"stays true over anonymized batches", true, []step{{[]bool{true}, true}, {[]bool{true, true}, true}, {[]bool{true}, true}}},
+		{"one plain exchange clears it for good", true, []step{{[]bool{true}, true}, {[]bool{true, false}, false}, {[]bool{true, true}, false}}},
+		{"plain first, anonymized later: not restored", false, []step{{[]bool{false}, false}, {[]bool{true}, false}, {[]bool{true, true}, false}}},
+		{"anonymized fills a plain-created recording, plain clears it", false, []step{{[]bool{true}, true}, {[]bool{true}, true}, {[]bool{false}, false}}},
+		{"empty batch changes nothing (anonymized)", true, []step{{nil, true}, {[]bool{true}, true}, {nil, true}}},
+		{"empty batch changes nothing (plain)", false, []step{{nil, false}, {[]bool{true}, true}, {nil, true}}},
+	}
+	backends(t, func(t *testing.T, s *SQLite) {
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				rec, err := s.CreateRecording(ctx(), model.Recording{Name: c.name, Source: "proxy", Anonymized: c.created})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if rec.Anonymized != c.created {
+					t.Fatalf("created recording has Anonymized %v, want %v", rec.Anonymized, c.created)
+				}
+				next := 0
+				for i, st := range c.steps {
+					exs := make([]*model.Exchange, len(st.anon))
+					for j, a := range st.anon {
+						exs[j] = mkEx(next, withAnonymized(a))
+						next++
+					}
+					if err := s.AppendExchanges(ctx(), rec.ID, exs); err != nil {
+						t.Fatal(err)
+					}
+					got, err := s.GetRecording(ctx(), rec.ID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if got.Anonymized != st.want {
+						t.Fatalf("step %d (append %v): Anonymized = %v, want %v", i, st.anon, got.Anonymized, st.want)
+					}
+				}
+				// Listing reads the same stored flag, and each exchange keeps its own.
+				list, _ := s.ListRecordings(ctx())
+				for _, r := range list {
+					if r.ID == rec.ID && r.Anonymized != c.steps[len(c.steps)-1].want {
+						t.Errorf("ListRecordings shows Anonymized = %v", r.Anonymized)
+					}
+				}
+				var plain int
+				if err := s.rdb.QueryRow(`SELECT COUNT(*) FROM exchanges WHERE recording_id = ? AND anonymized = 0`, rec.ID).Scan(&plain); err != nil {
+					t.Fatal(err)
+				}
+				got, _ := s.GetRecording(ctx(), rec.ID)
+				if got.ExchangeCount > 0 && got.Anonymized && plain != 0 {
+					t.Errorf("recording is flagged anonymized but holds %d plain exchanges", plain)
+				}
+			})
+		}
+	})
 }

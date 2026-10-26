@@ -65,6 +65,7 @@ type promCollector struct {
 	bytesIn   int64
 	bytesOut  int64
 	latency   promSummary
+	corrected *promSummary // nil when the collector never measured it
 	endpoints []promEndpoint
 }
 
@@ -78,6 +79,10 @@ func (c *Collector) promData() promCollector {
 		latency:  newPromSummary(&c.latency),
 	}
 	d.requests = d.latency.count
+	if cs := c.corr.Load(); cs != nil && cs.latency.Count() > 0 {
+		s := newPromSummary(&cs.latency)
+		d.corrected = &s
+	}
 	for i := range c.classes {
 		d.classes[i] = c.classes[i].Load()
 	}
@@ -197,9 +202,20 @@ func (p *promWriter) summary(name, labels, extra string, s promSummary) {
 // Durations are in seconds. A summary with no observations reports NaN
 // quantiles, as Prometheus clients do.
 //
+// Replay jobs that measured coordinated-omission-corrected latency (see
+// Observation.Corrected) also have, with the same labels and quantiles as
+// mirage_request_duration_seconds:
+//
+//	mirage_corrected_request_duration_seconds summary, latency from the
+//	                                          request's intended send time
+//
+// That family has samples only for collectors that measured it, and is emitted
+// (HELP and TYPE included) only when at least one does, so a registry of
+// services alone produces exactly the output it did before the family existed.
+//
 // Output is sorted (collectors by name, endpoints by name) and each family's
 // HELP and TYPE lines appear exactly once, even when the family has no
-// samples yet.
+// samples yet (except the corrected family, above).
 func (r *Registry) WritePrometheus(w io.Writer) error {
 	cols := r.List()
 	data := make([]promCollector, len(cols))
@@ -235,6 +251,19 @@ func (r *Registry) WritePrometheus(w io.Writer) error {
 	for i := range data {
 		d := &data[i]
 		p.summary("mirage_request_duration_seconds", d.labels, "", d.latency)
+	}
+
+	// Only collectors that measured it (replay jobs) have samples, and the
+	// family is left out entirely when none does, so output for services alone
+	// is unchanged.
+	if slices.ContainsFunc(data, func(d promCollector) bool { return d.corrected != nil }) {
+		p.family("mirage_corrected_request_duration_seconds", "Request latency in seconds from the intended send time (coordinated-omission corrected).", "summary")
+		for i := range data {
+			d := &data[i]
+			if d.corrected != nil {
+				p.summary("mirage_corrected_request_duration_seconds", d.labels, "", *d.corrected)
+			}
+		}
 	}
 
 	p.family("mirage_in_flight_requests", "Requests currently in flight.", "gauge")

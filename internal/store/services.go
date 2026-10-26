@@ -6,6 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/netip"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/justinburger/mirage/internal/model"
@@ -75,8 +79,13 @@ func (s *SQLite) GetService(ctx context.Context, id string) (model.Service, erro
 }
 
 // PutService inserts or updates a service by ID (assigning "svc_..." when
-// empty). A duplicate Name or ListenAddr on another service returns an error
-// wrapping model.ErrConflict.
+// empty). A duplicate Name, or a ListenAddr already used by another service,
+// returns an error wrapping model.ErrConflict.
+//
+// Listen addresses are compared host-normalised (see listenKey): ":9001",
+// "0.0.0.0:9001" and "[::]:9001" are the same socket. Port 0 means "pick a
+// free port" and never conflicts, so any number of services may use ":0" or
+// "127.0.0.1:0".
 func (s *SQLite) PutService(ctx context.Context, svc model.Service) (model.Service, error) {
 	if svc.ID == "" {
 		svc.ID = model.NewID("svc")
@@ -88,30 +97,92 @@ func (s *SQLite) PutService(ctx context.Context, svc model.Service) (model.Servi
 		return model.Service{}, fmt.Errorf("store: encode service: %w", err)
 	}
 	var created int64
-	err = s.wdb.QueryRowContext(ctx, `
-		INSERT INTO services (id, name, listen_addr, mode, enabled, recording_id, created_at, updated_at, data)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-			name = excluded.name, listen_addr = excluded.listen_addr, mode = excluded.mode,
-			enabled = excluded.enabled, recording_id = excluded.recording_id,
-			updated_at = excluded.updated_at, data = excluded.data
-		RETURNING created_at`,
-		svc.ID, svc.Name, svc.ListenAddr, string(svc.Mode), b2i(svc.Enabled), svc.RecordingID,
-		nanos(now), nanos(now), string(data)).Scan(&created)
-	if err != nil {
-		if isUniqueViolation(err) {
-			switch violatedColumn(err) {
-			case "services.name":
-				return model.Service{}, conflict("service name %q is already in use", svc.Name)
-			case "services.listen_addr":
-				return model.Service{}, conflict("listen address %q is already in use", svc.ListenAddr)
-			}
-			return model.Service{}, conflict("service %q conflicts with an existing service", svc.Name)
+	err = s.write(ctx, func(tx *sql.Tx) error {
+		// The writer is exclusive for the whole transaction, so the address
+		// check and the upsert cannot interleave with another PutService.
+		if err := checkListenAddr(ctx, tx, svc.ID, svc.ListenAddr); err != nil {
+			return err
 		}
-		return model.Service{}, fmt.Errorf("store: put service: %w", err)
+		err := tx.QueryRowContext(ctx, `
+			INSERT INTO services (id, name, listen_addr, mode, enabled, recording_id, created_at, updated_at, data)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET
+				name = excluded.name, listen_addr = excluded.listen_addr, mode = excluded.mode,
+				enabled = excluded.enabled, recording_id = excluded.recording_id,
+				updated_at = excluded.updated_at, data = excluded.data
+			RETURNING created_at`,
+			svc.ID, svc.Name, svc.ListenAddr, string(svc.Mode), b2i(svc.Enabled), svc.RecordingID,
+			nanos(now), nanos(now), string(data)).Scan(&created)
+		if isUniqueViolation(err) {
+			// Only services.name is still UNIQUE; the id is handled by the upsert.
+			return conflict("service name %q is already in use", svc.Name)
+		}
+		if err != nil {
+			return fmt.Errorf("store: put service: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return model.Service{}, err
 	}
 	svc.CreatedAt = fromNanos(created)
 	return svc, nil
+}
+
+// checkListenAddr reports a conflict when a service other than id listens on
+// the same socket as addr.
+func checkListenAddr(ctx context.Context, tx *sql.Tx, id, addr string) error {
+	key, checked := listenKey(addr)
+	if !checked {
+		return nil
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT name, listen_addr FROM services WHERE id <> ?`, id)
+	if err != nil {
+		return fmt.Errorf("store: put service: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name, other string
+		if err := rows.Scan(&name, &other); err != nil {
+			return fmt.Errorf("store: put service: %w", err)
+		}
+		if k, ok := listenKey(other); ok && k == key {
+			return conflict("listen address %q is already in use by service %q (%s)", addr, name, other)
+		}
+	}
+	return rows.Err()
+}
+
+// listenKey returns the canonical form of a listen address, so that spellings
+// of one socket compare equal, and whether the address takes part in the
+// uniqueness check at all. A wildcard host ("", 0.0.0.0, ::, in any spelling)
+// becomes "", other IPs their canonical text form (IPv4-mapped IPv6 addresses
+// become IPv4) and host names lower case; the port is read as a number. Port 0
+// is never checked. A value that is not host:port is compared as a lower-case
+// string.
+func listenKey(addr string) (key string, checked bool) {
+	addr = strings.TrimSpace(addr)
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return strings.ToLower(addr), true
+	}
+	if n, err := strconv.ParseUint(port, 10, 16); err == nil {
+		if n == 0 {
+			return "", false
+		}
+		port = strconv.FormatUint(n, 10)
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		ip = ip.Unmap()
+		if ip.IsUnspecified() {
+			host = ""
+		} else {
+			host = ip.String()
+		}
+	} else {
+		host = strings.ToLower(host)
+	}
+	return net.JoinHostPort(host, port), true
 }
 
 // DeleteService removes a service. Its recording is kept.

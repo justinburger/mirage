@@ -59,6 +59,12 @@ type Observation struct {
 	// Error marks the request as an error. Callers normally set it to
 	// model.IsErrorStatus(Status).
 	Error bool
+	// Corrected is the latency measured from the request's intended send time
+	// (coordinated-omission corrected), set by replay jobs; it is at least
+	// Duration. Zero (or negative) means not measured, which is what services
+	// leave it at. The first Observation with Corrected > 0 makes the collector
+	// allocate its corrected-latency state; see Collector.
+	Corrected time.Duration
 }
 
 // endpointStats is the cumulative state for one endpoint. The request count is
@@ -87,6 +93,14 @@ func (e *endpointStats) summary() model.EndpointSummary {
 // previous Tick into the closed one-second window, so every observation lands
 // in exactly one window no matter how it races with Tick, and the request path
 // never touches a lock or allocates a window.
+//
+// Replay jobs also report Observation.Corrected, the latency from each
+// request's intended send time. The first such observation allocates a second
+// cumulative histogram with its own per-window state (about 70 KiB), published
+// through an atomic pointer; Observe then adds one more lock-free histogram
+// record per request. A collector that never sees a corrected observation, as
+// every service collector, allocates nothing for it and Observe pays one
+// predictable branch.
 type Collector struct {
 	// Read-mostly after construction.
 	name  string
@@ -94,7 +108,7 @@ type Collector struct {
 	id    string
 	eps   atomic.Pointer[map[string]*endpointStats]
 	other atomic.Pointer[endpointStats] // overflow endpoint; nil until needed
-	epMu  sync.Mutex                    // serialises endpoint creation and Reset
+	epMu  sync.Mutex                    // serialises endpoint and corrected-state creation, and Reset
 	since atomic.Int64                  // UnixNano of creation or last Reset
 	_     [cacheLineSize]byte
 
@@ -153,6 +167,14 @@ type Collector struct {
 	winPos int
 	winLen int
 	recent *Histogram
+
+	// corr is the corrected-latency state; nil until the first Observation
+	// with Corrected > 0. Once set it is never replaced (Reset clears it in
+	// place), so a pointer loaded by Observe stays valid. It lives down here,
+	// not with the read-mostly fields above, on purpose: adding it there
+	// shifted latency.count and latency.sum across a 64-byte boundary and cost
+	// parallel Observe about 15% (see TestCollectorHotAtomicsShareALine).
+	corr atomic.Pointer[correctedState]
 }
 
 // windowStats is one closed one-second window.
@@ -198,7 +220,8 @@ func (c *Collector) Kind() model.CollectorKind { return c.kind }
 func (c *Collector) ID() string { return c.id }
 
 // Observe records one completed request. It is lock-free and, for an endpoint
-// the collector has already seen, allocation-free.
+// the collector has already seen, allocation-free (the first observation with
+// Corrected > 0 allocates the corrected-latency state once; see Collector).
 func (c *Collector) Observe(o Observation) {
 	d := max(int64(o.Duration), 0)
 	ep := c.endpoint(o.Endpoint)
@@ -218,6 +241,9 @@ func (c *Collector) Observe(o Observation) {
 	atomicMax(&c.winMinC, math.MaxInt64-d)
 	ep.latency.observe(d)
 	c.latency.observe(d)
+	if o.Corrected > 0 {
+		c.correctedState().observe(int64(o.Corrected))
+	}
 }
 
 // InFlight adjusts the in-flight gauge by delta (+1 on start, -1 on finish).
@@ -332,6 +358,18 @@ func (c *Collector) topEndpoints(limit int) []model.EndpointSummary {
 // Latency returns a copy of the cumulative latency histogram.
 func (c *Collector) Latency() *Histogram { return c.latency.Clone() }
 
+// CorrectedLatency returns a copy of the cumulative corrected-latency histogram
+// (latency from each request's intended send time), or nil when no observation
+// carried a Corrected value since creation or the last Reset. It is what the
+// replay summary reports.
+func (c *Collector) CorrectedLatency() *Histogram {
+	cs := c.corr.Load()
+	if cs == nil || cs.latency.Count() <= 0 {
+		return nil
+	}
+	return cs.latency.Clone()
+}
+
 // Reset clears all counters, histograms and series and sets Since to now. The
 // in-flight gauge is left alone: it tracks requests that are still running and
 // their completion will decrement it.
@@ -354,6 +392,9 @@ func (c *Collector) Reset() {
 	c.winMax.Store(0)
 	c.winMinC.Store(0)
 	c.latency.Reset()
+	if cs := c.corr.Load(); cs != nil {
+		cs.reset()
+	}
 
 	clear(c.prev[:])
 	c.prevCount, c.prevErrs, c.prevIn, c.prevOut, c.prevSum = 0, 0, 0, 0, 0

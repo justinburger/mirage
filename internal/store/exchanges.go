@@ -118,10 +118,8 @@ const (
 // prepareRows validates and prepares a batch, in parallel when the bodies are
 // large enough for compression to dominate, and totals the counter deltas.
 func prepareRows(exs []*model.Exchange) ([]insertRow, batchStats, error) {
-	var (
-		st    batchStats
-		total int
-	)
+	st := batchStats{anonymized: true}
+	total := 0
 	for i, ex := range exs {
 		if ex == nil {
 			return nil, st, fmt.Errorf("store: append exchanges: exchange %d is nil", i)
@@ -162,6 +160,9 @@ func prepareRows(exs []*model.Exchange) ([]insertRow, batchStats, error) {
 		if r.isErr {
 			st.errors++
 		}
+		if !r.ex.Anonymized {
+			st.anonymized = false
+		}
 		if t := nanos(r.ex.StartedAt); t != 0 {
 			if st.first == 0 || t < st.first {
 				st.first = t
@@ -176,6 +177,7 @@ func prepareRows(exs []*model.Exchange) ([]insertRow, batchStats, error) {
 type batchStats struct {
 	count, errors, bytes int64
 	first, last          int64 // Unix nanos of the earliest and latest StartedAt; 0 = none
+	anonymized           bool  // every exchange of the batch has Anonymized set
 }
 
 // AppendExchanges writes a batch of exchanges to a recording in one
@@ -184,9 +186,13 @@ type batchStats struct {
 // order) and RecordingID set in place; on failure nothing is written and the
 // exchanges are left untouched. The recording's ExchangeCount, ErrorCount,
 // Bytes (captured body bytes), FirstAt (earliest StartedAt), LastAt (latest
-// StartedAt) and UpdatedAt are updated in the same transaction. An unknown
-// recording returns an error wrapping model.ErrNotFound; an empty batch is a
-// no-op.
+// StartedAt) and UpdatedAt are updated in the same transaction, and so is the
+// recording's Anonymized flag: appending any exchange with Anonymized false
+// clears it, and appending to an empty recording sets it to whether every
+// appended exchange is anonymized. A non-empty recording therefore stays
+// anonymized only while every exchange it ever received was. An unknown (or
+// being deleted) recording returns an error wrapping model.ErrNotFound; an
+// empty batch is a no-op.
 func (s *SQLite) AppendExchanges(ctx context.Context, recordingID string, exs []*model.Exchange) error {
 	if len(exs) == 0 {
 		return nil
@@ -205,7 +211,7 @@ func (s *SQLite) AppendExchanges(ctx context.Context, recordingID string, exs []
 		// MAX(seq) is answered from the (recording_id, seq) index.
 		err := tx.QueryRowContext(ctx, `
 			SELECT COALESCE((SELECT MAX(seq) FROM exchanges WHERE recording_id = r.id), 0)
-			FROM recordings r WHERE r.id = ?`, recordingID).Scan(&base)
+			FROM recordings r WHERE r.id = ? AND r.deleted_at IS NULL`, recordingID).Scan(&base)
 		if errors.Is(err, sql.ErrNoRows) {
 			return notFound("recording", recordingID)
 		}
@@ -240,9 +246,12 @@ func (s *SQLite) AppendExchanges(ctx context.Context, recordingID string, exs []
 				                WHEN first_at IS NULL OR ?4 < first_at THEN ?4 ELSE first_at END,
 				last_at  = CASE WHEN ?5 IS NULL THEN last_at
 				                WHEN last_at IS NULL OR ?5 > last_at THEN ?5 ELSE last_at END,
+				anonymized = CASE WHEN exchange_count = 0 THEN ?8
+				                  WHEN ?8 = 0 THEN 0
+				                  ELSE anonymized END,
 				updated_at = ?6
 			WHERE id = ?7`,
-			st.count, st.errors, st.bytes, first, last, nanos(s.nowUTC()), recordingID)
+			st.count, st.errors, st.bytes, first, last, nanos(s.nowUTC()), recordingID, b2i(st.anonymized))
 		if err != nil {
 			return fmt.Errorf("store: update recording counters: %w", err)
 		}

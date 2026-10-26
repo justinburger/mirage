@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/justinburger/mirage/internal/model"
 )
@@ -83,10 +85,16 @@ func (s *SQLite) GetProfile(ctx context.Context, id string) (model.Anonymization
 // empty). An empty Secret keeps the stored secret on update and generates a
 // fresh one on insert, so every profile can key deterministic anonymization;
 // a non-empty Secret replaces the stored one.
+//
+// Every rule with an empty ID gets a "rule_..." ID (existing IDs are kept, so
+// a profile read back and saved again keeps its rule IDs). Profile names are
+// unique ignoring case and surrounding white space: a name used by another
+// profile returns an error wrapping model.ErrConflict.
 func (s *SQLite) PutProfile(ctx context.Context, p model.AnonymizationProfile) (model.AnonymizationProfile, error) {
 	if p.ID == "" {
 		p.ID = model.NewID("prof")
 	}
+	p.Rules = withRuleIDs(p.Rules)
 	keepStored := p.Secret == ""
 	secret := p.Secret
 	if keepStored {
@@ -102,21 +110,74 @@ func (s *SQLite) PutProfile(ctx context.Context, p model.AnonymizationProfile) (
 		return model.AnonymizationProfile{}, fmt.Errorf("store: encode profile: %w", err)
 	}
 	var created int64
-	err = s.wdb.QueryRowContext(ctx, `
-		INSERT INTO profiles (id, name, secret, created_at, updated_at, data)
-		VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-			name = excluded.name,
-			secret = CASE WHEN ? THEN profiles.secret ELSE excluded.secret END,
-			updated_at = excluded.updated_at, data = excluded.data
-		RETURNING secret, created_at`,
-		p.ID, p.Name, secret, nanos(now), nanos(now), string(data), b2i(keepStored)).Scan(&secret, &created)
+	err = s.write(ctx, func(tx *sql.Tx) error {
+		// The writer is exclusive for the whole transaction, so the name check
+		// and the upsert cannot interleave with another PutProfile. Profiles
+		// are few, which lets Go do the Unicode-aware comparison.
+		if err := checkProfileName(ctx, tx, p.ID, p.Name); err != nil {
+			return err
+		}
+		err := tx.QueryRowContext(ctx, `
+			INSERT INTO profiles (id, name, secret, created_at, updated_at, data)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET
+				name = excluded.name,
+				secret = CASE WHEN ? THEN profiles.secret ELSE excluded.secret END,
+				updated_at = excluded.updated_at, data = excluded.data
+			RETURNING secret, created_at`,
+			p.ID, p.Name, secret, nanos(now), nanos(now), string(data), b2i(keepStored)).Scan(&secret, &created)
+		if err != nil {
+			return fmt.Errorf("store: put profile: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
-		return model.AnonymizationProfile{}, fmt.Errorf("store: put profile: %w", err)
+		return model.AnonymizationProfile{}, err
 	}
 	p.Secret, p.HasSecret = secret, secret != ""
 	p.CreatedAt = fromNanos(created)
 	return p, nil
+}
+
+// withRuleIDs returns rules with every empty ID filled in. The caller's slice
+// is never modified.
+func withRuleIDs(rules []model.AnonymizationRule) []model.AnonymizationRule {
+	if !slices.ContainsFunc(rules, func(r model.AnonymizationRule) bool { return r.ID == "" }) {
+		return rules
+	}
+	out := slices.Clone(rules)
+	for i := range out {
+		if out[i].ID == "" {
+			out[i].ID = model.NewID("rule")
+		}
+	}
+	return out
+}
+
+// sameProfileName compares profile names ignoring case and surrounding white
+// space.
+func sameProfileName(a, b string) bool {
+	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
+}
+
+// checkProfileName reports a conflict when a profile other than id already
+// uses name.
+func checkProfileName(ctx context.Context, tx *sql.Tx, id, name string) error {
+	rows, err := tx.QueryContext(ctx, `SELECT name FROM profiles WHERE id <> ?`, id)
+	if err != nil {
+		return fmt.Errorf("store: put profile: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var other string
+		if err := rows.Scan(&other); err != nil {
+			return fmt.Errorf("store: put profile: %w", err)
+		}
+		if sameProfileName(other, name) {
+			return conflict("profile name %q is already in use", name)
+		}
+	}
+	return rows.Err()
 }
 
 // DeleteProfile removes a profile. The built-in "default" profile cannot be

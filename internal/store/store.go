@@ -8,25 +8,48 @@
 //     profile (model.DefaultAnonymizationProfile with a model.NewSecret())
 //     when no profile with that ID exists.
 //   - Every method is safe for concurrent use.
-//   - Not-found lookups return an error wrapping model.ErrNotFound; unique
-//     violations (duplicate service name or listen_addr) wrap
-//     model.ErrConflict.
+//   - Not-found lookups return an error wrapping model.ErrNotFound; uniqueness
+//     violations (duplicate service name or listen address, duplicate profile
+//     name) wrap model.ErrConflict.
 //   - Put* methods upsert by ID. They assign an ID (model.NewID with prefix
 //     "svc", "prof", "flt", "rpl") when ID is empty, set CreatedAt on insert
 //     and UpdatedAt on every write, and return the stored object.
+//   - PutProfile also assigns model.NewID("rule") to every rule with an empty
+//     ID (existing IDs are kept) and requires the profile name to be unique,
+//     ignoring case and surrounding white space.
+//   - PutService requires the listen address to be unique among services,
+//     compared host-normalised: ":9001", "0.0.0.0:9001" and "[::]:9001" are one
+//     socket, while a specific host and a wildcard on one port, or "localhost"
+//     and 127.0.0.1, are left to the OS to refuse at listen time. Port 0 (an
+//     OS-assigned port) is exempt, so any number of services may use ":0" or
+//     "127.0.0.1:0". The service name is unique as well.
 //   - Structured sub-objects (MatchConfig, rules, labels, replay config,
 //     summary, series) may be stored as JSON columns.
 //   - AppendExchanges is the hot write path: one transaction per batch, with
 //     prepared statements. It assigns ID and Seq (continuing the recording's
 //     sequence) to each exchange in place and updates the recording's
 //     counters (ExchangeCount, ErrorCount, Bytes, FirstAt, LastAt,
-//     UpdatedAt). Target: ≥ 20k exchanges/s with small bodies on a laptop.
+//     UpdatedAt) and its Anonymized flag. Target: ≥ 20k exchanges/s with small
+//     bodies on a laptop.
 //     Bodies may be compressed (e.g. gzip above a size threshold) as long as
 //     reads return the original bytes.
+//   - Recording.Source and the initial Anonymized value are set by
+//     CreateRecording. AppendExchanges then maintains Anonymized: appending any
+//     exchange with Anonymized=false clears it, and appending to an empty
+//     recording sets it to whether every appended exchange is anonymized (so a
+//     recording created non-anonymized but filled only with anonymized captures
+//     becomes true). On a non-empty recording the flag is never set, only
+//     cleared. UpdateRecording writes neither Source nor Anonymized: it edits
+//     Name, Description and Labels only.
 //   - IterateExchanges streams in Seq order without loading the recording
 //     into memory, loading bodies only when asked (IterOptions). Returning
 //     an error from fn stops iteration and is returned.
-//   - DeleteRecording deletes its exchanges too.
+//   - DeleteRecording deletes its exchanges too, without monopolising the single
+//     writer: the recording disappears first (every read and write reports it
+//     as not found, and its ID stays reserved), then its exchanges are deleted
+//     in chunks of at most 10,000 rows per transaction, so capture batches of
+//     other recordings interleave, and finally the recording row. The call is
+//     synchronous; see the implementation notes for interruptions.
 //   - EndpointStats groups a recording's exchanges by Endpoint and computes
 //     count, errors (model.Exchange.IsError semantics), avg/p50/p95/p99/max
 //     duration and status counts. Sorted by count descending.
@@ -62,6 +85,28 @@
 // Exchange IDs come from an AUTOINCREMENT key, so they are unique across
 // recordings and never reused.
 //
+// Schema versions. 1 is the initial schema. 2 rebuilds the services table
+// without the UNIQUE constraint on listen_addr, whose uniqueness PutService
+// now checks itself (host-normalised, port 0 exempt; the name stays UNIQUE).
+// 3 adds recordings.deleted_at, the tombstone of DeleteRecording. Profile name
+// uniqueness is likewise checked by PutProfile, not by an index, so databases
+// that already hold two profiles of one name still open; such a profile must
+// be renamed before it can be saved again.
+//
+// Deleting a recording. DeleteRecording first sets deleted_at on the recording
+// row in one short transaction. Every query that looks a recording up filters
+// on deleted_at IS NULL, so from then on the recording is invisible and cannot
+// be appended to, and CreateRecording refuses its ID (the row still exists).
+// The exchanges are deleted by a loop of single DELETE statements, each limited
+// to 10,000 rows and each its own transaction, so the writer connection is free
+// between them and database/sql hands it to the longest-waiting writer; the
+// recording row goes last (the foreign key cascade then has nothing to do). If
+// the caller's context ends in between, the rest of the purge continues on a
+// background goroutine and DeleteRecording returns the context's error. Close
+// cancels and waits for such goroutines. A purge that never finished (Close, a
+// crash) leaves a tombstoned recording, which Open finds and purges in the
+// background; nothing else ever sees it.
+//
 // Timestamps are stored as Unix nanoseconds (the zero time.Time is stored as
 // 0), which limits the representable range to the years 1678-2262, and are
 // returned in UTC.
@@ -82,6 +127,8 @@ type Store interface {
 	// Services
 	ListServices(ctx context.Context) ([]model.Service, error)
 	GetService(ctx context.Context, id string) (model.Service, error)
+	// PutService returns an error wrapping model.ErrConflict for a duplicate
+	// name or a listen address another service uses (port 0 is exempt).
 	PutService(ctx context.Context, s model.Service) (model.Service, error)
 	DeleteService(ctx context.Context, id string) error
 
@@ -89,9 +136,13 @@ type Store interface {
 	CreateRecording(ctx context.Context, r model.Recording) (model.Recording, error) // assigns ID ("rec") if empty
 	ListRecordings(ctx context.Context) ([]model.Recording, error)                   // newest first
 	GetRecording(ctx context.Context, id string) (model.Recording, error)
-	// UpdateRecording updates Name, Description, Labels, Anonymized and
-	// Source only; counters are owned by AppendExchanges.
+	// UpdateRecording updates Name, Description and Labels only. Source and
+	// the initial Anonymized value are set by CreateRecording; AppendExchanges
+	// owns the counters, the time range and Anonymized afterwards.
 	UpdateRecording(ctx context.Context, r model.Recording) (model.Recording, error)
+	// DeleteRecording removes the recording at once from every read and write,
+	// then deletes its exchanges in chunks of at most 10,000 rows per
+	// transaction (see the package comment).
 	DeleteRecording(ctx context.Context, id string) error
 
 	// Exchanges
@@ -101,7 +152,9 @@ type Store interface {
 	IterateExchanges(ctx context.Context, recordingID string, opts model.IterOptions, fn func(*model.Exchange) error) error
 	EndpointStats(ctx context.Context, recordingID string) ([]model.EndpointStat, error)
 
-	// Anonymization profiles (Secret is stored and returned; the API hides it)
+	// Anonymization profiles (Secret is stored and returned; the API hides it).
+	// PutProfile assigns IDs to rules without one and returns an error wrapping
+	// model.ErrConflict for a name another profile already uses (ignoring case).
 	ListProfiles(ctx context.Context) ([]model.AnonymizationProfile, error)
 	GetProfile(ctx context.Context, id string) (model.AnonymizationProfile, error)
 	PutProfile(ctx context.Context, p model.AnonymizationProfile) (model.AnonymizationProfile, error)

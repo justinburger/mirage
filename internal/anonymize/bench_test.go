@@ -235,3 +235,102 @@ func BenchmarkParseJSONPath(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkExchangeBuiltinProfile is the sample exchange under the real
+// built-in profile, with its credential and name rules (the benchmarks above
+// that say "default" use the default detectors without rules).
+func BenchmarkExchangeBuiltinProfile(b *testing.B) {
+	e := builtinEngine(b)
+	h := newBenchExchange(sampleExchange())
+	b.SetBytes(int64(len(h.tmpl.Request.Body) + len(h.tmpl.Response.Body)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := e.Exchange(h.reset()); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkBuiltinLogin is a small request that matches several built-in rules.
+func BenchmarkBuiltinLogin(b *testing.B) {
+	e := builtinEngine(b)
+	tmpl := `{"email":"jane.doe@acme.io","password":"hunter2","profile":{"firstName":"Jane","lastName":"Doe"},"accessToken":"abc","refresh_token":"def"}`
+	body := make([]byte, 0, len(tmpl))
+	b.SetBytes(int64(len(tmpl)))
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		body = append(body[:0], tmpl...)
+		req := &model.Request{Method: "POST", Path: "/login", RawQuery: "api_key=XYZ", Header: http.Header{"Content-Type": {"application/json"}}, Body: body, BodySize: int64(len(body))}
+		if err := e.Request(req); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkOpaqueFill(b *testing.B) {
+	for _, n := range []int{4 << 10, 64 << 10, 1 << 20} {
+		b.Run(fmt.Sprint(n>>10, "KiB"), func(b *testing.B) {
+			e := fillEngine(b)
+			tmpl := patterned(n, "bench")
+			body := make([]byte, n)
+			b.SetBytes(int64(n))
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				copy(body, tmpl)
+				resp := &model.Response{Header: http.Header{"Content-Type": {"image/png"}}, Body: body, BodySize: int64(n)}
+				if err := e.Response(resp); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkMultipart(b *testing.B) {
+	file := string(patterned(100<<10, "upload"))
+	in := buildMP(mpBoundary, "\r\n",
+		tpart{name: "email", body: "jane.doe@acme.io"},
+		tpart{name: "password", body: "hunter2"},
+		tpart{name: "comment", ct: "text/plain", body: "Please call 415-555-2671 about the order, thanks."},
+		tpart{name: "avatar", filename: "me.jpg", ct: "image/jpeg", body: file},
+	)
+	for _, c := range []struct {
+		name string
+		e    *Engine
+	}{
+		{"keep", builtinEngine(b)},
+		{"fill", func() *Engine {
+			p := model.DefaultAnonymizationProfile()
+			p.Secret, p.OpaqueBodies = testSecret, model.OpaqueFill
+			return mustEngine(b, p)
+		}()},
+	} {
+		b.Run(c.name, func(b *testing.B) {
+			body := make([]byte, len(in))
+			b.SetBytes(int64(len(in)))
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				copy(body, in)
+				req := &model.Request{Method: "POST", Path: "/u", Header: http.Header{"Content-Type": {mpCT(mpBoundary)}}, Body: body[:len(in)], BodySize: int64(len(in))}
+				if err := c.e.Request(req); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkSplitMultipart(b *testing.B) {
+	in := []byte(buildMP(mpBoundary, "\r\n",
+		tpart{name: "a", body: "1"}, tpart{name: "b", body: "2"},
+		tpart{name: "file", filename: "f.bin", ct: "image/png", body: string(patterned(1<<20, "split"))},
+	))
+	b.SetBytes(int64(len(in)))
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, ok := splitMultipart(in, mpBoundary, false); !ok {
+			b.Fatal("not multipart")
+		}
+	}
+}

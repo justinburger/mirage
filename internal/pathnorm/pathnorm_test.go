@@ -713,6 +713,7 @@ func FuzzTemplate(f *testing.F) {
 	for _, s := range []string{
 		"", "/", "*", "/users/42", "/a//b", "//", "/users/42/?x=1", "/a%20b", "/o/123e4567-e89b-12d3-a456-426614174000",
 		"/x/jane@example.com", "/d/2024-02-29", "/files/a/b/c", "/%", "/\x00/\xff", "a/b",
+		"/u/jane%40acme.io", "/n/%31%32%33", "/h/h_3f9a1c0b7d2e4a51", "/h/h%5F3f9a1c0b7d2e4a51", "/n/%zz/%2531/%",
 	} {
 		f.Add(s)
 	}
@@ -739,7 +740,32 @@ func FuzzTemplate(f *testing.F) {
 				t.Fatalf("Endpoint(%q) = %q, want %q", path, e, "GET "+got)
 			}
 		}
+		checkSegmentsEitherKeptOrPlaceholder(t, path, Default.Template(path))
 	})
+}
+
+// checkSegmentsEitherKeptOrPlaceholder asserts that, without user patterns,
+// every segment of the template is a placeholder or the input segment exactly
+// as given: decoded text never leaks into a template.
+func checkSegmentsEitherKeptOrPlaceholder(t *testing.T, path, got string) {
+	t.Helper()
+	if got == "/" || got == "*" || strings.IndexByte(path, '?') >= 0 {
+		return
+	}
+	body := func(s string) []string {
+		return strings.Split(strings.TrimRight(strings.TrimPrefix(s, "/"), "/"), "/")
+	}
+	in, out := body(path), body(got)
+	if len(in) != len(out) {
+		t.Fatalf("Template(%q) = %q has %d segments, input has %d", path, got, len(out), len(in))
+	}
+	for i := range in {
+		switch out[i] {
+		case in[i], tokID, tokUUID, tokHex, tokToken, tokEmail, tokDate:
+		default:
+			t.Fatalf("Template(%q) = %q: segment %d is %q, neither the input segment %q nor a placeholder", path, got, i, out[i], in[i])
+		}
+	}
 }
 
 func mustNew(t testing.TB, patterns ...string) *Normalizer {
