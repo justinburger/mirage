@@ -570,7 +570,7 @@ func TestSameVirtualization(t *testing.T) {
 	same := base
 	same.Match.IgnoreParams = []string{"a"}
 	same.Upstream = "http://elsewhere" // not part of the virtual index
-	same.Mode = model.ModeHybrid
+	same.Mode = model.ModeVirtualize   // record <-> virtualize does not change the index
 	if !sameVirtualization(base, same) {
 		t.Error("unrelated changes must keep the virtualizer")
 	}
@@ -582,6 +582,7 @@ func TestSameVirtualization(t *testing.T) {
 		"amplify":      func(s *model.Service) { s.ErrorAmplification = 3 },
 		"floor":        func(s *model.Service) { s.ErrorFloor = 0.1 },
 		"endpointpats": func(s *model.Service) { s.EndpointPatterns = []string{"/x/{id}"} },
+		"hybrid":       func(s *model.Service) { s.Mode = model.ModeHybrid }, // truncated-only matches become misses
 	} {
 		c := base
 		mut(&c)

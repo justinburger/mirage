@@ -595,6 +595,39 @@ wait_for "the TLS listener" 10 curl -sk "https://127.0.0.1:$TLS_PORT/health"
 assert "a self-signed TLS service proxies to the upstream" test "$(curl -sk --max-time 5 -o /dev/null -w '%{http_code}' "https://127.0.0.1:$TLS_PORT/health")" = 200
 assert "plain HTTP to the TLS port is refused" test "$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$TLS_PORT/health")" != 200
 api DELETE "/services/$TLS_ID" >/dev/null
+
+# A response larger than max_body_bytes is recorded truncated; virtualize must
+# not serve the cut-off body as a complete 200.
+TRUNC_PORT=$(free_port)
+TRUNC_REC=$(api POST /recordings '{"name":"e2e-truncated"}' | j '.id')
+TRUNC_ID=$(api POST /services "{\"name\":\"e2e-trunc\",\"listen_addr\":\"127.0.0.1:$TRUNC_PORT\",\"upstream\":\"$DEMO\",\"mode\":\"record\",\"recording_id\":\"$TRUNC_REC\",\"enabled\":true,\"max_body_bytes\":200,\"latency\":{\"mode\":\"none\"}}" | j '.id')
+TRUNC_URL="http://127.0.0.1:$TRUNC_PORT/api/products"
+wait_for "the truncating service" 10 curl -sf -o /dev/null "$TRUNC_URL"
+FULL=$(curl -sS --max-time 10 "$TRUNC_URL" | wc -c | tr -d ' ')
+assert "traffic itself is never truncated ($FULL bytes, cap 200)" num_gt "$FULL" 200
+trunc_counted() { num_ge "$(api GET "/services/$TRUNC_ID" | j '.status.capture_truncated')" 1; }
+wait_for "a truncated capture to be counted" 10 trunc_counted
+TRUNC_WARN=$(api GET "/services/$TRUNC_ID" | j '.status.warning')
+assert "record mode warns about max_body_bytes ($TRUNC_WARN)" grep -q 'max_body_bytes' <<<"$TRUNC_WARN"
+api POST "/services/$TRUNC_ID/mode" "{\"mode\":\"virtualize\",\"recording_id\":\"$TRUNC_REC\"}" >/dev/null
+code=$(curl -sS --max-time 10 -D "$TMP/trunc.hdr" -o "$TMP/trunc.body" -w '%{http_code}' "$TRUNC_URL")
+assert "a truncated recording is answered 502, not a short 200 (got $code)" test "$code" = 502
+assert "...with X-Mirage-Error: truncated" grep -qi '^x-mirage-error: truncated' "$TMP/trunc.hdr"
+assert "...and a body saying how much was kept ($(j '.kept_bytes' <"$TMP/trunc.body") of $(j '.recorded_bytes' <"$TMP/trunc.body"))" \
+  num_gt "$(j '.recorded_bytes' <"$TMP/trunc.body")" "$(j '.kept_bytes' <"$TMP/trunc.body")"
+assert "the service counts the truncated match" num_ge "$(api GET "/services/$TRUNC_ID" | j '.status.virtual_truncated')" 1
+# The fix the warning asks for: a bigger cap, and hybrid records the request again.
+TRUNC_SVC=$(api GET "/services/$TRUNC_ID" | sed -E 's/"max_body_bytes":[0-9]+/"max_body_bytes":1048576/; s/"mode":"virtualize"/"mode":"hybrid"/')
+api PUT "/services/$TRUNC_ID" "$TRUNC_SVC" >/dev/null
+code=$(curl -sS --max-time 10 -o "$TMP/trunc2.body" -w '%{http_code}' "$TRUNC_URL")
+assert "hybrid proxies a truncated-only match to the upstream (got $code, $(wc -c <"$TMP/trunc2.body" | tr -d ' ') bytes)" \
+  test "$code" = 200 -a "$(wc -c <"$TMP/trunc2.body" | tr -d ' ')" = "$FULL"
+sleep 1
+api POST "/services/$TRUNC_ID/mode" "{\"mode\":\"virtualize\",\"recording_id\":\"$TRUNC_REC\"}" >/dev/null
+code=$(curl -sS --max-time 10 -o "$TMP/trunc3.body" -w '%{http_code}' "$TRUNC_URL")
+assert "virtualize now serves the complete recording (got $code, $(wc -c <"$TMP/trunc3.body" | tr -d ' ') of $FULL bytes)" \
+  test "$code" = 200 -a "$(wc -c <"$TMP/trunc3.body" | tr -d ' ')" = "$FULL"
+api DELETE "/services/$TRUNC_ID" >/dev/null
 kill "$DEMO2_PID" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------

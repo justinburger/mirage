@@ -171,7 +171,7 @@ function buildLive(ctx, root) {
     // A listener that failed is an error; a running service that reports a note (capture limit reached) is only a warning.
     const kinds = state.services.map((s) => (statusNotice(s.status) || {}).kind);
     const errored = kinds.filter((k) => k === 'failed').length;
-    const noted = kinds.filter((k) => k === 'capture-limit' || k === 'runtime').length;
+    const noted = kinds.filter((k) => k === 'capture-limit' || k === 'truncated' || k === 'runtime').length;
     tSvc.set(`${running} / ${state.services.length}`,
       errored ? `${errored} with errors` : noted ? `${noted} with warnings` : running === state.services.length ? 'all running' : `${state.services.length - running} stopped`,
       errored ? 'err' : noted ? 'warn' : '');

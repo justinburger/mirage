@@ -35,6 +35,12 @@ const (
 	// HeaderInjected is "error" on responses where error amplification
 	// replaced a success with an error.
 	HeaderInjected = "X-Mirage-Injected"
+	// HeaderError names why Mirage answered instead of the recording:
+	// ErrorTruncated, or "store" when a lazily loaded body could not be read.
+	HeaderError = "X-Mirage-Error"
+	// ErrorTruncated is the HeaderError value for a matched recording whose
+	// response body was truncated at capture.
+	ErrorTruncated = "truncated"
 )
 
 // Options configures an Engine.
@@ -49,6 +55,10 @@ type Options struct {
 	MaxResidentBytes int64 // 0 = DefaultMaxResidentBytes
 	// Seed makes random choices reproducible in tests (0 = random seed).
 	Seed uint64
+	// TruncatedAsMiss makes a request whose only matching recordings have a
+	// truncated response body a miss, so that a hybrid service proxies it to
+	// the upstream (and records it again) instead of answering 502.
+	TruncatedAsMiss bool
 }
 
 // OptionsFromService derives Options from a service (defaults applied).
@@ -61,6 +71,7 @@ func OptionsFromService(svc model.Service, n *pathnorm.Normalizer) Options {
 		ErrorAmplification: svc.ErrorAmplification,
 		ErrorFloor:         svc.ErrorFloor,
 		Normalizer:         n,
+		TruncatedAsMiss:    svc.Mode == model.ModeHybrid,
 	}
 }
 
@@ -108,6 +119,7 @@ type Engine struct {
 	builtMaxID int64
 
 	count    atomic.Int64 // exchanges indexed (Len)
+	truncs   atomic.Int64 // requests answered 502 because the body was truncated
 	resident atomic.Int64 // request+response body bytes held in memory
 	lazy     bool         // set by Build before the engine is shared
 	closed   atomic.Bool
@@ -343,10 +355,11 @@ func (e *Engine) Stats() model.VirtualStats {
 		}
 	}
 	return model.VirtualStats{
-		Indexed:  e.count.Load(),
-		Hits:     hits,
-		Misses:   misses,
-		Injected: injected,
+		Indexed:   e.count.Load(),
+		Hits:      hits,
+		Misses:    misses,
+		Injected:  injected,
+		Truncated: e.truncs.Load(),
 		ByLevel: map[string]int64{
 			LevelExact:    lv[levelExact],
 			LevelPath:     lv[levelPath],

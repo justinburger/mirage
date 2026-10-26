@@ -124,19 +124,53 @@ mutually exclusive, and it is a 400 when the service would still have none.
 ```json
 {"service_id":"svc_...","running":true,"addr":"[::]:9001","mode":"record","error":"","warning":"",
  "started_at":"...","captured":1520,"capture_dropped":0,"capture_skipped":0,
- "virtual_hits":0,"virtual_misses":0,"virtual_injected":0,"indexed_exchanges":0}
+ "capture_truncated":0,"virtual_hits":0,"virtual_misses":0,"virtual_injected":0,
+ "virtual_truncated":0,"indexed_exchanges":0}
 ```
 
 `error` says why a service is not running (it could not start, or its listener
 died) or reports a failure found while serving, such as a capture write that
 failed. `warning` is a note about something that leaves the service working;
-today that is `capture limit reached` (the recording holds
-`max_capture_bytes` of bodies: traffic keeps flowing, only capturing stopped).
+it is `capture limit reached` (the recording holds `max_capture_bytes` of
+bodies: traffic keeps flowing, only capturing stopped) or a note mentioning
+`max_body_bytes` when recorded responses were truncated (see below). While the
+capture limit is reached, `capture limit reached` is shown instead of a note
+about truncated captures.
 It appears only on a running service. Both are omitted when empty and cleared
 the next time the service is applied, for example by raising the limit.
 `mode` is the mode of the running listener, or the saved service's mode when
 nothing is running. `virtual_injected` counts injected errors only, the
 responses that carry `X-Mirage-Injected`.
+
+`capture_truncated` counts stored exchanges whose response body was larger than
+`max_body_bytes` and was cut (only the beginning is kept; the traffic itself is
+never truncated). It is not counted when `max_body_bytes` is `-1` (bodies are
+not captured on purpose), it resets when `max_body_bytes` is raised or the
+recording changes, and lowering the cap does not reset it.
+
+A recording that holds only part of a response body is never served as if it
+were complete:
+
+- If the same request was also recorded completely, a complete recording is
+  served; `selection` rotates over the complete recordings as if the truncated
+  ones did not exist.
+- In `hybrid` mode a request whose only recordings are truncated is a miss: it
+  is proxied to the upstream and recorded again, on every such request until
+  `max_body_bytes` is large enough to record it whole (like any other miss
+  that hybrid does not learn).
+- In `virtualize` mode it is answered `502` with `X-Mirage-Error: truncated`,
+  the `X-Mirage-Match` level and a JSON body with `error`, `method`, `path`,
+  `recording_id`, `exchange_id`, `recorded_bytes`, `recorded_bytes_exact`
+  (false when the body was cut while being decompressed, so `recorded_bytes`
+  is only a lower bound) and `kept_bytes`. `virtual_truncated` counts these
+  answers since the virtual index was built.
+- A recording that kept no body at all (`max_body_bytes: -1`, or a HAR entry
+  without response content) is served as recorded, with an empty body.
+
+The truncation `warning` is derived from these counters: it names
+`max_body_bytes` and is shown while they are non-zero. Raise `max_body_bytes`
+and record the affected requests again (switch to `record` or `hybrid`;
+`hybrid` does it by itself).
 
 **Saving a service that cannot start is not an HTTP error.** Create, update,
 `enable` and `mode` persist the service and then apply it to the listener. If

@@ -38,7 +38,7 @@ export const durText = (v) => {
  * @param {object} [o]
  * @param {object|null} [o.service] the service to edit; null creates one
  * @param {Function} [o.onSaved]
- * @param {'max_capture_bytes'} [o.focus] control to focus when editing
+ * @param {'max_capture_bytes' | 'max_body_bytes'} [o.focus] control to focus when editing
  */
 export async function openServiceForm({ service = null, onSaved, focus } = {}) {
   const editing = !!service;
@@ -145,7 +145,8 @@ export async function openServiceForm({ service = null, onSaved, focus } = {}) {
   // follow the mode while it is chosen, but never fight a click on them.
   const captureBox = collapsible('Capture', h('div', { class: 'stack' },
     anon.el, profileRow, F.endpoint_patterns, formGrid(F.timeout, F.max_body_bytes), formGrid(F.capture_sample, F.max_capture_bytes)),
-  { open: startMode !== 'virtualize', hint: 'what is stored when traffic is recorded; not used in virtualize mode' });
+  // Opened from a capture warning ("Raise the limit"), the field to edit must be visible even in virtualize mode.
+  { open: startMode !== 'virtualize' || focus === 'max_body_bytes' || focus === 'max_capture_bytes', hint: 'what is stored when traffic is recorded; not used in virtualize mode' });
   const virt = collapsible('Virtualization', h('div', { class: 'stack' },
     formGrid(F['match.query'], F['match.body']),
     formGrid(F.ignore_params, F['match.headers']),
@@ -320,7 +321,7 @@ export async function openServiceForm({ service = null, onSaved, focus } = {}) {
     size: 'lg',
     content: body,
     footer: [btn('Cancel', { onClick: () => m.close(null) }), saveBtn],
-    initialFocus: editing ? (focus === 'max_capture_bytes' ? capLimit.input : undefined) : name.input,
+    initialFocus: editing ? (focus === 'max_capture_bytes' ? capLimit.input : focus === 'max_body_bytes' ? maxBody.input : undefined) : name.input,
   });
   return m;
 }

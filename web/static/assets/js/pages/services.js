@@ -15,7 +15,9 @@ function stateCell(st, enabled) {
   if (st.running) {
     const tag = !n ? null : n.kind === 'capture-limit'
       ? badge('Capture full', 'warn', { title: 'The capture limit was reached: traffic is served, but no new exchanges are recorded.' })
-      : badge('Warning', 'warn', { title: n.text });
+      : n.kind === 'truncated'
+        ? badge('Truncated bodies', 'warn', { title: n.text })
+        : badge('Warning', 'warn', { title: n.text });
     return h('span', { class: 'status-text' }, dot('live'), 'Running', tag);
   }
   if (n) return h('span', { class: 'status-text', title: n.text, style: 'color:var(--err)' }, dot('err'), 'Error');
@@ -181,6 +183,16 @@ export async function detail(ctx) {
         h('div', null, `The recording holds the capture limit${limit} of request and response bodies, so new exchanges are no longer stored. The service itself is running: traffic is still proxied and measured.`),
         h('div', null, btn('Raise the limit', { size: 'sm', icon: 'edit', onClick: () => openServiceForm({ service: svc, focus: 'max_capture_bytes', onSaved: () => reload() }) }))),
       { title: `Capture stopped: limit${limit ? ` of ${fmtBytes(svc.max_capture_bytes)}` : ''} reached` }));
+    } else if (n.kind === 'truncated') {
+      const cap = fmtBytes(svc.max_body_bytes > 0 ? svc.max_body_bytes : 1048576);
+      const next = svc.mode === 'virtualize'
+        ? `Raise max_body_bytes (now ${cap}), then switch to Record or Hybrid to record these requests again; Hybrid re-records them by itself.`
+        : `Raise max_body_bytes (now ${cap}); requests recorded after that are kept whole.`;
+      errHost.replaceChildren(alertBox('warn', h('div', { class: 'stack-sm' },
+        h('div', null, n.text.charAt(0).toUpperCase() + n.text.slice(1) + '.'),
+        h('div', { class: 'muted' }, next),
+        h('div', null, btn('Raise max_body_bytes', { size: 'sm', icon: 'edit', onClick: () => openServiceForm({ service: svc, focus: 'max_body_bytes', onSaved: () => reload() }) }))),
+      { title: 'Recorded bodies were truncated' }));
     } else {
       errHost.replaceChildren(alertBox('warn', n.text, { title: 'The service reported a problem while running' }));
     }
@@ -241,14 +253,16 @@ export async function detail(ctx) {
       cells.push(
         cell('Captured', fmtInt(st.captured), capFull ? 'stopped: capture limit reached' : `exchanges written${sample}`, capFull ? 'warn' : ''),
         cell('Capture dropped', fmtInt(st.capture_dropped), st.capture_dropped ? 'queue was full' : 'none', st.capture_dropped ? 'warn' : ''),
-        cell('Capture skipped', fmtInt(st.capture_skipped), st.capture_skipped ? 'client left early, sampled out or over the limit' : 'none', ''));
+        cell('Capture skipped', fmtInt(st.capture_skipped), st.capture_skipped ? 'client left early, sampled out or over the limit' : 'none', ''),
+        cell('Bodies truncated', fmtInt(st.capture_truncated || 0), st.capture_truncated ? 'larger than max_body_bytes' : 'none', st.capture_truncated ? 'warn' : ''));
     }
     if (virt) {
       cells.push(
         cell('Virtual hits', fmtInt(hits), total ? `${fmtPct(hits / total)} hit rate` : ''),
         cell('Virtual misses', fmtInt(misses), svc.mode === 'hybrid' ? 'proxied and recorded' : `answered ${svc.match.miss_status}`, total && misses / total > 0.05 ? 'warn' : ''),
         cell('Errors injected', fmtInt(st.virtual_injected), svc.error_amplification !== 1 || svc.error_floor > 0 ? `by ${svc.error_amplification}× amplification${svc.error_floor > 0 ? ` and ${fmtPct(svc.error_floor)} floor` : ''}` : 'amplification is off', ''),
-        cell('Indexed', fmtInt(st.indexed_exchanges), 'exchanges in index'));
+        cell('Indexed', fmtInt(st.indexed_exchanges), 'exchanges in index'),
+        cell('Truncated matches', fmtInt(st.virtual_truncated || 0), st.virtual_truncated ? 'answered 502: recording incomplete' : 'none', st.virtual_truncated ? 'warn' : ''));
     }
     statusHost.replaceChildren(h('div', { class: 'stat-grid cols-4' }, ...cells));
   }

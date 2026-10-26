@@ -84,6 +84,23 @@
 // ({"error":"no recorded response matches this request","method":…,
 // "path":…,"recording_id":…}) and "X-Mirage-Match: miss".
 //
+// Truncated recordings. A recording whose Response.BodyTruncated is set holds
+// only part of its body (it exceeded max_body_bytes at capture, or was cut in
+// an imported HAR). It is never served as if it were complete: a prefix with
+// a matching Content-Length would look like the real response. Such
+// exchanges stay in the index, so the request still matches, but when an
+// entry holds any, selection picks among its complete candidates only (the
+// rotation behaves as if the truncated ones were absent) and falls back to a
+// truncated one only when nothing else matches. They are left out of the
+// error-amplification pools. With Options.TruncatedAsMiss (hybrid services) a
+// truncated-only match is a miss, so the proxy forwards the request and
+// records it again. Otherwise Respond answers 502 with
+// "X-Mirage-Error: truncated", the match level, and a JSON body ({"error":…,
+// "method":…,"path":…,"recording_id":…,"exchange_id":…,"recorded_bytes":…,
+// "recorded_bytes_exact":…,"kept_bytes":…}); Stats.Truncated counts these. A
+// recording that kept no body at all (max_body_bytes -1, a HAR entry without
+// content) is served as recorded, empty.
+//
 // Memory. If the recording's captured bytes exceed MaxResidentBytes, keep
 // only the index and request-side keys in memory and load response bodies on
 // demand with store.GetExchange through an LRU cache bounded by

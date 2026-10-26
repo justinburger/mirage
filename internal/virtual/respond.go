@@ -79,6 +79,14 @@ func (e *Engine) Respond(w http.ResponseWriter, r *http.Request, m *Match) {
 			e.writeLoadError(w, r, err)
 			return
 		}
+		if it.truncated && len(body.raw) > 0 {
+			// Serving the prefix with a matching Content-Length would hand the
+			// client a response it cannot tell from a complete one. A body that
+			// was not kept at all (max_body_bytes -1, a HAR without content)
+			// is served as recorded, empty.
+			e.writeTruncated(w, r, m, it, len(body.raw))
+			return
+		}
 		status, hdrs, gzOK = responseStatus(it.status), it.hdrs, it.gzip
 	}
 
@@ -157,8 +165,66 @@ func (e *Engine) writeLoadError(w http.ResponseWriter, r *http.Request, err erro
 	h := w.Header()
 	h.Set("Content-Type", "application/json")
 	h.Set("Content-Length", strconv.Itoa(len(body)))
-	h.Set("X-Mirage-Error", "store")
+	h.Set(HeaderError, "store")
 	w.WriteHeader(http.StatusInternalServerError)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(body)
+	}
+}
+
+// truncatedBody is the JSON document answered for a truncated recording.
+type truncatedBody struct {
+	Error       string `json:"error"`
+	Method      string `json:"method"`
+	Path        string `json:"path"`
+	RecordingID string `json:"recording_id"`
+	ExchangeID  int64  `json:"exchange_id,omitempty"`
+	// RecordedBytes is the size of the original response body. When the body
+	// was cut while being decompressed it is only a lower bound and
+	// RecordedBytesExact is false.
+	RecordedBytes      int64 `json:"recorded_bytes"`
+	RecordedBytesExact bool  `json:"recorded_bytes_exact"`
+	KeptBytes          int64 `json:"kept_bytes"` // bytes kept in the recording
+}
+
+// truncatedMessage is the error text of a truncated-recording answer.
+const truncatedMessage = "only part of this response body was recorded (it was larger than the service's max_body_bytes when it was captured, or it was cut in an imported HAR), so it cannot be served faithfully; raise max_body_bytes and record this request again"
+
+// writeTruncated answers a request whose matched recording holds only part of
+// its response body: 502 with a JSON explanation, the match level, and
+// "X-Mirage-Error: truncated". No latency is simulated.
+func (e *Engine) writeTruncated(w http.ResponseWriter, r *http.Request, m *Match, it *item, kept int) {
+	e.truncs.Add(1)
+	path := "/"
+	if r.URL != nil {
+		if path = r.URL.EscapedPath(); path == "" {
+			path = "/"
+		}
+	}
+	doc := truncatedBody{
+		Error:              truncatedMessage,
+		Method:             r.Method,
+		Path:               path,
+		RecordingID:        e.opts.RecordingID,
+		KeptBytes:          int64(kept),
+		RecordedBytesExact: true,
+	}
+	if ex := it.ex; ex != nil {
+		doc.ExchangeID = ex.ID
+		doc.RecordedBytes = ex.Response.BodySize
+		// A body cut while being decoded only knows it was bigger than the
+		// cap (the capture records max_body_bytes+1 or the wire size).
+		doc.RecordedBytesExact = ex.Response.ContentEncoding == ""
+	}
+	body, _ := json.Marshal(doc)
+	h := w.Header()
+	h.Set("Content-Type", "application/json")
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	h.Set(HeaderError, ErrorTruncated)
+	if m.Level != "" {
+		h.Set(HeaderMatch, m.Level)
+	}
+	w.WriteHeader(http.StatusBadGateway)
 	if r.Method != http.MethodHead {
 		_, _ = w.Write(body)
 	}

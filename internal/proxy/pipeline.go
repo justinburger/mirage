@@ -340,6 +340,14 @@ func (p *pipeline) flush(recordingID string, jobs []*captureJob) {
 	for _, j := range jobs {
 		stored := int64(len(j.ex.Request.Body) + len(j.ex.Response.Body))
 		j.svc.captured.Add(1)
+		if j.ex.Response.BodyTruncated && j.st.bodyCap > 0 {
+			// max_body_bytes -1 drops bodies on purpose; only a real cap
+			// counts. A capture queued before the cap or recording changed
+			// would bring back a warning the user has just acted on.
+			if cur := j.svc.state.Load(); cur != nil && cur.bodyCap == j.st.bodyCap && cur.svc.RecordingID == j.st.svc.RecordingID {
+				j.svc.truncated.Add(1)
+			}
+		}
 		j.svc.used.Add(stored)
 		j.release(p)
 		p.learn(j) // hands the exchange over: do not touch j.ex afterwards

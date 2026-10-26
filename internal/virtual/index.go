@@ -52,6 +52,12 @@ type entry struct {
 	cands    []*item
 	cursor   atomic.Uint64
 	unsorted bool // Build only: cands needs sorting before use
+	// mixed is set (under the shard lock, like cands) once a truncated
+	// candidate is added. complete then holds the complete candidates in the
+	// same order, maintained like cands, so a lookup can pick among them in
+	// O(1).
+	mixed    bool
+	complete []*item
 }
 
 // item is one servable exchange. It is immutable once indexed.
@@ -60,6 +66,7 @@ type item struct {
 	id        int64
 	status    int
 	isErr     bool
+	truncated bool // response body was cut at capture; never served as a body
 	gzip      bool // response may be re-encoded as gzip
 	ttfb, dur time.Duration
 	ep        *epool
@@ -96,24 +103,39 @@ func cmpItems(a, b *item) int {
 // engine is shared) out-of-order items are appended and the entry is marked
 // for sorting by finalize.
 func (en *entry) add(it *item, bulk bool) {
-	n := len(en.cands)
-	if n == 0 || !before(it, en.cands[n-1]) {
+	if it.truncated && !en.mixed {
+		// From now on complete mirrors cands without the truncated items.
+		en.mixed = true
+		en.complete = slices.Clone(en.cands)
+	}
+	var unsorted bool
+	en.cands, unsorted = insertItem(en.cands, it, bulk)
+	en.unsorted = en.unsorted || unsorted
+	if en.mixed && !it.truncated {
+		en.complete, unsorted = insertItem(en.complete, it, bulk)
+		en.unsorted = en.unsorted || unsorted
+	}
+}
+
+// insertItem inserts it into list in (StartedAt, Seq) order and returns the
+// new list. With bulk set out-of-order items are appended and reported as
+// unsorted (finalize sorts them).
+func insertItem(list []*item, it *item, bulk bool) ([]*item, bool) {
+	n := len(list)
+	if n == 0 || !before(it, list[n-1]) {
 		// Appending is safe for readers holding the old slice header: they
 		// never look beyond their own length.
-		en.cands = append(en.cands, it)
-		return
+		return append(list, it), false
 	}
 	if bulk {
-		en.cands = append(en.cands, it)
-		en.unsorted = true
-		return
+		return append(list, it), true
 	}
-	i := sort.Search(n, func(i int) bool { return before(it, en.cands[i]) })
-	nc := make([]*item, n+1)
-	copy(nc, en.cands[:i])
-	nc[i] = it
-	copy(nc[i+1:], en.cands[i:])
-	en.cands = nc
+	i := sort.Search(n, func(i int) bool { return before(it, list[i]) })
+	nl := make([]*item, n+1)
+	copy(nl, list[:i])
+	nl[i] = it
+	copy(nl[i+1:], list[i:])
+	return nl, false
 }
 
 // put adds it to the entry for key.
@@ -138,6 +160,7 @@ func (e *Engine) finalize() {
 		for _, en := range sh.m {
 			if en.unsorted {
 				slices.SortStableFunc(en.cands, cmpItems)
+				slices.SortStableFunc(en.complete, cmpItems)
 				en.unsorted = false
 			}
 		}
@@ -199,7 +222,13 @@ func (e *Engine) insert(ex *model.Exchange, bulk bool) {
 	} else {
 		e.resident.Add(size)
 	}
-	ep.record(it, isErr, !bulk)
+	// A truncated recording is never used to replace another response
+	// during error amplification, but it still counts toward the rate.
+	if it.truncated {
+		ep.record(nil, isErr, !bulk)
+	} else {
+		ep.record(it, isErr, !bulk)
+	}
 
 	var kb [320]byte
 	key := append(kb[:0], keyExact)
@@ -301,12 +330,13 @@ func (e *Engine) internHeaders(hs []hdr) []hdr {
 // copy without bodies).
 func newItem(ex *model.Exchange, lazy bool) *item {
 	it := &item{
-		status: ex.Response.Status,
-		isErr:  ex.IsError(),
-		gzip:   ex.Response.ContentEncoding == "gzip",
-		ttfb:   ex.TTFB.D(),
-		dur:    ex.Duration.D(),
-		hdrs:   buildHeaders(ex.Response.Header, ex.Response.ContentEncoding != ""),
+		status:    ex.Response.Status,
+		isErr:     ex.IsError(),
+		truncated: ex.Response.BodyTruncated,
+		gzip:      ex.Response.ContentEncoding == "gzip",
+		ttfb:      ex.TTFB.D(),
+		dur:       ex.Duration.D(),
+		hdrs:      buildHeaders(ex.Response.Header, ex.Response.ContentEncoding != ""),
 	}
 	if lazy {
 		c := *ex
@@ -412,6 +442,12 @@ func (e *Engine) lookup(r *http.Request, body []byte, m *Match) bool {
 		key = append(key, suffix...)
 		ok = e.find(maphash.Bytes(e.seed, key), key, path, http.MethodGet, req, m)
 	}
+	if ok && e.opts.TruncatedAsMiss && m.it != nil && m.it.truncated {
+		// Hybrid: let the upstream answer (and the capture repair the
+		// recording) instead of answering from an incomplete body.
+		*m = Match{}
+		ok = false
+	}
 	if !ok {
 		stripe.misses.Add(1)
 		return false
@@ -482,17 +518,38 @@ func (e *Engine) probe(h uint64, key []byte, req []param) *item {
 	sh := &e.shards[h&(numShards-1)]
 	sh.mu.RLock()
 	en := sh.m[string(key)]
-	var cands []*item
+	var cands, complete []*item
 	if en != nil {
 		cands = en.cands
+		if en.mixed {
+			complete = en.complete
+		}
 	}
 	sh.mu.RUnlock()
 	if len(cands) == 0 {
 		return nil
 	}
+	// When some candidates hold a truncated body, choose among the complete
+	// ones only, so the selection rotates over them exactly as if the
+	// truncated ones were not there; fall back to all candidates (and so to
+	// a truncated one) only when nothing complete matches.
 	if !e.cfg.subset {
+		if len(complete) > 0 {
+			return complete[e.pick(en, len(complete))]
+		}
 		return cands[e.pick(en, len(cands))]
 	}
+	if len(complete) > 0 {
+		if it := e.pickSubset(en, complete, req); it != nil {
+			return it
+		}
+	}
+	return e.pickSubset(en, cands, req)
+}
+
+// pickSubset picks among the candidates whose recorded query parameters are a
+// subset of the request's. It returns nil when none qualifies.
+func (e *Engine) pickSubset(en *entry, cands []*item, req []param) *item {
 	n := 0
 	for _, c := range cands {
 		if subsetOf(c.params, req) {

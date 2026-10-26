@@ -76,12 +76,18 @@ export async function refreshInfo() {
  * server reports "capture limit reached" in the separate `warning` field (the
  * service is fine, only capturing stopped), which is never a failure; older
  * servers put the same text in `error`, so the text is recognised in both.
- * Returns {kind: 'failed' | 'capture-limit' | 'runtime', text} or null.
+ * Returns {kind: 'failed' | 'capture-limit' | 'truncated' | 'runtime', text} or null.
  */
 export function statusNotice(st) {
   if (!st) return null;
   const note = st.running ? (st.error || st.warning) : '';
-  if (note) return { kind: /capture limit reached/i.test(note) ? 'capture-limit' : 'runtime', text: note };
+  if (note) {
+    // Truncation notes come first when joined with "capture limit reached":
+    // they describe requests that are failing right now.
+    const kind = !st.error && /max_body_bytes/.test(note) ? 'truncated'
+      : /capture limit reached/i.test(note) ? 'capture-limit' : 'runtime';
+    return { kind, text: note };
+  }
   if (st.error) return { kind: 'failed', text: st.error };
   return null;
 }

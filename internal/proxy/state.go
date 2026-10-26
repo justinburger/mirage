@@ -66,7 +66,11 @@ func effectiveProfileID(svc model.Service) string {
 // sameVirtualization reports whether two service configurations produce the
 // same virtual index, so a running virtualizer can be kept.
 func sameVirtualization(a, b model.Service) bool {
+	// Hybrid treats truncated-only matches as misses (see
+	// virtual.Options.TruncatedAsMiss), so moving in or out of hybrid needs a
+	// new engine.
 	return a.RecordingID == b.RecordingID &&
+		(a.Mode == model.ModeHybrid) == (b.Mode == model.ModeHybrid) &&
 		reflect.DeepEqual(a.Match, b.Match) &&
 		a.Latency == b.Latency &&
 		a.ErrorAmplification == b.ErrorAmplification &&

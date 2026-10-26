@@ -338,3 +338,32 @@ func BenchmarkJSONBodyKey(b *testing.B) {
 		_ = e.appendBodyKey(buf[:0], body)
 	}
 }
+
+// A hot key with many recordings: one truncated candidate must not turn the
+// O(1) pick into a scan over all of them.
+func BenchmarkLookupHotKey(b *testing.B) {
+	for _, tc := range []struct {
+		name      string
+		truncated bool
+		query     model.QueryMatch
+	}{
+		{"complete", false, model.QueryExact},
+		{"one-truncated", true, model.QueryExact},
+		{"subset-complete", false, model.QuerySubset},
+		{"subset-one-truncated", true, model.QuerySubset},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			const n = 20000
+			e := NewEngine(nil, Options{Match: model.MatchConfig{Query: tc.query}, Latency: model.LatencyConfig{Mode: model.LatencyNone}})
+			b.Cleanup(func() { _ = e.Close() })
+			for i := range n {
+				ex := mkEx(int64(i+1), "GET", "/hot", 200, "ok")
+				if tc.truncated && i == n/2 {
+					ex.Response.BodyTruncated, ex.Response.BodySize = true, 1<<20
+				}
+				e.Add(ex)
+			}
+			benchLookup(b, e, "/hot", "GET", nil, LevelExact)
+		})
+	}
+}

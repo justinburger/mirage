@@ -47,6 +47,7 @@ type service struct {
 	captured   atomic.Int64
 	dropped    atomic.Int64
 	skipped    atomic.Int64
+	truncated  atomic.Int64 // stored exchanges whose response body was cut at bodyCap
 	used       atomic.Int64 // body bytes stored in the recording (capture limit)
 	pending    atomic.Int64 // body bytes of this service waiting in the capture queue
 	limitNoted atomic.Bool  // "capture limit reached" is set in rtWarn
@@ -102,6 +103,7 @@ func (s *service) apply(ctx context.Context, svc model.Service) error {
 		s.captured.Store(0)
 		s.dropped.Store(0)
 		s.skipped.Store(0)
+		s.truncated.Store(0)
 	case listenerChanged(s.cfg, svc):
 		oldLis = s.lis
 		if sameSocket(s.cfg.ListenAddr, svc.ListenAddr) {
@@ -125,6 +127,13 @@ func (s *service) apply(ctx context.Context, svc model.Service) error {
 	}
 	s.limitNoted.Store(false)
 	s.state.Store(next)
+	if prev != nil && (raisedCap(prev.bodyCap, next.bodyCap) || prev.svc.RecordingID != svc.RecordingID) {
+		// The warning tells the user to raise max_body_bytes or record into
+		// another recording: once they have, stop repeating it. Reset after
+		// publishing next: a flush that still sees prev would otherwise
+		// count an old-cap capture after the reset.
+		s.truncated.Store(0)
+	}
 	if newLis != nil {
 		s.lis = newLis
 		s.serve(newLis)
@@ -265,10 +274,61 @@ func (s *service) status() model.ServiceStatus {
 	out.Captured = s.captured.Load()
 	out.CaptureDropped = s.dropped.Load()
 	out.CaptureSkipped = s.skipped.Load()
+	out.CaptureTruncated = s.truncated.Load()
 	if st := s.state.Load(); st != nil && st.virt != nil {
 		vs := st.virt.Stats()
 		out.VirtualHits, out.VirtualMisses = vs.Hits, vs.Misses
 		out.VirtualInjected, out.IndexedExchanges = vs.Injected, vs.Indexed
+		out.VirtualTruncated = vs.Truncated
+	}
+	if out.Running {
+		out.Warning = joinWarnings(out.Warning, truncationWarning(out.VirtualTruncated, out.CaptureTruncated), out.VirtualTruncated > 0)
 	}
 	return out
+}
+
+// raisedCap reports whether a new body cap captures more than the old one
+// (0 means bodies are not captured; a positive cap is a byte limit).
+func raisedCap(prev, next int64) bool {
+	return next > prev
+}
+
+// joinWarnings combines the runtime warning with the truncation note. Answers
+// that are failing right now (served > 0) come first; a note about what was
+// recorded only shows when nothing else is reported.
+func joinWarnings(runtime, trunc string, served bool) string {
+	switch {
+	case trunc == "":
+		return runtime
+	case runtime == "":
+		return trunc
+	case served:
+		return trunc + "; " + runtime
+	}
+	return runtime
+}
+
+// truncationWarning explains truncated recordings, or returns "".
+func truncationWarning(served, captured int64) string {
+	switch {
+	case served > 0:
+		return fmt.Sprintf("%s recordings that hold only part of their response body and %s answered 502: raise max_body_bytes, then record them again in record or hybrid mode",
+			plural(served, "request matched", "requests matched"), plural1(served, "was", "were"))
+	case captured > 0:
+		return fmt.Sprintf("%s larger than max_body_bytes and %s stored truncated; virtualize answers %s 502 until you raise max_body_bytes and record %s again",
+			plural(captured, "captured response was", "captured responses were"), plural1(captured, "was", "were"),
+			plural1(captured, "it", "them"), plural1(captured, "it", "them"))
+	}
+	return ""
+}
+
+// plural formats n with the singular or plural phrase; plural1 returns just
+// the matching word.
+func plural(n int64, one, many string) string { return fmt.Sprintf("%d %s", n, plural1(n, one, many)) }
+
+func plural1(n int64, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }

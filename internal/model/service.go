@@ -331,10 +331,12 @@ type ServiceStatus struct {
 	Addr      string `json:"addr,omitempty"` // resolved listen address
 	Mode      Mode   `json:"mode"`
 	Error     string `json:"error,omitempty"` // last start/runtime error
-	// Warning is a note about something that happened while serving that
-	// leaves the service working, such as "capture limit reached": traffic
-	// keeps flowing, only capturing stopped. Cleared when the service is
-	// applied again (raising the limit, say). Error stays for failures.
+	// Warning is a note about something that leaves the service working:
+	// "capture limit reached" (traffic keeps flowing, only capturing stopped;
+	// cleared when the service is applied again) and/or a note about truncated
+	// recordings naming max_body_bytes (derived from CaptureTruncated and
+	// VirtualTruncated; shown while they are non-zero). Error stays for
+	// failures.
 	Warning   string     `json:"warning,omitempty"`
 	StartedAt *time.Time `json:"started_at,omitempty"`
 	// Captured counts exchanges written to the recording since start.
@@ -345,11 +347,20 @@ type ServiceStatus struct {
 	// CaptureSkipped counts exchanges not captured because the client went
 	// away before the upstream response finished, or sampling skipped them.
 	CaptureSkipped int64 `json:"capture_skipped"`
+	// CaptureTruncated counts stored exchanges whose response body was larger
+	// than max_body_bytes and was cut (not counted with max_body_bytes -1;
+	// reset when the cap is raised or the recording changes). Virtualize
+	// answers such recordings with a 502 (see VirtualTruncated).
+	CaptureTruncated int64 `json:"capture_truncated"`
 	// VirtualHits/VirtualMisses count virtualization lookups since start.
 	VirtualHits   int64 `json:"virtual_hits"`
 	VirtualMisses int64 `json:"virtual_misses"`
 	// VirtualInjected counts responses swapped by error amplification.
 	VirtualInjected int64 `json:"virtual_injected"`
+	// VirtualTruncated counts requests answered 502 because every matching
+	// recording held only part of its response body (raise max_body_bytes and
+	// record them again).
+	VirtualTruncated int64 `json:"virtual_truncated"`
 	// IndexedExchanges is the size of the virtualization index (0 when not
 	// virtualizing).
 	IndexedExchanges int64 `json:"indexed_exchanges"`
@@ -370,9 +381,12 @@ func (s ServiceStatus) MarshalJSON() ([]byte, error) {
 // VirtualStats counts virtualization activity of one service since its
 // virtual index was built.
 type VirtualStats struct {
-	Indexed  int64            `json:"indexed"`
-	Hits     int64            `json:"hits"`
-	Misses   int64            `json:"misses"`
-	Injected int64            `json:"injected"`
-	ByLevel  map[string]int64 `json:"by_level"`
+	Indexed  int64 `json:"indexed"`
+	Hits     int64 `json:"hits"`
+	Misses   int64 `json:"misses"`
+	Injected int64 `json:"injected"`
+	// Truncated counts requests answered 502 because every matching
+	// recording held only part of its response body (see docs/API.md).
+	Truncated int64            `json:"truncated"`
+	ByLevel   map[string]int64 `json:"by_level"`
 }
