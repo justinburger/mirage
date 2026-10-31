@@ -117,6 +117,8 @@ const (
 	DefaultReplayMaxConcurrency = 64   // max mode workers
 	DefaultReplayTimeout        = 30 * time.Second
 	MaxReplayConcurrency        = 100000
+	// MaxReplayRate bounds rate and stage rates (requests per second).
+	MaxReplayRate = 10000000
 	// MaxReplaySeries is the most per-second points a job keeps; longer runs
 	// merge adjacent points (halving resolution) to stay under it.
 	MaxReplaySeries = 7200
@@ -208,9 +210,38 @@ func (c ReplayConfig) Validate() error {
 			p.add("filter %q: %v", re, err)
 		}
 	}
-	for k := range c.SetHeaders {
-		if strings.TrimSpace(k) == "" {
-			p.add("set_headers has an empty header name")
+	for k, v := range c.SetHeaders {
+		if !validHeaderName(k) {
+			p.add("set_headers: %q is not a valid header name", k)
+		}
+		if !validHeaderValue(v) {
+			p.add("set_headers: the value of %q contains control characters (CR, LF, ...)", k)
+		}
+	}
+	for _, k := range c.RemoveHeaders {
+		if !validHeaderName(k) {
+			p.add("remove_headers: %q is not a valid header name", k)
+		}
+	}
+	if !validHeaderValue(c.HostHeader) || strings.ContainsAny(c.HostHeader, " \t/") {
+		p.add("host_header %q is not a valid host", c.HostHeader)
+	}
+	rates := []float64{c.Speed, c.Rate, c.ErrorAmplification}
+	for _, s := range c.Stages {
+		rates = append(rates, s.Rate)
+	}
+	if !finite(rates...) {
+		p.add("speed, rate, stage rates and error_amplification must be numbers")
+	}
+	for _, r := range rates[1:2] {
+		if r > MaxReplayRate {
+			p.add("rate must be at most %d requests per second", MaxReplayRate)
+		}
+	}
+	for _, s := range c.Stages {
+		if s.Rate > MaxReplayRate {
+			p.add("stage rates must be at most %d requests per second", MaxReplayRate)
+			break
 		}
 	}
 	return p.err()

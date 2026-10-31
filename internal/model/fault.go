@@ -79,7 +79,7 @@ func (r FaultRule) Validate() error {
 	if strings.TrimSpace(r.Name) == "" {
 		p.add("name is required")
 	}
-	if r.Probability < 0 || r.Probability > 1 {
+	if !finite(r.Probability) || r.Probability < 0 || r.Probability > 1 {
 		p.add("probability must be between 0 and 1")
 	}
 	switch r.Type {

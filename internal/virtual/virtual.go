@@ -59,6 +59,21 @@ type Options struct {
 	// truncated response body a miss, so that a hybrid service proxies it to
 	// the upstream (and records it again) instead of answering 502.
 	TruncatedAsMiss bool
+	// Anonymizer, when set, is the anonymization the recording was captured
+	// with (a service with anonymize_capture on, using its profile). A
+	// recording made that way stores anonymized paths, queries, bodies and
+	// headers, so the raw request of a client cannot match it directly:
+	// lookups first try the anonymized form of the request (a copy; the
+	// request itself is never changed) and then the request as received,
+	// which still matches traffic that is already anonymized, such as a
+	// replay of the recording.
+	Anonymizer RequestAnonymizer
+}
+
+// RequestAnonymizer anonymizes a request in place. *anonymize.Engine
+// implements it.
+type RequestAnonymizer interface {
+	Request(r *model.Request) error
 }
 
 // OptionsFromService derives Options from a service (defaults applied).

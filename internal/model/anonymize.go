@@ -41,6 +41,13 @@ const (
 	TargetQuery RuleTarget = "query"
 	// TargetCookie: Selector is a cookie name, in Cookie and Set-Cookie.
 	TargetCookie RuleTarget = "cookie"
+	//
+	// Key names in query, cookie and form selectors and in JSONPath recursive
+	// descent ("$..api_key") are compared ignoring case and the characters
+	// "_" and "-": "api_key" also matches apiKey, API-KEY and apikey. A form
+	// or query name like "user[password]" also matches by its last bracketed
+	// part. When several rules match the same value, the first one in the
+	// list wins and later ones leave it alone.
 	// TargetJSON: Selector is a JSONPath subset applied to JSON bodies:
 	// "$.user.email", "$.items[*].card", "$.items[0].id", "$..email"
 	// (recursive descent by key name) and "$.*" wildcards. One filter is
@@ -191,7 +198,7 @@ const (
 //	2  postal addresses, customer and cardholder names, a "name" next to an
 //	   e-mail or phone, XML password and token elements, more credential
 //	   query parameters and headers
-const DefaultProfileRev = 2
+const DefaultProfileRev = 3
 
 // defaultProfileDescription is the Description of the built-in profile.
 const defaultProfileDescription = "Hashes auth headers, session cookies and common credential fields (passwords, tokens, API keys, OAuth and cloud signatures). " +
@@ -213,6 +220,9 @@ var defaultRedactHeaders = []string{
 	"Api-Key", "Apikey", "X-Apikey", "X-Api-Token", "X-Auth-Key", "X-Goog-Api-Key",
 	"X-Amz-Security-Token", "X-Session-Id", "X-Session-Token",
 	"X-Xsrf-Token", "X-Csrftoken", "True-Client-Ip", "Cf-Connecting-Ip",
+	// Revision 3.
+	"X-Vault-Token", "Private-Token", "X-Hub-Signature", "X-Hub-Signature-256",
+	"X-Id-Token", "X-Refresh-Token", "X-Amz-Signature", "Authentication",
 }
 
 // defaultSiblingNames are the members whose presence next to a "name" member
@@ -321,6 +331,21 @@ func defaultRules() []AnonymizationRule {
 			Scope:    ScopeBoth, Strategy: StrategyHash,
 		},
 	)
+
+	// Revision 3. Key names are compared ignoring case, "_" and "-" (see
+	// AnonymizationRule), so one entry covers password, Password and
+	// PASSWORD, and access_token covers accessToken and access-token.
+	for _, k := range []string{
+		"passphrase", "new_password", "old_password", "current_password", "user_password",
+		"password_confirmation", "confirm_password", "api_secret", "secret_key", "private_key",
+	} {
+		add("json-"+k, "JSON "+k, TargetJSON, "$.."+k, StrategyRedact, "")
+		add("form-"+k, "Form "+k, TargetForm, k, StrategyRedact, "")
+	}
+	for _, k := range []string{"auth_token", "bearer_token", "jwt", "session", "csrf_token", "xsrf_token", "authorization"} {
+		add("json-"+k, "JSON "+k, TargetJSON, "$.."+k, StrategyHash, "")
+		add("form-"+k, "Form "+k, TargetForm, k, StrategyHash, "")
+	}
 	return rules
 }
 

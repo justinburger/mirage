@@ -2,10 +2,10 @@ package model
 
 import (
 	"encoding/json"
+	"github.com/justinburger/mirage/internal/pathnorm"
 	"net"
 	"net/url"
 	"regexp"
-	"strings"
 	"time"
 )
 
@@ -300,9 +300,12 @@ func (s Service) Validate() error {
 		p.add("error_floor must be between 0 and 1")
 	}
 	for _, pat := range s.EndpointPatterns {
-		if !strings.HasPrefix(pat, "/") {
-			p.add("endpoint pattern %q must start with /", pat)
+		if err := pathnorm.ValidatePattern(pat); err != nil {
+			p.add("endpoint pattern %q: %v", pat, err)
 		}
+	}
+	if !finite(s.CaptureSample, s.ErrorAmplification, s.ErrorFloor, s.Latency.Multiplier) {
+		p.add("capture_sample, error_amplification, error_floor and latency.multiplier must be numbers")
 	}
 	return p.err()
 }
