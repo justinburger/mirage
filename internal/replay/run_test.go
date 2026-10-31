@@ -700,17 +700,20 @@ func TestRunProgressAndSeries(t *testing.T) {
 			t.Errorf("progress went backwards: %+v then %+v", progress[i-1], progress[i])
 		}
 	}
-	if progress[0].Sent == 0 || progress[len(progress)-1].Sent > sum.Sent {
+	// The first call can land in the first milliseconds of the run (the second
+	// boundary is wherever the wall clock puts it), before anything is sent;
+	// the last one is a second or more in.
+	if progress[len(progress)-1].Sent == 0 || progress[len(progress)-1].Sent > sum.Sent {
 		t.Errorf("progress sent %d..%d, final %d", progress[0].Sent, progress[len(progress)-1].Sent, sum.Sent)
 	}
 	if len(series) < 3 {
-		t.Fatalf("%d series points for a 2.3s run", len(series))
+		t.Fatalf("%d series points for a 2.3s run: %v", len(series), seriesTimes(series))
 	}
 	var total int64
 	for i, p := range series {
 		total += p.Requests
 		if i > 0 && p.T != series[i-1].T+1000 {
-			t.Errorf("point %d at %d does not follow %d by one second", i, p.T, series[i-1].T)
+			t.Errorf("point %d at %d does not follow %d by one second (all: %v)", i, p.T, series[i-1].T, seriesTimes(series))
 		}
 		if p.Requests > 0 && (p.P95 <= 0 || p.CorrectedP95 < p.P95) {
 			t.Errorf("point %d: p95=%v corrected p95=%v", i, p.P95, p.CorrectedP95)

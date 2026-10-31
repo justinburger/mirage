@@ -608,6 +608,102 @@ func TestLargeBodiesAreForwardedIntactAndCaptureTruncated(t *testing.T) {
 	}
 }
 
+// TestResponseIsNotCutOffWhileTheRequestBodyIsStillBeingSent pins the cause of
+// the CI-only "unexpected EOF" flake of
+// TestLargeBodiesAreForwardedIntactAndCaptureTruncated.
+//
+// net/http's HTTP/1 server closes the request body of a handler that starts
+// its response before it has read the whole body, unless the handler asked
+// for full duplex (http.ResponseController.EnableFullDuplex). The proxy hands
+// the client's body to the upstream transport, which keeps reading it on its
+// own goroutine, so that close can land in the middle of the transport's
+// read: the transport fails with "invalid Read on closed Body", drops the
+// upstream connection and the response the client is reading stops with an
+// error. That happens whenever the upstream answers before the upload has
+// finished (an early answer, a streaming service) and, as a race, when the
+// transport is only a few microseconds behind a fast upstream, as in the
+// flaky test.
+//
+// Here the upstream answers after the first kilobyte and the client sends the
+// rest of its upload once the answer is under way, so the answer is always
+// ahead of the request body. Nothing may be cut: the client gets the whole
+// response and the upstream gets the whole request.
+func TestResponseIsNotCutOffWhileTheRequestBodyIsStillBeingSent(t *testing.T) {
+	const respSize = 3 << 20
+	rnd := rand.NewChaCha8([32]byte{9})
+	head, tail, respData := make([]byte, 1<<10), make([]byte, 128<<10), make([]byte, respSize)
+	rnd.Read(head)
+	rnd.Read(tail)
+	rnd.Read(respData)
+	wantReq := sha256.Sum256(append(append([]byte(nil), head...), tail...))
+
+	answering := make(chan struct{})
+	gotReq := make(chan [32]byte, 1)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rc := http.NewResponseController(w)
+		if err := rc.EnableFullDuplex(); err != nil { // answer while the body is still arriving
+			t.Errorf("upstream EnableFullDuplex: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write(respData[:1<<10])
+		rc.Flush()
+		close(answering)
+		w.Write(respData[1<<10:])
+		h := sha256.New()
+		io.Copy(h, r.Body)
+		var sum [32]byte
+		copy(sum[:], h.Sum(nil))
+		gotReq <- sum
+	}))
+	defer up.Close()
+	e := newEnv(t)
+	svc := e.service(up.URL, model.ModeRecord, func(s *model.Service) { s.MaxBodyBytes = 1024 })
+	base := e.start(svc)
+
+	pr, pw := io.Pipe()
+	defer pr.Close()
+	go func() {
+		pw.Write(head)
+		select {
+		case <-answering:
+		case <-time.After(10 * time.Second):
+		}
+		// Let the proxy start copying the answer to the client; a proxy that
+		// is too slow only makes this test pass vacuously, never fail.
+		time.Sleep(50 * time.Millisecond)
+		pw.Write(tail)
+		pw.Close()
+	}()
+	req, err := http.NewRequest("POST", base+"/stream", pr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := newClient(t).Do(req)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("reading the response: %v (got %d of %d bytes)", err, len(body), respSize)
+	}
+	if res.StatusCode != 200 || !bytes.Equal(body, respData) {
+		t.Fatalf("status %d, response intact: %v", res.StatusCode, bytes.Equal(body, respData))
+	}
+	select {
+	case sum := <-gotReq:
+		if sum != wantReq {
+			t.Error("the upstream did not receive the request body intact")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the upstream never finished reading the request body")
+	}
+	ex := e.waitStored(svc.RecordingID, 1)[0]
+	if ex.Response.BodySize != respSize || ex.Error != "" {
+		t.Errorf("stored response size %d (want %d), error %q", ex.Response.BodySize, respSize, ex.Error)
+	}
+}
+
 func TestBodyCaptureDisabled(t *testing.T) {
 	up := newEcho(t)
 	e := newEnv(t)

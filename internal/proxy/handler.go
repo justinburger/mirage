@@ -141,7 +141,30 @@ func (rs *reqState) proxy(w http.ResponseWriter, r *http.Request, record bool) {
 		return
 	}
 	rs.capture = record && rs.decideCapture(r)
+	if hasBody(r) {
+		allowFullDuplex(rs.rw.ResponseWriter)
+	}
 	rs.s.rp.ServeHTTP(w, rs.prepare(r))
+}
+
+// allowFullDuplex tells net/http's HTTP/1 server that the handler reads the
+// request body while it writes the response.
+//
+// The upstream transport reads the client's body on its own goroutine, and the
+// upstream may answer before it has taken all of it (it was quicker than the
+// transport's last read, or it answers early, or it streams). By default the
+// server then consumes and closes the rest of the body the moment the response
+// starts, behind the transport's back: the transport's next read fails with
+// "invalid Read on closed Body", it drops the upstream connection, and the
+// response the client is reading is cut off with an unexpected EOF. A proxy
+// that promises never to truncate the traffic cannot allow that. The server
+// still disposes of whatever the transport left unread once the handler has
+// returned.
+//
+// HTTP/2 connections are full duplex by nature and do not implement the
+// switch; the error is of no consequence there.
+func allowFullDuplex(w http.ResponseWriter) {
+	_ = http.NewResponseController(w).EnableFullDuplex()
 }
 
 // decideCapture decides, before any buffering, whether r is captured.

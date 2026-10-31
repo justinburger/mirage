@@ -644,12 +644,20 @@ func (r *runner) anonymize(j job) (http.Header, []byte, *url.URL, error) {
 // monitor collects the series and reports progress once a second, on the
 // second boundaries (as the registry does), so the points a run ticks itself
 // carry exactly the stamps a registry would give them.
+//
+// A wake-up that comes a second or more late (a stalled or overloaded
+// machine) sleeps through a boundary, because the next one is taken from the
+// clock. That costs a Progress call, but not a point: the second it skipped is
+// zero-filled by the collector and picked up by collect.
 func (r *runner) monitor(stop <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
 	t := time.NewTimer(0)
 	defer t.Stop()
+	// The first boundary is the one after the run started, not after this
+	// goroutine did: if the start of the run is a scheduling delay behind it,
+	// the run's first second must not be the one that goes missing.
+	boundary := nextSecond(r.start)
 	for {
-		boundary := nextSecond(time.Now())
 		wait := time.Until(boundary)
 		if !r.opts.TickCollector {
 			wait += registrySlack // let the registry close the second first
@@ -663,6 +671,7 @@ func (r *runner) monitor(stop <-chan struct{}, done chan<- struct{}) {
 			if r.opts.Progress != nil {
 				r.opts.Progress(r.summary())
 			}
+			boundary = nextSecond(time.Now())
 		}
 	}
 }
@@ -673,12 +682,18 @@ func nextSecond(t time.Time) time.Time { return t.Truncate(time.Second).Add(time
 // collect appends the points the collector has closed since the last call
 // (ticking it first, as of the second boundary now, when the run owns the
 // ticking).
+//
+// It always reads them back from the collector's series rather than taking
+// what Tick returns: a Tick that comes more than a second after the previous
+// one first appends zero points for the seconds in between and then closes its
+// own, and returns only the last. Those fill points are what keeps the series
+// one point per second for the charts and the stored result, so they must be
+// collected too.
 func (r *runner) collect(now time.Time) {
 	r.collectMu.Lock()
 	defer r.collectMu.Unlock()
 	if r.opts.TickCollector {
-		r.addPoint(r.col.Tick(now))
-		return
+		r.col.Tick(now)
 	}
 	for _, p := range r.col.Series(r.lastT + 1) {
 		r.addPoint(p)

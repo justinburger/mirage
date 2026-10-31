@@ -197,6 +197,16 @@
 //     the profile with anonymize_capture on, together with the capture
 //     anonymizer of record and hybrid services. What cannot be rebuilt keeps
 //     its previous version and the error is returned.
+//   - Request body and response overlap. A proxied request with a body puts the
+//     client's HTTP/1 response writer in full duplex mode
+//     (http.ResponseController.EnableFullDuplex). The upstream transport reads
+//     the client's body on its own goroutine and the upstream may answer before
+//     it has taken all of it; without full duplex net/http closes the rest of
+//     the body as soon as the response starts, the transport's next read fails,
+//     it drops the upstream connection and the response the client is reading
+//     ends in an unexpected EOF. This was the cause of the CI-only failures of
+//     TestLargeBodiesAreForwardedIntactAndCaptureTruncated. After the handler
+//     returns, net/http still disposes of any body the transport left unread.
 //   - Content-Type. A response the upstream sent without a Content-Type reaches
 //     the client without one in every proxied mode: the client's header map
 //     gets an empty Content-Type entry, which keeps net/http from sniffing one.

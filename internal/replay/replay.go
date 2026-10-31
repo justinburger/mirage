@@ -83,7 +83,10 @@
 // series slice (appending each point the collector closes; with
 // TickCollector it ticks once more at the end so the last partial second is
 // included); above model.MaxReplaySeries points it merges adjacent pairs
-// (sum counts, max of percentiles), so long soaks keep their beginning.
+// (sum counts, max of percentiles), so long soaks keep their beginning. A
+// tick that comes a second or more late (a stalled machine) does not leave a
+// hole in the series: the seconds it skipped are zero points, as in the
+// collector's own ring.
 //
 // Performance target: ≥ 30k req/s against a local httptest server with
 // Concurrency 256 on a laptop, scheduler error < 2ms at 10k req/s.

@@ -128,6 +128,7 @@ func (s *service) modifyResponse(res *http.Response) error {
 		return nil
 	}
 	suppressSniffing(rs.rw.Header(), res.Header)
+	announceEarlyClose(rs)
 	if rs.capture {
 		rs.respTee = &respTee{src: res.Body, buf: newCapBuf(rs.st.bodyCap)}
 		res.Body = rs.respTee
@@ -280,4 +281,26 @@ func qIsZero(params string) bool {
 // isUpgrade reports whether r asks for a protocol upgrade (WebSocket).
 func isUpgrade(r *http.Request) bool {
 	return r.Header.Get("Upgrade") != ""
+}
+
+// earlyCloseThreshold is net/http's maxPostHandlerReadBytes: the most unread
+// request body the server drains after a response to keep the connection.
+const earlyCloseThreshold = 256 << 10
+
+// announceEarlyClose says "Connection: close" to the client when the upstream
+// answers while much of the request body is still unread, as net/http does
+// for a handler that is not in full duplex mode. With full duplex on (see
+// allowFullDuplex) the server skips that header but still closes such a
+// connection after the response rather than drain the body, so keep-alive
+// clients would send their next request on a connection that is being torn
+// down. Unknown remaining length (chunked) counts as much.
+func announceEarlyClose(rs *reqState) {
+	t := rs.reqTee
+	if t == nil || t.eof.Load() || rs.r.ProtoMajor != 1 {
+		return
+	}
+	if cl := rs.r.ContentLength; cl >= 0 && cl-t.n.Load() < earlyCloseThreshold {
+		return
+	}
+	rs.rw.Header().Set("Connection", "close")
 }

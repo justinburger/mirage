@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -329,6 +330,53 @@ func TestStatusCarriesConfigUpdatedAt(t *testing.T) {
 		st := e.mgr.Status(svc.ID)
 		if st.Running || st.ConfigUpdatedAt == nil || !st.ConfigUpdatedAt.Equal(at) {
 			t.Fatalf("apply %d: running=%v config_updated_at=%v, want %v", i, st.Running, st.ConfigUpdatedAt, at)
+		}
+	}
+}
+
+// ---- early answers to large uploads ------------------------------------
+
+// An upstream that answers before reading a large upload gets the client a
+// "Connection: close", as net/http announces it for a handler that is not in
+// full duplex mode: the proxy will close the connection rather than drain
+// the rest of the body, and a keep-alive client must not reuse it. A small
+// remainder, or a body read to its end, keeps the connection.
+func TestEarlyAnswerToALargeUploadAnnouncesTheClose(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/read" {
+			_, _ = io.Copy(io.Discard, r.Body)
+		}
+		http.Error(w, "no", http.StatusUnauthorized)
+	}))
+	t.Cleanup(up.Close)
+	for _, mode := range []model.Mode{model.ModePassthrough, model.ModeRecord} {
+		e := newEnv(t)
+		base := e.start(e.service(up.URL, mode))
+		for _, tc := range []struct {
+			path      string
+			size      int
+			wantClose bool
+		}{
+			{"/early", 2 << 20, true},
+			{"/early", 10 << 10, false},
+			{"/read", 2 << 20, false},
+		} {
+			for i := range 20 {
+				req, _ := http.NewRequest("POST", base+tc.path, bytes.NewReader(make([]byte, tc.size)))
+				res, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Fatalf("%s %s %d bytes, request %d: %v", mode, tc.path, tc.size, i, err)
+				}
+				_, _ = io.Copy(io.Discard, res.Body)
+				res.Body.Close()
+				if res.StatusCode != http.StatusUnauthorized {
+					t.Fatalf("%s %s: status %d", mode, tc.path, res.StatusCode)
+				}
+				if res.Close != tc.wantClose {
+					t.Errorf("%s %s %d bytes: Connection: close announced = %v, want %v", mode, tc.path, tc.size, res.Close, tc.wantClose)
+					break
+				}
+			}
 		}
 	}
 }

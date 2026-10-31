@@ -115,6 +115,7 @@ func (c *capBuf) discard() {
 type reqTee struct {
 	src io.ReadCloser
 	n   atomic.Int64
+	eof atomic.Bool // the client's body has been read to its end
 	buf *capBuf
 }
 
@@ -134,6 +135,9 @@ func (t *reqTee) Read(p []byte) (int, error) {
 		if t.buf != nil {
 			t.buf.write(p[:n])
 		}
+	}
+	if err == io.EOF {
+		t.eof.Store(true)
 	}
 	return n, err
 }
