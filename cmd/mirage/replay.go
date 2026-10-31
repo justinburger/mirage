@@ -160,11 +160,59 @@ func runReplay(ctx context.Context, args []string, s streams) int {
 	if (recRef == "") == (harPath == "") {
 		return usageError(s, fs, "give the traffic to replay with --recording (and --data) or with --har")
 	}
-	if set["max-error-rate"] && (maxErrRate < 0 || maxErrRate > 1) {
+	// NaN fails every comparison, so test for the valid range, not its
+	// complement.
+	if set["max-error-rate"] && !(maxErrRate >= 0 && maxErrRate <= 1) {
 		return usageError(s, fs, "--max-error-rate must be between 0 and 1")
+	}
+	// A zero or negative limit used to switch the gate off silently, in a CI
+	// job that asked for it.
+	if set["max-p99"] && maxP99 <= 0 {
+		return usageError(s, fs, "--max-p99 must be a positive duration, for example 250ms")
 	}
 	if u, err := url.Parse(target); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return usageError(s, fs, "--target %q must be an absolute http(s) URL", target)
+	}
+
+	// Build and validate the configuration like the API does. The options
+	// are checked before any source is opened, so a bad option is a usage
+	// error (exit status 2) whatever the state of the database or the file.
+	buildConfig := func(recordingID, profileID string) model.ReplayConfig {
+		cfg := model.ReplayConfig{
+			RecordingID:        recordingID,
+			Target:             target,
+			Mode:               model.ReplayMode(mode),
+			Speed:              speed,
+			MaxGap:             model.Duration(maxGap),
+			Rate:               rate,
+			Stages:             stages,
+			Amplify:            amplify,
+			ErrorAmplification: errAmp,
+			Concurrency:        concurrency,
+			Duration:           model.Duration(duration),
+			Loop:               loop,
+			MaxRequests:        maxRequests,
+			Timeout:            model.Duration(timeout),
+			Include:            include,
+			Exclude:            exclude,
+			SetHeaders:         headers,
+			RemoveHeaders:      removeHeaders,
+			HostHeader:         hostHeader,
+			InsecureSkipVerify: insecure,
+			ProfileID:          profileID,
+			VaryClones:         varyClones,
+			CompareStatus:      compareStatus,
+			Seed:               seed,
+		}
+		if cfg.Mode == "" && (cfg.Rate > 0 || len(cfg.Stages) > 0) {
+			cfg.Mode = model.ReplayRate
+		}
+		return cfg.WithDefaults()
+	}
+	// The recording and the profile are not resolved yet; stand-ins let the
+	// rest of the options be validated.
+	if err := buildConfig("pending", profileRef).Validate(); err != nil {
+		return invalidReplayOptions(s, err)
 	}
 
 	// Ctrl-C stops the run and still prints what was measured.
@@ -219,49 +267,9 @@ func runReplay(ctx context.Context, args []string, s streams) int {
 		profileID = p.ID
 	}
 
-	// Build and validate the configuration like the API does.
-	cfg := model.ReplayConfig{
-		RecordingID:        rec.ID,
-		Target:             target,
-		Mode:               model.ReplayMode(mode),
-		Speed:              speed,
-		MaxGap:             model.Duration(maxGap),
-		Rate:               rate,
-		Stages:             stages,
-		Amplify:            amplify,
-		ErrorAmplification: errAmp,
-		Concurrency:        concurrency,
-		Duration:           model.Duration(duration),
-		Loop:               loop,
-		MaxRequests:        maxRequests,
-		Timeout:            model.Duration(timeout),
-		Include:            include,
-		Exclude:            exclude,
-		SetHeaders:         headers,
-		RemoveHeaders:      removeHeaders,
-		HostHeader:         hostHeader,
-		InsecureSkipVerify: insecure,
-		ProfileID:          profileID,
-		VaryClones:         varyClones,
-		CompareStatus:      compareStatus,
-		Seed:               seed,
-	}
-	if cfg.Mode == "" && (cfg.Rate > 0 || len(cfg.Stages) > 0) {
-		cfg.Mode = model.ReplayRate
-	}
-	cfg = cfg.WithDefaults()
+	cfg := buildConfig(rec.ID, profileID)
 	if err := cfg.Validate(); err != nil {
-		var ve *model.ValidationError
-		if errors.As(err, &ve) {
-			fmt.Fprintln(s.err, "mirage replay: invalid options:")
-			for _, p := range ve.Problems {
-				fmt.Fprintf(s.err, "  - %s\n", p)
-			}
-			fmt.Fprintln(s.err, "Run 'mirage replay -h' for usage.")
-			return exitUsage
-		}
-		fmt.Fprintf(s.err, "mirage replay: %v\n", err)
-		return exitUsage
+		return invalidReplayOptions(s, err)
 	}
 
 	col := metrics.NewCollector(metrics.ReplayCollectorName("cli"), model.KindReplay, "cli")
@@ -319,6 +327,22 @@ func runReplay(ctx context.Context, args []string, s streams) int {
 		return exitInterrupted
 	}
 	return exitOK
+}
+
+// invalidReplayOptions reports a configuration that failed validation, with
+// the model's own messages, and returns the usage exit status.
+func invalidReplayOptions(s streams, err error) int {
+	var ve *model.ValidationError
+	if errors.As(err, &ve) {
+		fmt.Fprintln(s.err, "mirage replay: invalid options:")
+		for _, p := range ve.Problems {
+			fmt.Fprintf(s.err, "  - %s\n", p)
+		}
+		fmt.Fprintln(s.err, "Run 'mirage replay -h' for usage.")
+		return exitUsage
+	}
+	fmt.Fprintf(s.err, "mirage replay: %v\n", err)
+	return exitUsage
 }
 
 // writeSummaryJSON writes the summary to path ("-" is stdout is not offered:

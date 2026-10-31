@@ -75,7 +75,7 @@ func runImport(ctx context.Context, args []string, s streams) int {
 		fmt.Fprintf(s.err, "mirage import: %v\n", err)
 		return exitFail
 	}
-	rec, err := ops.ImportHAR(ctx, st, in, name, eng, nil)
+	rec, stats, err := ops.ImportHARStats(ctx, st, in, name, eng, nil)
 	if err != nil {
 		fmt.Fprintf(s.err, "mirage import: %v\n", err)
 		return exitFail
@@ -86,7 +86,31 @@ func runImport(ctx context.Context, args []string, s streams) int {
 	}
 	fmt.Fprintf(s.out, "Imported %s exchanges (%s errors, %s%s) into recording %q (%s)\n",
 		fmtInt(rec.ExchangeCount), fmtInt(rec.ErrorCount), fmtBytes(rec.Bytes), anon, rec.Name, rec.ID)
+	if stats.Failed > 0 {
+		fmt.Fprintf(s.out, "Warning: %s could not be anonymized and %s left out of the recording (first failure: %v)\n",
+			countOf(stats.Failed, "entry", "entries"), pluralVerb(stats.Failed, "was", "were"), stats.FirstError)
+	}
+	if stats.BadTimes > 0 {
+		fmt.Fprintf(s.out, "Note: %s had a missing start time or one outside the years 1678 to 2261; %s took the start time of a neighbouring entry\n",
+			countOf(stats.BadTimes, "entry", "entries"), pluralVerb(stats.BadTimes, "it", "they"))
+	}
 	return exitOK
+}
+
+// countOf writes "1 entry" or "3 entries".
+func countOf(n int64, singular, plural string) string {
+	if n == 1 {
+		return fmt.Sprintf("%s %s", fmtInt(n), singular)
+	}
+	return fmt.Sprintf("%s %s", fmtInt(n), plural)
+}
+
+// pluralVerb picks the singular or plural form of a word that agrees with n.
+func pluralVerb(n int64, singular, plural string) string {
+	if n == 1 {
+		return singular
+	}
+	return plural
 }
 
 func runExport(ctx context.Context, args []string, s streams) int {
@@ -130,10 +154,14 @@ func runExport(ctx context.Context, args []string, s streams) int {
 		return exitFail
 	}
 
-	var written int64
+	var (
+		written int64
+		stats   ops.Stats
+	)
 	export := func(w io.Writer) error {
 		cw := &countWriter{w: w}
-		if err := ops.ExportHAR(ctx, st, rec.ID, cw, eng, version.Version); err != nil {
+		var err error
+		if stats, err = ops.ExportHARStats(ctx, st, rec.ID, cw, eng, version.Version); err != nil {
 			return err
 		}
 		written = cw.n
@@ -163,7 +191,11 @@ func runExport(ctx context.Context, args []string, s streams) int {
 	if eng != nil {
 		anon = " (anonymized)"
 	}
-	fmt.Fprintf(dst, "Exported %s exchanges of %q to %s, %s%s\n", fmtInt(rec.ExchangeCount), rec.Name, outPath, fmtBytes(written), anon)
+	fmt.Fprintf(dst, "Exported %s exchanges of %q to %s, %s%s\n", fmtInt(stats.Written), rec.Name, outPath, fmtBytes(written), anon)
+	if stats.Failed > 0 {
+		fmt.Fprintf(dst, "Warning: %s could not be anonymized and %s left out of the file (first failure: %v)\n",
+			countOf(stats.Failed, "exchange", "exchanges"), pluralVerb(stats.Failed, "was", "were"), stats.FirstError)
+	}
 	return exitOK
 }
 

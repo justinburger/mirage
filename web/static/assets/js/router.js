@@ -66,7 +66,13 @@ export function createRouter({ routes, outlet, onRoute, notFound }) {
       const m = r.re.exec(path);
       if (m) {
         match = r;
-        r.keys.forEach((k, i) => { params[k] = decodeURIComponent(m[i + 1]); });
+        try {
+          r.keys.forEach((k, i) => { params[k] = decodeURIComponent(m[i + 1]); });
+        } catch (_) {
+          // A malformed escape ('#/services/%') names nothing: not found.
+          match = null;
+          params = {};
+        }
         break;
       }
     }

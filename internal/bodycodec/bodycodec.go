@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/justinburger/mirage/internal/model"
 )
@@ -96,6 +97,122 @@ func makeInspectable(h http.Header, body *[]byte, size *int64, truncated *bool, 
 	}
 	*size = max(*size, int64(len(*body)))
 	*body, *truncated = nil, true
+}
+
+// LooksCompressed reports whether body, recorded as already decoded from the
+// content coding ce (a Content-Encoding list in the order the codings were
+// applied), is in fact still compressed with the outermost one. A HAR stores
+// bodies decoded and keeps the Content-Encoding header, so an importer cannot
+// tell from the header alone; a stream the importer could not decode (cut by
+// a capture cap, or an unknown coding) arrives looking the same as a decoded
+// body.
+//
+// The tests are chosen so that a decoded body is practically never taken for
+// a compressed one:
+//
+//   - gzip: the gzip magic number, which is never valid UTF-8.
+//   - deflate, body not valid UTF-8: a complete zlib stream (its checksum
+//     matches), or a zlib or raw deflate stream, possibly cut, that inflates
+//     into more than 16 bytes of text, at least half as long as itself.
+//     Binary data rarely inflates at all, and then into a few bytes of noise:
+//     about one random body in 100,000 passes.
+//   - deflate, body valid UTF-8 (only very short streams are): the whole body
+//     must be one complete stream, to its last byte, that inflates into text.
+//   - any other coding (br, zstd): bytes that are not valid UTF-8.
+//
+// A cut stream of binary data under a deflate coding is not recognised; the
+// anonymizer could not read that data decoded either.
+func LooksCompressed(ce string, body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	outer := ""
+	for c := range strings.SplitSeq(ce, ",") {
+		if c = strings.ToLower(strings.TrimSpace(c)); c != "" && c != "identity" {
+			outer = c
+		}
+	}
+	switch outer {
+	case "":
+		return false
+	case "gzip", "x-gzip":
+		return len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b
+	case "deflate":
+		out, complete, rest, isZlib := inflateProbe(body)
+		switch {
+		case len(out) == 0:
+			return false
+		case len(out) >= looksCompressedProbe:
+			return textPrefix(out) // still going: text this long is no accident
+		case utf8.Valid(body):
+			return complete && rest == 0 && utf8.Valid(out) && textPrefix(out)
+		case isZlib && complete:
+			return true
+		}
+		return len(out) > 16 && len(out) >= len(body)/2 && textPrefix(out)
+	}
+	return !utf8.Valid(body)
+}
+
+// looksCompressedProbe is how much LooksCompressed inflates at most.
+const looksCompressedProbe = 64 << 10
+
+// zlibHeader reports whether body starts with a zlib header (RFC 1950) that
+// a decoder accepts: deflate, a window of at most 32 KiB, no preset
+// dictionary, and the check bits.
+func zlibHeader(body []byte) bool {
+	return len(body) >= 2 && body[0]&0x0f == 8 && body[0]>>4 <= 7 && body[1]&0x20 == 0 &&
+		(uint16(body[0])<<8|uint16(body[1]))%31 == 0
+}
+
+// inflateProbe inflates at most looksCompressedProbe bytes of body: as a zlib
+// stream when it starts with a zlib header, else as a raw deflate stream.
+// complete reports a stream that ended cleanly (for zlib, with a matching
+// checksum) and rest the bytes of body after its end. flate reads a
+// bytes.Reader byte by byte (it is an io.ByteReader), so what the reader has
+// left is exactly what the stream did not use.
+func inflateProbe(body []byte) (out []byte, complete bool, rest int, isZlib bool) {
+	br := bytes.NewReader(body)
+	var r io.ReadCloser
+	if isZlib = zlibHeader(body); isZlib {
+		zr, err := zlib.NewReader(br)
+		if err != nil {
+			return nil, false, 0, true
+		}
+		r = zr
+	} else {
+		r = flate.NewReader(br)
+	}
+	defer r.Close()
+	out, err := readDecoded(r, int64(len(body))*4, looksCompressedProbe)
+	return out, err == nil && len(out) < looksCompressedProbe, br.Len(), isZlib
+}
+
+// textPrefix reports whether b reads as text: valid UTF-8 once a rune cut at
+// its end is ignored, no control characters other than tab, CR and LF, and,
+// past 16 bytes, at least 8 distinct byte values, so that a few bytes of
+// noise repeated by back-references do not pass.
+func textPrefix(b []byte) bool {
+	var seen [256]bool
+	distinct := 0
+	for _, c := range b {
+		if (c < 0x20 && c != '\t' && c != '\n' && c != '\r') || c == 0x7f {
+			return false
+		}
+		if !seen[c] {
+			seen[c] = true
+			distinct++
+		}
+	}
+	if len(b) > 16 && distinct < 8 {
+		return false
+	}
+	for cut := 0; cut < utf8.UTFMax && cut < len(b); cut++ {
+		if utf8.Valid(b[:len(b)-cut]) {
+			return true
+		}
+	}
+	return false
 }
 
 // StillEncoded reports whether h announces a content coding other than
@@ -301,7 +418,7 @@ func newDecoder(coding string, body []byte) (io.Reader, func(), error) {
 		}
 		return zr, func() { _ = zr.Close(); gzipReaders.Put(zr) }, nil
 	}
-	if len(body) >= 2 && body[0]&0x0f == 8 && (uint16(body[0])<<8|uint16(body[1]))%31 == 0 {
+	if zlibHeader(body) {
 		zr, err := zlib.NewReader(bytes.NewReader(body))
 		if err == nil {
 			return zr, func() { _ = zr.Close() }, nil

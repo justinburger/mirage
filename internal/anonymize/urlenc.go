@@ -121,7 +121,7 @@ func (r *run) param(pair string, rules map[string][]*rule, loc *locator) (string
 	key := decodeQuery(k)
 	l := *loc
 	l.name = key
-	sel := rules[key]
+	sel := r.keyedRules(rules, key, true)
 	if rl := removes(sel); rl != nil {
 		r.record(&l, rl.source, pair, "")
 		return "", true
@@ -185,6 +185,12 @@ func (r *run) pathRules(p string, loc *locator) (string, uint64) {
 	}
 	hits := make([]span, hi-lo)
 	changed := false
+	// A segment that a rule covers is that rule's: when several rules match
+	// it the first wins and the others leave it alone.
+	var taken []bool
+	if len(r.sd.path) > 1 {
+		taken = make([]bool, len(dec))
+	}
 	for _, rl := range r.sd.path {
 		if !rl.tmpl.match(dec[lo:hi], hits) {
 			continue
@@ -194,6 +200,12 @@ func (r *run) pathRules(p string, loc *locator) (string, uint64) {
 				continue
 			}
 			i := lo + j
+			if taken != nil {
+				if taken[i] {
+					continue
+				}
+				taken[i] = true
+			}
 			seg := dec[i]
 			sel := [1]*rule{rl}
 			res := r.value(sel[:], seg[sp.lo:sp.hi], loc)

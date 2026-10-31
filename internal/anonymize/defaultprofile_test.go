@@ -429,9 +429,11 @@ func TestBuiltinProfileInAFullExchange(t *testing.T) {
 	}
 	for _, w := range []struct{ loc, source string }{
 		{"request.body $.password", "JSON password"},
-		{"request.body $.profile.firstName", "JSON firstName"},
+		// firstName and first_name are the same key (case, "_" and "-" are
+		// ignored): the first rule in the profile takes the value.
+		{"request.body $.profile.firstName", "JSON first_name"},
 		{"request.query.api_key", "Query api_key"},
-		{"response.body $.accessToken", "JSON accessToken"},
+		{"response.body $.accessToken", "JSON access_token"},
 		{"response.body $.refresh_token", "JSON refresh_token"},
 		{"response.body $.user.first_name", "JSON first_name"},
 		{"request.body $.email", "detector:email"},

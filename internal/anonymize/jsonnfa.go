@@ -40,7 +40,7 @@ func (w *jsonRW) enter(parent *jframe, key []byte, idx int) childInfo {
 	}
 	// Rules of the form $..name have no automaton state: they are matched by
 	// member name below.
-	fast := w.r.sd.keyDescent != nil
+	fast := w.kd != nil
 	if parent == nil {
 		for ri, rl := range w.prog {
 			if !(fast && rl.keyOnly) {
@@ -57,6 +57,12 @@ func (w *jsonRW) enter(parent *jframe, key []byte, idx int) childInfo {
 			s := &steps[p]
 			if s.descend {
 				w.addState(info.stLo, st)
+				if s.fold { // a name after ".." is compared ignoring case, "_" and "-"
+					if s.matchFold(parent.obj, key) {
+						w.addState(info.stLo, mkState(ri, p+1))
+					}
+					continue
+				}
 			}
 			if s.matches(parent.obj, key, idx) {
 				w.addState(info.stLo, mkState(ri, p+1))
@@ -75,23 +81,29 @@ func (w *jsonRW) enter(parent *jframe, key []byte, idx int) childInfo {
 		w.addActive(info.acLo, int32(ri))
 		// The document root cannot be deleted; there, remove falls back to
 		// redacting every leaf.
-		if parent != nil && info.remove == nil && w.prog[ri].act.remove() {
-			info.remove = w.prog[ri]
+		if rl := w.prog[ri]; parent != nil && rl.act.remove() && (info.remove == nil || rl.idx < info.remove.idx) {
+			info.remove = rl
 		}
 	}
 	if fast && parent != nil && parent.obj {
-		for _, ri := range w.r.sd.keyDescent[string(key)] {
-			if sib := w.prog[ri].jp.siblings; sib != nil && !w.siblingCheck(parent, sib) {
+		for _, ri := range w.kd[string(foldKey(&w.nkey, key))] {
+			if sib := w.prog[ri].jp.sibNorm; sib != nil && !w.siblingCheck(parent, sib) {
 				continue
 			}
 			w.addActive(info.acLo, ri)
-			// Of several rules that delete the node, report the lowest.
+			// Of several rules that delete the node, take the lowest.
 			if rl := w.prog[ri]; rl.act.remove() && (info.remove == nil || rl.idx < info.remove.idx) {
 				info.remove = rl
 			}
 		}
 	}
 	info.acHi = len(w.active)
+	// When several rules match a value the first in the profile wins and the
+	// others leave it alone: the node is deleted only if the rule that deletes
+	// it is that first one (active is in profile order).
+	if info.remove != nil && w.prog[w.active[info.acLo]] != info.remove {
+		info.remove = nil
+	}
 	return info
 }
 
@@ -110,23 +122,23 @@ func (w *jsonRW) pop() {
 }
 
 // leafChain returns the rules that apply to a scalar leaf, in profile order:
-// the JSONPath rules matching it or an ancestor, merged with the regex rules.
+// the first JSONPath rule matching it or an ancestor (when several match, the
+// first wins and the rest leave the value alone), merged with the regex
+// rules.
 func (w *jsonRW) leafChain(info *childInfo) []*rule {
 	act := w.active[info.acLo:info.acHi]
 	rx := w.r.sd.regex
 	if len(act) == 0 {
 		return rx
 	}
+	rl := w.prog[act[0]]
 	w.chain = w.chain[:0]
 	j := 0
-	for _, ri := range act {
-		rl := w.prog[ri]
-		for j < len(rx) && rx[j].idx < rl.idx {
-			w.chain = append(w.chain, rx[j])
-			j++
-		}
-		w.chain = append(w.chain, rl)
+	for j < len(rx) && rx[j].idx < rl.idx {
+		w.chain = append(w.chain, rx[j])
+		j++
 	}
+	w.chain = append(w.chain, rl)
 	w.chain = append(w.chain, rx[j:]...)
 	return w.chain
 }
@@ -158,8 +170,9 @@ func (w *jsonRW) siblingCheck(f *jframe, names []string) bool {
 
 // scanForKeys reads the members of the object whose opening brace was just
 // consumed, from w.pos, and reports whether one of them is called one of
-// names. complete is false when the input ended (or was malformed) before the
-// object did.
+// names (which are normalized, see normKey: case, "_" and "-" do not
+// matter). complete is false when the input ended (or was malformed) before
+// the object did.
 func (w *jsonRW) scanForKeys(names []string) (found, complete bool) {
 	for {
 		w.skipWS()
@@ -178,7 +191,7 @@ func (w *jsonRW) scanForKeys(names []string) (found, complete bool) {
 				key = w.sibTmp
 			}
 			for _, n := range names {
-				if string(key) == n {
+				if normEqual(key, n) {
 					found = true
 					break
 				}

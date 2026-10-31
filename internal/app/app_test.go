@@ -775,3 +775,197 @@ func TestExampleStrictProfileKeepsDemoCredentialsOutOfTheRecording(t *testing.T)
 		}
 	}
 }
+
+// A service that records with anonymize_capture stores anonymized paths, queries
+// and bodies. Switched to virtualize or hybrid, it must serve those recordings
+// to the very requests that were recorded (raw emails in the path, the query
+// and the body), each with the response recorded for it and at match level
+// "exact", not collapse them onto one response or miss them.
+func TestAnonymizedRecordingIsServedToTheRawRequests(t *testing.T) {
+	// The upstream answers with a marker that carries no PII, so the recorded
+	// response is what it said and the test can tell the responses apart.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		who := "nobody"
+		for _, name := range []string{"jane", "bob"} {
+			if strings.Contains(r.URL.Path, name) || strings.Contains(string(body), name) {
+				who = name
+			}
+		}
+		kind := "profile"
+		if r.Method == http.MethodPost {
+			kind = "order"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"answer":%q}`, kind+"-"+who)
+	}))
+	defer upstream.Close()
+
+	dir := t.TempDir()
+	cfg := writeFile(t, dir, "mirage.yaml", fmt.Sprintf(`
+recordings:
+  - name: anon
+services:
+  - name: anon
+    listen_addr: 127.0.0.1:0
+    upstream: %s
+    mode: record
+    enabled: true
+    recording: anon
+    anonymize_capture: true
+`, upstream.URL))
+	a, _ := startApp(t, Options{Data: filepath.Join(dir, "m.db"), ConfigPath: cfg})
+	base := a.AdminURL()
+
+	var svcs []struct {
+		ID     string
+		Status model.ServiceStatus
+	}
+	getJSON(t, base+"/api/v1/services", &svcs)
+	if len(svcs) != 1 || !svcs[0].Status.Running {
+		t.Fatalf("services: %+v", svcs)
+	}
+	svcID, addr := svcs[0].ID, svcs[0].Status.Addr
+
+	type call struct {
+		method, path, query, body string
+		want                      string
+	}
+	calls := []call{
+		{"GET", "/users/jane@acme.io/profile", "email=jane@acme.io", "", "profile-jane"},
+		{"GET", "/users/bob@acme.io/profile", "email=bob@acme.io", "", "profile-bob"},
+		{"POST", "/orders", "", `{"email":"jane@acme.io","item":"book"}`, "order-jane"},
+		{"POST", "/orders", "", `{"email":"bob@acme.io","item":"book"}`, "order-bob"},
+	}
+	send := func(c call) (int, string, string) {
+		t.Helper()
+		u := "http://" + addr + c.path
+		if c.query != "" {
+			u += "?" + c.query
+		}
+		var body io.Reader
+		if c.body != "" {
+			body = strings.NewReader(c.body)
+		}
+		req, err := http.NewRequest(c.method, u, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", c.method, u, err)
+		}
+		defer resp.Body.Close()
+		got, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(got), resp.Header.Get("X-Mirage-Match")
+	}
+
+	// Record.
+	for _, c := range calls {
+		if code, body, _ := send(c); code != 200 || !strings.Contains(body, c.want) {
+			t.Fatalf("recording %s %s: %d %s", c.method, c.path, code, body)
+		}
+	}
+	var recs []model.Recording
+	eventually(t, "the exchanges to be captured", 10*time.Second, func() bool {
+		getJSON(t, base+"/api/v1/recordings", &recs)
+		return len(recs) == 1 && recs[0].ExchangeCount == int64(len(calls))
+	})
+	recID := recs[0].ID
+	if !recs[0].Anonymized {
+		t.Fatalf("recording should be anonymized: %+v", recs[0])
+	}
+	// The premise of the test: nothing raw was stored, so a raw request can
+	// only match through the anonymizer.
+	err := a.Store().IterateExchanges(context.Background(), recID, model.IterOptions{RequestBodies: true}, func(ex *model.Exchange) error {
+		for _, field := range []string{ex.Request.Path, ex.Request.RawQuery, string(ex.Request.Body)} {
+			if strings.Contains(field, "acme.io") {
+				t.Errorf("exchange %d still holds a raw email: %q", ex.Seq, field)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The upstream is gone from here on: every answer comes from the recording.
+	upstream.Close()
+
+	for _, mode := range []model.Mode{model.ModeVirtualize, model.ModeHybrid} {
+		t.Run(string(mode), func(t *testing.T) {
+			body := fmt.Sprintf(`{"mode":%q,"recording_id":%q}`, mode, recID)
+			resp, err := http.Post(base+"/api/v1/services/"+svcID+"/mode", "application/json", strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out struct{ Status model.ServiceStatus }
+			raw, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err := json.Unmarshal(raw, &out); err != nil || resp.StatusCode != 200 || !out.Status.Running || out.Status.Error != "" || out.Status.Mode != mode {
+				t.Fatalf("switch to %s: %d %s", mode, resp.StatusCode, raw)
+			}
+			addr = out.Status.Addr
+
+			// Each request twice: the second answer must not move on to
+			// another recorded response either.
+			for round := 0; round < 2; round++ {
+				for _, c := range calls {
+					code, got, level := send(c)
+					if code != 200 || !strings.Contains(got, c.want) {
+						t.Errorf("%s %s?%s %s round %d: %d %s, want the response recorded for it (%s)", c.method, c.path, c.query, c.body, round, code, got, c.want)
+					}
+					if level != "exact" {
+						t.Errorf("%s %s?%s %s: X-Mirage-Match = %q, want exact", c.method, c.path, c.query, c.body, level)
+					}
+				}
+			}
+			// A request nobody recorded does not pass for a recorded one.
+			if _, _, level := send(call{"GET", "/users/carol@acme.io/profile", "email=carol@acme.io", "", ""}); level == "exact" {
+				t.Errorf("a request that was never recorded matched exactly")
+			}
+		})
+	}
+}
+
+// The factory builds the matching anonymizer only for a service that captures
+// anonymized, and a profile it cannot load fails the build (with an untyped
+// nil, never an engine with a nil anonymizer inside).
+func TestVirtualizerFactoryAnonymizerProfile(t *testing.T) {
+	a, err := New(context.Background(), Options{Admin: "127.0.0.1:0", Data: store.MemoryPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	rec, err := a.Store().CreateRecording(context.Background(), model.Recording{Name: "r", Source: "proxy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := model.Service{Mode: model.ModeVirtualize, RecordingID: rec.ID, ProfileID: "prof_missing"}
+
+	// Not anonymizing: the profile is irrelevant and is not looked up.
+	v, err := a.virtualizer(context.Background(), svc, nil)
+	if err != nil || v == nil {
+		t.Fatalf("service without anonymize_capture: %v, %v", v, err)
+	}
+	_ = v.Close()
+
+	svc.AnonymizeCapture = true
+	v, err = a.virtualizer(context.Background(), svc, nil)
+	if err == nil || !strings.Contains(err.Error(), "prof_missing") {
+		t.Fatalf("missing profile: err = %v", err)
+	}
+	if v != nil {
+		t.Fatalf("factory returned a non-nil interface (%T) together with an error", v)
+	}
+
+	// The built-in profile (no ProfileID) loads.
+	svc.ProfileID = ""
+	if v, err = a.virtualizer(context.Background(), svc, nil); err != nil || v == nil {
+		t.Fatalf("default profile: %v, %v", v, err)
+	}
+	_ = v.Close()
+}

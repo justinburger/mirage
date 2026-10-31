@@ -266,8 +266,28 @@ func (a *App) applyConfig(ctx context.Context, cfg *config.Config) error {
 // virtualizer is the proxy.VirtualizerFactory. It returns an untyped nil
 // interface on error: returning the nil *virtual.Engine directly would give
 // the proxy a non-nil interface wrapping a nil pointer.
+//
+// A service with anonymize_capture on recorded anonymized paths, queries and
+// bodies, so the engine that serves its recording must match the requests of
+// clients in that form: it gets the anonymizer of the service's profile
+// (virtual.Options.Anonymizer), built exactly like the one the capture used, so
+// the same input gives the same tokens. The anonymizer is set only when it was
+// built; an *anonymize.Engine left nil on an error path must never reach the
+// option, where the interface holding it would be non-nil. A profile that
+// cannot be loaded fails the build, as it fails the capture of the same
+// service, instead of serving a recording that nothing can match.
 func (a *App) virtualizer(ctx context.Context, svc model.Service, n *pathnorm.Normalizer) (proxy.Virtualizer, error) {
-	e, err := virtual.Build(ctx, a.store, virtual.OptionsFromService(svc, n))
+	opts := virtual.OptionsFromService(svc, n)
+	if svc.AnonymizeCapture {
+		eng, err := ops.LoadEngine(ctx, a.store, svc.ProfileID)
+		if err != nil {
+			return nil, fmt.Errorf("anonymization profile for matching: %w", err)
+		}
+		if eng != nil {
+			opts.Anonymizer = eng
+		}
+	}
+	e, err := virtual.Build(ctx, a.store, opts)
 	if err != nil {
 		return nil, err
 	}

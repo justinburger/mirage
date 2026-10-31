@@ -70,6 +70,19 @@ export async function refreshInfo() {
 }
 
 /**
+ * Fetches everything the stream does not replay again: server info, the
+ * services and the replay jobs. The stream only carries changes, so whatever
+ * happened while it was down (a restarted server marking a running replay
+ * failed, a service edited elsewhere) is only visible after this. Emits
+ * 'resync' when the fetches have settled, for pages that keep their own copy
+ * of server data.
+ */
+export function resyncAll() {
+  const quiet = (p) => p.then(() => {}, () => {});
+  return Promise.all([quiet(refreshInfo()), quiet(refreshServices()), quiet(refreshReplays())]).then(() => emit('resync'));
+}
+
+/**
  * What ServiceStatus.error means depends on whether the listener is up. On a
  * service that is not running it is why it could not start (or why its
  * listener died). On a running one it is a problem found while serving. The
@@ -96,21 +109,38 @@ export function serviceById(id) {
   return state.services.find((s) => s.id === id) || null;
 }
 
-/** Applies an SSE `services` event: [ServiceStatus]. */
+/**
+ * Applies an SSE `services` event: [ServiceStatus]. A status only says whether
+ * a service runs, where, in which mode, since when and why it does not, so when
+ * one of those differs from what the UI holds the service was changed
+ * (disabled, enabled, moved, switched, restarted) and the rows may be stale in
+ * ways a status cannot tell: the whole list is fetched again.
+ */
 export function applyServiceStatuses(list) {
   if (!Array.isArray(list)) return;
-  let unknown = false;
+  let refetch = false;
   const byId = new Map(state.services.map((s) => [s.id, s]));
   for (const st of list) {
     const s = byId.get(st.service_id);
-    if (s) {
-      s.status = st;
-      s.mode = st.mode || s.mode;
-    } else unknown = true;
+    if (!s) { refetch = true; continue; }
+    const held = s.status;
+    if (held && statusChanged(held, st)) refetch = true;
+    s.status = st;
+    s.mode = st.mode || s.mode;
   }
-  if (list.length !== state.services.length) unknown = true;
+  if (list.length !== state.services.length) refetch = true;
   emit('services', state.services);
-  if (unknown) refreshServices().catch(() => {});
+  if (refetch) refreshServices().catch(() => {});
+}
+
+function statusChanged(held, st) {
+  // config_updated_at moves with every saved edit, a rename included.
+  if ((held.config_updated_at || '') !== (st.config_updated_at || '')) return true;
+  if (!!held.running !== !!st.running) return true;
+  if ((held.error || '') !== (st.error || '')) return true;
+  if (st.mode && st.mode !== held.mode) return true;
+  if (st.addr && held.addr && st.addr !== held.addr) return true;
+  return !!(st.started_at && held.started_at && st.started_at !== held.started_at);
 }
 
 /** Applies an SSE `replays` event: [{id, status, summary}]. */

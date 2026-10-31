@@ -145,9 +145,19 @@ func (s *Server) patchRecording(w http.ResponseWriter, r *http.Request) error {
 
 // deleteRecording answers DELETE /api/v1/recordings/{id}. A recording that a
 // service is using, or a replay is about to use, cannot be deleted.
+//
+// The in-use check and the delete run under Server.recordingMu, held
+// exclusively, which service saves and replay starts also take (shared) around
+// their own reference check and write: a service cannot be enabled on, or
+// pointed at, the recording between the check here and the delete, and the
+// delete cannot slip in between theirs. A large recording takes a while to
+// purge, during which service changes wait for the lock; that is the price of
+// the guarantee.
 func (s *Server) deleteRecording(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	id := r.PathValue("id")
+	s.recordingMu.Lock()
+	defer s.recordingMu.Unlock()
 	if _, err := s.deps.Store.GetRecording(ctx, id); err != nil {
 		return err
 	}

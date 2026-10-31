@@ -79,8 +79,11 @@ func (s *SQLite) GetService(ctx context.Context, id string) (model.Service, erro
 }
 
 // PutService inserts or updates a service by ID (assigning "svc_..." when
-// empty). A duplicate Name, or a ListenAddr already used by another service,
-// returns an error wrapping model.ErrConflict.
+// empty). A Name another service already uses, ignoring case and surrounding
+// white space (like profile names), or a ListenAddr already used by another
+// service, returns an error wrapping model.ErrConflict. A database that
+// already holds two names differing only in case still opens; one of them has
+// to be renamed before it can be saved again.
 //
 // Listen addresses are compared host-normalised (see listenKey): ":9001",
 // "0.0.0.0:9001" and "[::]:9001" are the same socket. Port 0 means "pick a
@@ -98,9 +101,12 @@ func (s *SQLite) PutService(ctx context.Context, svc model.Service) (model.Servi
 	}
 	var created int64
 	err = s.write(ctx, func(tx *sql.Tx) error {
-		// The writer is exclusive for the whole transaction, so the address
-		// check and the upsert cannot interleave with another PutService.
+		// The writer is exclusive for the whole transaction, so the address and
+		// name checks and the upsert cannot interleave with another PutService.
 		if err := checkListenAddr(ctx, tx, svc.ID, svc.ListenAddr); err != nil {
+			return err
+		}
+		if err := checkServiceName(ctx, tx, svc.ID, svc.Name); err != nil {
 			return err
 		}
 		err := tx.QueryRowContext(ctx, `
@@ -148,6 +154,32 @@ func checkListenAddr(ctx context.Context, tx *sql.Tx, id, addr string) error {
 		}
 		if k, ok := listenKey(other); ok && k == key {
 			return conflict("listen address %q is already in use by service %q (%s)", addr, name, other)
+		}
+	}
+	return rows.Err()
+}
+
+// sameServiceName compares service names ignoring case and surrounding white
+// space, as profile names are.
+func sameServiceName(a, b string) bool { return sameProfileName(a, b) }
+
+// checkServiceName reports a conflict when a service other than id already
+// uses name. The services.name column is UNIQUE, but that compares bytes; this
+// is the comparison users expect ("API" and "api" are one name). Services are
+// few, which lets Go do the Unicode-aware comparison.
+func checkServiceName(ctx context.Context, tx *sql.Tx, id, name string) error {
+	rows, err := tx.QueryContext(ctx, `SELECT name FROM services WHERE id <> ?`, id)
+	if err != nil {
+		return fmt.Errorf("store: put service: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var other string
+		if err := rows.Scan(&other); err != nil {
+			return fmt.Errorf("store: put service: %w", err)
+		}
+		if sameServiceName(other, name) {
+			return conflict("service name %q is already in use", name)
 		}
 	}
 	return rows.Err()

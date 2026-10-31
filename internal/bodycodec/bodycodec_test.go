@@ -189,3 +189,78 @@ func BenchmarkDecodeGzip(b *testing.B) {
 		}
 	}
 }
+
+// utf8Deflate is the raw deflate stream (zlib's, no header) of
+// "ssn=314-87-8072"; its bytes happen to be valid UTF-8.
+var utf8Deflate = []byte("+.\xce\xb3564\xd1\xb50\xd7\xb5007\x02\x00")
+
+func TestLooksCompressed(t *testing.T) {
+	var doc strings.Builder
+	for i := range 400 {
+		fmt.Fprintf(&doc, `{"id":%d,"email":"user%d@acme-corp.io"}`, i*7919, i)
+	}
+	text := []byte(doc.String())
+	cut := func(b []byte) []byte { return b[:len(b)/3] }
+	for _, tc := range []struct {
+		name, ce string
+		body     []byte
+		want     bool
+	}{
+		{"gzip stream", "gzip", gz(t, text), true},
+		{"cut gzip stream", "gzip", cut(gz(t, text)), true},
+		{"decoded under gzip", "gzip", text, false},
+		{"zlib stream", "deflate", zl(t, text), true},
+		{"cut zlib stream", "deflate", cut(zl(t, text)), true},
+		{"raw deflate stream", "deflate", rawDeflate(t, text), true},
+		{"cut raw deflate stream", "deflate", cut(rawDeflate(t, text)), true},
+		{"raw deflate that is valid UTF-8", "deflate", utf8Deflate, true},
+		{"outer coding decides", "gzip, deflate", rawDeflate(t, text), true},
+		{"decoded under deflate", "deflate", text, false},
+		{"decoded tiny JSON under deflate", "deflate", []byte(`{"a":1}`), false},
+		{"brotli bytes", "br", []byte{0x8b, 0x02, 0x80, 0xff}, true},
+		{"decoded under br", "br", text, false},
+		{"no coding", "", rawDeflate(t, text), false},
+		{"identity", "identity", rawDeflate(t, text), false},
+	} {
+		if got := LooksCompressed(tc.ce, tc.body); got != tc.want {
+			t.Errorf("%s: LooksCompressed(%q) = %v, want %v", tc.name, tc.ce, got, tc.want)
+		}
+	}
+}
+
+// TestLooksCompressedSparesDecodedBodies feeds bodies that were decoded
+// already, text and binary, under a deflate claim. Text must never be taken
+// for a stream; random binary may, rarely (an anonymized copy would then
+// replace that body with what it inflates to), so its rate is bounded.
+func TestLooksCompressedSparesDecodedBodies(t *testing.T) {
+	rng := uint64(42)
+	next := func() byte {
+		rng ^= rng << 13
+		rng ^= rng >> 7
+		rng ^= rng << 17
+		return byte(rng)
+	}
+	words := []string{`{"id":`, `"name":"`, `Ada`, `", `, `[1,2,3]`, `true`, `null`, `}`, ` `, `<p>`, `hello`, `=`, `&`, `\n`, `+`, `.`, `%`, `0`}
+	const n = 100000
+	binaryHits := 0
+	for i := range n {
+		size := 1 + i%300
+		var b []byte
+		for len(b) < size {
+			b = append(b, words[int(next())%len(words)]...)
+		}
+		if LooksCompressed("deflate", b) {
+			t.Fatalf("decoded text %d (%d bytes) taken for a deflate stream: %q", i, len(b), b)
+		}
+		b = make([]byte, size)
+		for j := range b {
+			b[j] = next()
+		}
+		if LooksCompressed("deflate", b) {
+			binaryHits++
+		}
+	}
+	if binaryHits > n/10000 {
+		t.Fatalf("%d of %d random binary bodies taken for deflate streams", binaryHits, n)
+	}
+}

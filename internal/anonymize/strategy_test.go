@@ -2,6 +2,7 @@ package anonymize
 
 import (
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -32,6 +33,57 @@ func TestMaskValue(t *testing.T) {
 	for _, c := range cases {
 		if got := maskValue(c.in, c.prefix, c.suff); got != c.want {
 			t.Errorf("maskValue(%q,%d,%d) = %q, want %q", c.in, c.prefix, c.suff, got, c.want)
+		}
+	}
+}
+
+// A keep setting too large to add up must behave like one that is merely
+// larger than the value: the whole value is masked. The sum of the two used
+// to overflow, wrap negative, and keep every character.
+func TestMaskValueHugeKeepMasksEverything(t *testing.T) {
+	huge := []int{math.MaxInt, math.MaxInt - 1, math.MaxInt / 2, math.MaxInt/2 + 1, 1 << 62, 1 << 40}
+	for _, v := range []string{"hunter2", "h", "héllo wörld", "北京市", strings.Repeat("x", 300)} {
+		want := strings.Repeat("*", len([]rune(v)))
+		check := func(prefix, suffix int) {
+			t.Helper()
+			if got := maskValue(v, prefix, suffix); got != want {
+				t.Errorf("maskValue(%q, %d, %d) = %q, want %q", v, prefix, suffix, got, want)
+			}
+		}
+		for _, h := range huge {
+			check(h, 0)
+			check(0, h)
+			check(h, 1)
+			check(1, h)
+			check(h, h)
+			check(h, math.MaxInt)
+			check(math.MaxInt, h)
+		}
+		check(math.MaxInt, math.MaxInt)
+	}
+
+	// And through the engine, with the rule's own settings.
+	r := rl(model.TargetHeader, "X-Card", model.StrategyMask)
+	r.KeepPrefix, r.KeepSuffix = math.MaxInt, math.MaxInt
+	e := mustEngine(t, bareProfile(r))
+	ex := newExchange()
+	ex.Request.Header.Set("X-Card", "4111111111111111")
+	if err := e.Exchange(ex); err != nil {
+		t.Fatal(err)
+	}
+	if got := ex.Request.Header.Get("X-Card"); got != strings.Repeat("*", 16) {
+		t.Errorf("X-Card = %q", got)
+	}
+	for _, k := range [][2]int{{math.MaxInt, 0}, {0, math.MaxInt}, {math.MaxInt, 1}} {
+		r.KeepPrefix, r.KeepSuffix = k[0], k[1]
+		e = mustEngine(t, bareProfile(r))
+		ex = newExchange()
+		ex.Request.Header.Set("X-Card", "4111111111111111")
+		if err := e.Exchange(ex); err != nil {
+			t.Fatal(err)
+		}
+		if got := ex.Request.Header.Get("X-Card"); strings.ContainsAny(got, "0123456789") {
+			t.Errorf("keep %v: X-Card = %q still shows digits", k, got)
 		}
 	}
 }
@@ -348,46 +400,43 @@ func TestRuleScopeAndEnabled(t *testing.T) {
 	}
 }
 
+// TestRulesRunInOrder: when several rules match one value the first in the
+// profile wins and the later ones leave the value alone, so a value is never
+// transformed twice.
 func TestRulesRunInOrder(t *testing.T) {
-	// redact then hash: the hash sees the redaction marker.
-	e := mustEngine(t, bareProfile(
-		rl(model.TargetHeader, "X-A", model.StrategyRedact),
-		rl(model.TargetHeader, "X-A", model.StrategyHash),
-	))
-	ex := newExchange()
-	ex.Request.Header.Set("X-A", "v")
-	if err := e.Exchange(ex); err != nil {
-		t.Fatal(err)
-	}
-	if got, want := ex.Request.Header.Get("X-A"), e.k.hashToken("[REDACTED]"); got != want {
-		t.Errorf("redact,hash: got %q, want %q", got, want)
+	run := func(t *testing.T, rules ...model.AnonymizationRule) (*Engine, http.Header) {
+		t.Helper()
+		e := mustEngine(t, bareProfile(rules...))
+		ex := newExchange()
+		ex.Request.Header.Set("X-A", "v")
+		if err := e.Exchange(ex); err != nil {
+			t.Fatal(err)
+		}
+		return e, ex.Request.Header
 	}
 
-	// hash then mask: the mask sees the token.
+	// redact first: the hash rule listed after it leaves the marker alone.
+	_, h := run(t, rl(model.TargetHeader, "X-A", model.StrategyRedact), rl(model.TargetHeader, "X-A", model.StrategyHash))
+	if got := h.Get("X-A"); got != "[REDACTED]" {
+		t.Errorf("redact,hash: got %q, want the redaction marker", got)
+	}
+
+	// hash first: the mask listed after it does not mask the token.
 	m := rl(model.TargetHeader, "X-A", model.StrategyMask)
 	m.KeepPrefix = 2
-	e = mustEngine(t, bareProfile(rl(model.TargetHeader, "X-A", model.StrategyHash), m))
-	ex = newExchange()
-	ex.Request.Header.Set("X-A", "v")
-	if err := e.Exchange(ex); err != nil {
-		t.Fatal(err)
-	}
-	if got, want := ex.Request.Header.Get("X-A"), maskValue(e.k.hashToken("v"), 2, 0); got != want {
+	e, h := run(t, rl(model.TargetHeader, "X-A", model.StrategyHash), m)
+	if got, want := h.Get("X-A"), e.k.hashToken("v"); got != want {
 		t.Errorf("hash,mask: got %q, want %q", got, want)
 	}
 
-	// A remove anywhere in the chain wins.
-	e = mustEngine(t, bareProfile(
-		rl(model.TargetHeader, "X-A", model.StrategyHash),
-		rl(model.TargetHeader, "X-A", model.StrategyRemove),
-	))
-	ex = newExchange()
-	ex.Request.Header.Set("X-A", "v")
-	if err := e.Exchange(ex); err != nil {
-		t.Fatal(err)
+	// The first rule wins for remove as well, in either order.
+	_, h = run(t, rl(model.TargetHeader, "X-A", model.StrategyHash), rl(model.TargetHeader, "X-A", model.StrategyRemove))
+	if _, ok := h["X-A"]; !ok {
+		t.Error("a remove listed after a hash rule deleted the header")
 	}
-	if _, ok := ex.Request.Header["X-A"]; ok {
-		t.Error("remove did not delete the header")
+	_, h = run(t, rl(model.TargetHeader, "X-A", model.StrategyRemove), rl(model.TargetHeader, "X-A", model.StrategyHash))
+	if _, ok := h["X-A"]; ok {
+		t.Error("a remove listed first did not delete the header")
 	}
 }
 
@@ -525,7 +574,7 @@ func TestPathSegmentsAreURLSafe(t *testing.T) {
 	}
 }
 
-func TestHeaderNamesCaseInsensitiveButQueryExact(t *testing.T) {
+func TestHeaderNamesAndQueryNamesIgnoreCase(t *testing.T) {
 	e := mustEngine(t, bareProfile(
 		rl(model.TargetHeader, "X-API-KEY", model.StrategyRedact),
 		rl(model.TargetQuery, "Token", model.StrategyRedact),
@@ -533,15 +582,16 @@ func TestHeaderNamesCaseInsensitiveButQueryExact(t *testing.T) {
 	ex := newExchange()
 	lowerKey := "x-api-" + "key" // non-canonical, as hand-built headers have
 	ex.Request.Header[lowerKey] = []string{"abc"}
-	ex.Request.RawQuery = "token=a&Token=b"
+	ex.Request.RawQuery = "token=a&Token=b&TOKEN=c&to_ken=d&other=e"
 	if err := e.Exchange(ex); err != nil {
 		t.Fatal(err)
 	}
 	if got := ex.Request.Header[lowerKey]; len(got) != 1 || got[0] != "[REDACTED]" {
 		t.Errorf("header with a non-canonical key: %v", ex.Request.Header)
 	}
-	if ex.Request.RawQuery != "token=a&Token=%5BREDACTED%5D" {
-		t.Errorf("query parameter names are case sensitive: %q", ex.Request.RawQuery)
+	// Query names are compared ignoring case, "_" and "-".
+	if want := "token=%5BREDACTED%5D&Token=%5BREDACTED%5D&TOKEN=%5BREDACTED%5D&to_ken=%5BREDACTED%5D&other=e"; ex.Request.RawQuery != want {
+		t.Errorf("query = %q, want %q", ex.Request.RawQuery, want)
 	}
 }
 

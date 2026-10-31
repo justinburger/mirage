@@ -189,8 +189,8 @@ func (r *run) headerValue(name, v string, sel []*rule, redacted bool, loc *locat
 // restrictedValue applies the regex rules and then the metaSafeDetectors, for
 // headers that are mostly protocol metadata.
 func (r *run) restrictedValue(s string, loc *locator) string {
-	for _, rl := range r.sd.regex {
-		s = r.applyRegex(rl, s, loc)
+	if len(r.sd.regex) > 0 {
+		s = r.applyChain(r.sd.regex, s, loc)
 	}
 	return r.detectWith(s, nil, loc, metaSafeDetectors)
 }
@@ -293,7 +293,7 @@ func (r *run) cookiePair(name, val string, redacted bool, loc *locator) (string,
 		}
 		return s
 	}
-	if sel := r.sd.cookie[name]; len(sel) > 0 {
+	if sel := r.keyedRules(r.sd.cookie, name, false); len(sel) > 0 {
 		if rl := removes(sel); rl != nil {
 			r.record(&cl, rl.source, val, "")
 			return "", true

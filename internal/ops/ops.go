@@ -15,21 +15,53 @@
 // partial destination is deleted again (on a context that survives the
 // caller's cancellation) and the original error is returned.
 //
+// # Anonymizing
+//
+// Every anonymizing operation (copies, exports, imports, and the CLI's
+// "anonymize" command) runs each exchange through AnonymizeExchange, so they
+// all behave the same:
+//
+//   - Compressed bodies are decoded first (gzip, deflate and stacked codings
+//     such as "gzip, gzip", up to AnonymizeBodyLimit bytes; streams cut by a
+//     capture cap or corrupt after some output yield their readable prefix).
+//     A body that is still compressed after that (br, zstd, a stream that
+//     yields nothing) is dropped and marked truncated: the anonymizer cannot
+//     read it, and keeping it would store raw personal data that anyone can
+//     decompress.
+//   - The Endpoint is rebuilt with pathnorm.Normalizer.AnonymizedEndpoint from
+//     the raw and the anonymized path, so a raw path segment ("/ssn/123-45-
+//     6789") never survives in endpoint statistics, the UI or matching. A
+//     copy keeps a stored endpoint that came from a service's own patterns
+//     when it cannot carry anything the anonymizer removed.
+//   - An exchange the engine fails on is left out, never written in any form,
+//     and counted (Stats.Failed; also named in the description of a copy or
+//     an import). The operation fails only when every exchange failed.
+//
+// # Operations
+//
 //   - CopyAnonymized creates a recording with Source "copy" and Anonymized
 //     true, whose description names the source recording and the profile.
+//     CopyAnonymizedReport also reports the engine's changes per exchange, and
+//     CopyAnonymizedStats returns the Stats.
 //   - ImportHAR creates a recording with Source "har". Entries are decoded one
 //     at a time with har.DecodeEntries and converted with har.ToExchange.
 //     Entries that are not HTTP(S) exchanges (data: URLs and the like, errors
 //     wrapping har.ErrUnsupported) are skipped and counted in the
 //     recording's description; any other conversion error fails the import
 //     with an error wrapping model.ErrValidation that names the entry. The
-//     Endpoint of every exchange is computed from the raw escaped path before
-//     anonymization. Malformed HAR input yields an error wrapping
-//     model.ErrValidation; a failure of the reader itself (a dropped upload,
-//     a size limit) is returned as is, wrapped with context.
+//     Endpoint of every exchange comes from the raw escaped path, or, when
+//     anonymizing, from the raw and the anonymized path. A start time that
+//     cannot be stored (missing, or outside the years 1678 to 2261) is
+//     replaced by that of the previous entry (the first usable one for
+//     entries that come before it, the import time when there is none) and
+//     counted in the description, so a timeline replay does not wait years.
+//     Malformed HAR input yields an error wrapping model.ErrValidation; a
+//     failure of the reader itself (a dropped upload, a size limit) is
+//     returned as is, wrapped with context. ImportHARStats returns the Stats.
 //   - ExportHAR streams with har.Encoder through a buffered writer. It does
 //     not finish the document when it fails midway, so a truncated export is
 //     recognisably invalid JSON rather than a plausible short HAR.
+//     ExportHARStats returns the Stats.
 //   - LoadEngine builds the engine of a stored profile; LoadFaults copies the
 //     stored fault rules into an injector.
 //

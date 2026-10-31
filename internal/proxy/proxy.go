@@ -188,6 +188,21 @@
 //   - ServiceStatus.Error keeps the last Apply failure or runtime capture error
 //     until the next successful Apply. A failed Apply leaves a running service
 //     on its previous configuration.
+//   - Anonymization profile and virtualizer. A virtualize or hybrid service with
+//     anonymize_capture on matches requests in their anonymized form, so its
+//     virtualizer (built by Deps.Virtualizers from the service) embeds the
+//     profile's anonymizer. Changing anonymize_capture, or the profile while it
+//     is on, therefore rebuilds the virtualizer, and ProfileChanged rebuilds
+//     the virtualizer of every running virtualize and hybrid service that uses
+//     the profile with anonymize_capture on, together with the capture
+//     anonymizer of record and hybrid services. What cannot be rebuilt keeps
+//     its previous version and the error is returned.
+//   - Content-Type. A response the upstream sent without a Content-Type reaches
+//     the client without one in every proxied mode: the client's header map
+//     gets an empty Content-Type entry, which keeps net/http from sniffing one.
+//     It is set on the client's writer, not on the upstream response, because
+//     httputil.ReverseProxy copies header values one by one (an empty entry
+//     never arrives) and the captured headers must stay what the upstream sent.
 package proxy
 
 import (

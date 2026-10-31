@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -68,6 +69,9 @@ type item struct {
 	isErr     bool
 	truncated bool // response body was cut at capture; never served as a body
 	gzip      bool // response may be re-encoded as gzip
+	// clen is the Content-Length the upstream announced for a recorded HEAD
+	// exchange (its body is empty, so the length cannot be recomputed), or -1.
+	clen      int64
 	ttfb, dur time.Duration
 	ep        *epool
 	hdrs      []hdr      // response headers to copy
@@ -334,6 +338,7 @@ func newItem(ex *model.Exchange, lazy bool) *item {
 		isErr:     ex.IsError(),
 		truncated: ex.Response.BodyTruncated,
 		gzip:      ex.Response.ContentEncoding == "gzip",
+		clen:      headLength(ex),
 		ttfb:      ex.TTFB.D(),
 		dur:       ex.Duration.D(),
 		hdrs:      buildHeaders(ex.Response.Header, ex.Response.ContentEncoding != ""),
@@ -348,6 +353,23 @@ func newItem(ex *model.Exchange, lazy bool) *item {
 		it.body = &bodyEntry{raw: ex.Response.Body}
 	}
 	return it
+}
+
+// headLength returns the Content-Length a recorded HEAD exchange announced, or
+// -1 for any other exchange and for a HEAD response without a usable length.
+func headLength(ex *model.Exchange) int64 {
+	if upperMethod(ex.Request.Method) != http.MethodHead {
+		return -1
+	}
+	v := strings.TrimSpace(ex.Response.Header.Get("Content-Length"))
+	if v == "" {
+		return -1
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		return -1
+	}
+	return n
 }
 
 // buildHeaders returns the response headers worth copying: canonical keys
@@ -410,37 +432,45 @@ func (e *Engine) lookup(r *http.Request, body []byte, m *Match) bool {
 			path = "/"
 		}
 	}
-	body = e.requestBody(r, body)
 
-	var sb [192]byte
-	suffix := e.appendSuffix(sb[:0], rawQuery, body, r.Header)
-	var req []param
-	if e.cfg.subset {
-		var pb [8]param
-		req = e.parseParams(rawQuery, pb[:0], false, false)
-	}
+	var stripe *counters
+	var ok bool
+	if e.anon != nil {
+		// The recording is anonymized: see lookupForms.
+		stripe, ok = e.lookupForms(r, body, method, path, rawQuery, m)
+	} else {
+		body = e.requestBody(r, body)
 
-	var kb [320]byte
-	key := append(kb[:0], keyExact)
-	key = append(key, method...)
-	key = append(key, 0)
-	key = append(key, path...)
-	key = append(key, 0)
-	key = append(key, suffix...)
-	h := maphash.Bytes(e.seed, key)
-	stripe := &e.stats[h&(numShards-1)]
+		var sb [192]byte
+		suffix := e.appendSuffix(sb[:0], rawQuery, body, r.Header)
+		var req []param
+		if e.cfg.subset {
+			var pb [8]param
+			req = e.parseParams(rawQuery, pb[:0], false, false)
+		}
 
-	ok := e.find(h, key, path, method, req, m)
-	if !ok && method == http.MethodHead {
-		// A HEAD request is answered from the GET recording when no HEAD was
-		// recorded.
-		key = append(kb[:0], keyExact)
-		key = append(key, http.MethodGet...)
+		var kb [320]byte
+		key := append(kb[:0], keyExact)
+		key = append(key, method...)
 		key = append(key, 0)
 		key = append(key, path...)
 		key = append(key, 0)
 		key = append(key, suffix...)
-		ok = e.find(maphash.Bytes(e.seed, key), key, path, http.MethodGet, req, m)
+		h := maphash.Bytes(e.seed, key)
+		stripe = &e.stats[h&(numShards-1)]
+
+		ok = e.find(h, key, path, method, req, m)
+		if !ok && method == http.MethodHead {
+			// A HEAD request is answered from the GET recording when no HEAD was
+			// recorded.
+			key = append(kb[:0], keyExact)
+			key = append(key, http.MethodGet...)
+			key = append(key, 0)
+			key = append(key, path...)
+			key = append(key, 0)
+			key = append(key, suffix...)
+			ok = e.find(maphash.Bytes(e.seed, key), key, path, http.MethodGet, req, m)
+		}
 	}
 	if ok && e.opts.TruncatedAsMiss && m.it != nil && m.it.truncated {
 		// Hybrid: let the upstream answer (and the capture repair the

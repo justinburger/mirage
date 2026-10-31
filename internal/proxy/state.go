@@ -68,9 +68,14 @@ func effectiveProfileID(svc model.Service) string {
 func sameVirtualization(a, b model.Service) bool {
 	// Hybrid treats truncated-only matches as misses (see
 	// virtual.Options.TruncatedAsMiss), so moving in or out of hybrid needs a
-	// new engine.
+	// new engine. A service that anonymizes its captures matches requests in
+	// their anonymized form (virtual.Options.Anonymizer): the engine embeds the
+	// profile's anonymizer, so turning anonymize_capture on or off, or moving
+	// to another profile while it is on, needs a new engine.
 	return a.RecordingID == b.RecordingID &&
 		(a.Mode == model.ModeHybrid) == (b.Mode == model.ModeHybrid) &&
+		a.AnonymizeCapture == b.AnonymizeCapture &&
+		(!a.AnonymizeCapture || effectiveProfileID(a) == effectiveProfileID(b)) &&
 		reflect.DeepEqual(a.Match, b.Match) &&
 		a.Latency == b.Latency &&
 		a.ErrorAmplification == b.ErrorAmplification &&

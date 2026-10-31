@@ -163,8 +163,10 @@ func boundaryOf(ct string) string {
 		return params["boundary"]
 	}
 	// Lenient scan for values mime cannot parse (unquoted special characters).
-	lower := strings.ToLower(ct)
-	i := strings.Index(lower, "boundary=")
+	// The search folds ASCII case on the original bytes: lower-casing a copy
+	// would change the length of text that is not ASCII (or not UTF-8), and
+	// an index into the copy is not an index into ct.
+	i := indexFoldASCII(ct, "boundary=")
 	if i < 0 {
 		return ""
 	}
@@ -173,6 +175,29 @@ func boundaryOf(ct string) string {
 		v = v[:j]
 	}
 	return strings.Trim(strings.TrimSpace(v), `"`)
+}
+
+// indexFoldASCII returns the index in s of the first occurrence of lower, a
+// string of lower-case ASCII, comparing s without regard to ASCII case, or -1.
+// It works on bytes, so the result is always an index into s; bytes outside
+// ASCII never match.
+func indexFoldASCII(s, lower string) int {
+	for i := 0; i+len(lower) <= len(s); i++ {
+		j := 0
+		for ; j < len(lower); j++ {
+			c := s[i+j]
+			if 'A' <= c && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			if c != lower[j] {
+				break
+			}
+		}
+		if j == len(lower) {
+			return i
+		}
+	}
+	return -1
 }
 
 // partInfo is what the anonymizer needs to know about a part's headers.
@@ -409,7 +434,7 @@ func (r *run) multipartBody(b []byte, ct string, truncated bool, loc *locator) (
 		case info.hasFilename || info.encoded:
 			nb, changed = r.filePart(body, info, cut, &l)
 		default:
-			sel := r.sd.form[info.name]
+			sel := r.keyedRules(r.sd.form, info.name, true)
 			switch rl := removes(sel); {
 			case rl != nil:
 				if r.rep != nil {

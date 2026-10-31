@@ -1,6 +1,6 @@
 // Server-Sent Events client for /api/v1/stream with backoff reconnects.
 import { apiUrl, api, getToken, onTokenChange } from './api.js';
-import { applyStats, applyServiceStatuses, applyReplayUpdates, setConn, state } from './state.js';
+import { applyStats, applyServiceStatuses, applyReplayUpdates, resyncAll, setConn, state } from './state.js';
 import { ingestStats } from './series.js';
 
 let es = null;
@@ -9,6 +9,11 @@ let backoff = 1000;
 let started = false;
 let everConnected = false;
 let watchdog = 0;
+// The stream carries changes only. After any gap in it (an error, a silent
+// stream that was reconnected, a first attempt that failed) the next open
+// fetches services, replays and info again, so nothing that changed while it
+// was down stays stale.
+let gap = false;
 
 function parse(e) {
   try { return JSON.parse(e.data); } catch (_) { return null; }
@@ -29,6 +34,7 @@ function connect(quiet) {
     backoff = 1000;
     setConn('connected');
     armWatchdog();
+    if (gap) { gap = false; resyncAll(); }
   };
   es.addEventListener('stats', (e) => {
     const evt = parse(e);
@@ -47,6 +53,7 @@ function connect(quiet) {
     if (d) applyReplayUpdates(d);
   });
   es.onerror = () => {
+    gap = true;
     if (es) { es.close(); es = null; }
     if (state.conn !== 'unauthorized') setConn('reconnecting');
     // A 401 closes an EventSource without telling us why. Probe a normal
@@ -67,7 +74,7 @@ function scheduleReconnect() {
 function armWatchdog() {
   clearTimeout(watchdog);
   watchdog = setTimeout(() => {
-    if (state.conn === 'connected') connect(true);
+    if (state.conn === 'connected') { gap = true; connect(true); }
   }, 45000);
 }
 
@@ -75,6 +82,14 @@ export function startStream() {
   if (started) return;
   started = true;
   onTokenChange(() => { backoff = 1000; connect(); });
+  // A tab that was in the background may have missed changes made elsewhere
+  // (another tab, curl) that no status event reveals: fetch again on return.
+  let hiddenAt = 0;
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') hiddenAt = Date.now();
+    else if (hiddenAt && Date.now() - hiddenAt > 5000 && state.conn !== 'unauthorized') { hiddenAt = 0; resyncAll(); }
+    else hiddenAt = 0;
+  });
   connect();
 }
 

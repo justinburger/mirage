@@ -56,7 +56,9 @@ func maskValue(v string, keepPrefix, keepSuffix int) string {
 	if keepSuffix < 0 {
 		keepSuffix = 0
 	}
-	if keepPrefix+keepSuffix >= n {
+	// keepPrefix+keepSuffix >= n, written so that huge settings cannot
+	// overflow the sum (it would wrap negative and keep everything).
+	if keepPrefix >= n || keepSuffix >= n-keepPrefix {
 		keepPrefix, keepSuffix = 0, 0
 	}
 	if n == len(v) { // ASCII fast path

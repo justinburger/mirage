@@ -63,6 +63,9 @@ func (e *Engine) Respond(w http.ResponseWriter, r *http.Request, m *Match) {
 		hdrs   []hdr
 		body   *bodyEntry
 		gzOK   bool
+		// headLen is the length a recorded HEAD exchange announced; -1 = the
+		// length of the payload.
+		headLen int64 = -1
 	)
 	if m.Synthetic {
 		status, hdrs, body = http.StatusServiceUnavailable, syntheticHeaders, e.synth
@@ -88,6 +91,9 @@ func (e *Engine) Respond(w http.ResponseWriter, r *http.Request, m *Match) {
 			return
 		}
 		status, hdrs, gzOK = responseStatus(it.status), it.hdrs, it.gzip
+		if r.Method == http.MethodHead {
+			headLen = it.clen
+		}
 	}
 
 	payload := body.raw
@@ -101,7 +107,13 @@ func (e *Engine) Respond(w http.ResponseWriter, r *http.Request, m *Match) {
 		return
 	}
 
-	e.writeHeader(w.Header(), m, hdrs, status, len(payload), useGzip)
+	bodyLen := int64(len(payload))
+	if headLen >= 0 {
+		// A HEAD answered from a recorded HEAD exchange: its body is empty
+		// but the upstream announced the length of the GET body.
+		bodyLen = headLen
+	}
+	e.writeHeader(w.Header(), m, hdrs, status, bodyLen, useGzip)
 	w.WriteHeader(status)
 	if rest > 0 {
 		// Let the client see the headers while the "upstream" is still busy.
@@ -118,7 +130,7 @@ func (e *Engine) Respond(w http.ResponseWriter, r *http.Request, m *Match) {
 // writeHeader copies the recorded headers into dst and adds the ones Mirage
 // computes. The values are copied, so nothing a writer does to dst can reach
 // the index.
-func (e *Engine) writeHeader(dst http.Header, m *Match, hdrs []hdr, status, bodyLen int, gzipped bool) {
+func (e *Engine) writeHeader(dst http.Header, m *Match, hdrs []hdr, status int, bodyLen int64, gzipped bool) {
 	n := 5
 	for _, h := range hdrs {
 		n += len(h.vals)
@@ -127,9 +139,14 @@ func (e *Engine) writeHeader(dst http.Header, m *Match, hdrs []hdr, status, body
 	for _, h := range hdrs {
 		backing = putValues(dst, backing, h.key, h.vals...)
 	}
+	if _, ok := dst["Content-Type"]; !ok {
+		// The recording has no Content-Type: say so. Without the key net/http
+		// sniffs one ("text/plain; charset=utf-8") that the upstream never sent.
+		dst["Content-Type"] = nil
+	}
 	backing = putValues(dst, backing, "Date", e.dateHeader())
 	if bodyAllowed(status) {
-		backing = putValues(dst, backing, "Content-Length", strconv.Itoa(bodyLen))
+		backing = putValues(dst, backing, "Content-Length", strconv.FormatInt(bodyLen, 10))
 	}
 	if gzipped {
 		backing = putValues(dst, backing, "Content-Encoding", "gzip")

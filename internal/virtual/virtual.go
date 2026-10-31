@@ -66,7 +66,12 @@ type Options struct {
 	// lookups first try the anonymized form of the request (a copy; the
 	// request itself is never changed) and then the request as received,
 	// which still matches traffic that is already anonymized, such as a
-	// replay of the recording.
+	// replay of the recording. The two forms are tried level by level, most
+	// specific first (exact, path, template), so a broad template match on the
+	// anonymized form never hides an exact match of the request as received.
+	// The template level uses the endpoint the capture stored for an
+	// anonymized exchange (pathnorm.Normalizer.AnonymizedEndpoint). With a nil
+	// Anonymizer (the default) lookups cost nothing extra.
 	Anonymizer RequestAnonymizer
 }
 
@@ -123,6 +128,7 @@ type Engine struct {
 	seed     maphash.Seed
 	norm     *pathnorm.Normalizer
 	patterns map[string]struct{} // norm's endpoint_patterns
+	anon     RequestAnonymizer   // Options.Anonymizer; nil = lookups use the request as received
 	rng      rng
 
 	shards [numShards]shard
@@ -234,12 +240,18 @@ func NewEngine(st store.Store, opts Options) *Engine {
 	if opts.Normalizer == nil {
 		opts.Normalizer = pathnorm.Default
 	}
+	if isNilAnonymizer(opts.Anonymizer) {
+		// A nil *anonymize.Engine inside the interface would panic on the
+		// first lookup; it means "no anonymizer".
+		opts.Anonymizer = nil
+	}
 
 	e := &Engine{
 		st:   st,
 		opts: opts,
 		seed: maphash.MakeSeed(),
 		norm: opts.Normalizer,
+		anon: opts.Anonymizer,
 		eps:  make(map[string]*epool),
 		now:  time.Now,
 	}

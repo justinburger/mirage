@@ -99,7 +99,15 @@ export function resetSeries(name) {
   buffers.delete(name);
 }
 
-/** Sum rows of several series at equal timestamps (for "all traffic"). */
+/**
+ * Combines the rows of several series at equal timestamps (for "all
+ * services"): counts add up. A percentile of the combined traffic cannot be
+ * rebuilt from per-series percentiles, and a request-weighted mean of p95s is
+ * not a p95 (one service at 800 ms with half the traffic and one at 100 ms
+ * average to about 450 ms, while the combined p95 is about 800 ms). So p95 and p99
+ * are the worst series' value, an upper bound that names the slowest service;
+ * p50 stays a request-weighted mean, a typical value. The charts say so.
+ */
 export function aggregateRows(rowLists) {
   const byT = new Map();
   for (const rows of rowLists) {
@@ -123,17 +131,18 @@ export function addInto(a, r) {
   const w = r.rps || 0;
   a.w += w;
   a.p50 += r.p50 * w;
-  a.p95 += r.p95 * w;
-  a.p99 += r.p99 * w;
+  if (w > 0) {
+    a.p95 = Math.max(a.p95, r.p95);
+    a.p99 = Math.max(a.p99, r.p99);
+  }
   a.max = Math.max(a.max, r.max);
   return a;
 }
 
-/** Turn weighted sums into request-weighted averages. */
+/** Turn the weighted p50 sum into a mean; p95 and p99 already hold the worst series. */
 export function finishAgg(a) {
-  if (a.w > 0) {
-    a.p50 /= a.w; a.p95 /= a.w; a.p99 /= a.w;
-  } else { a.p50 = a.p95 = a.p99 = 0; }
+  if (a.w > 0) a.p50 /= a.w;
+  else a.p50 = a.p95 = a.p99 = 0;
   a.err_pct = a.rps > 0 ? (a.errors / a.rps) * 100 : 0;
   delete a.w;
   return a;

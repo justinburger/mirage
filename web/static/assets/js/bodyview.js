@@ -155,7 +155,11 @@ export function bodyViewer(bv, opts = {}) {
   const shown = kind === 'binary' ? hexDump(bytes) : (pretty != null ? pretty : rawText);
   const limit = opts.maxChars || MAX_RENDER;
   const code = h('pre', { class: ['code', kind === 'binary' && 'code-hex'], tabindex: 0 });
-  const wrapState = { on: false };
+  // A line longer than a screen (one long string, a minified document) would
+  // be read by scrolling sideways: such a body starts wrapped. The toggle
+  // below still switches it, and every other body keeps its lines.
+  const wrapState = { on: kind !== 'binary' && /[^\n]{160}/.test(shown.length > limit ? shown.slice(0, limit) : shown) };
+  code.classList.toggle('wrap', wrapState.on);
   function paint(full) {
     const text = !full && shown.length > limit ? shown.slice(0, limit) : shown;
     code.replaceChildren(kind === 'json' ? highlightJSON(text, marks) : highlightPlain(text, marks));
@@ -174,7 +178,7 @@ export function bodyViewer(bv, opts = {}) {
   const tools = h('div', { class: 'body-tools' },
     kind !== 'binary' ? copyButton(() => shown, { title: 'Copy body' }) : null,
     h('button', {
-      type: 'button', class: 'btn btn-ghost btn-sm btn-icon', title: 'Toggle line wrapping', 'aria-label': 'Toggle line wrapping',
+      type: 'button', class: ['btn btn-ghost btn-sm btn-icon', wrapState.on && 'is-on'], title: 'Toggle line wrapping', 'aria-label': 'Toggle line wrapping',
       onclick: (e) => { wrapState.on = !wrapState.on; code.classList.toggle('wrap', wrapState.on); e.currentTarget.classList.toggle('is-on', wrapState.on); },
     }, h('span', { class: 'wrap-glyph', 'aria-hidden': 'true' }, '\u21b5')),
     btn('', {

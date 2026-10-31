@@ -58,14 +58,21 @@ type jsonRW struct {
 	reporting bool
 	loc       locator
 	prog      []*rule
-	states    []jstate
-	active    []int32
-	stack     []jframe
-	path      []byte
-	chain     []*rule
-	tmp       []byte
-	sibTmp    []byte // scratch of scanForKeys; tmp may be holding the key being entered
-	skipStk   []byte
+	// kd indexes the keyOnly rules of prog by normalized member name, see
+	// sideRules.keyDescent.
+	kd map[string][]int32
+	// nest is how many JSON documents enclose this one (it was found inside a
+	// string of another); nkey is scratch for normalized member names.
+	nest    int
+	nkey    []byte
+	states  []jstate
+	active  []int32
+	stack   []jframe
+	path    []byte
+	chain   []*rule
+	tmp     []byte
+	sibTmp  []byte // scratch of scanForKeys; tmp may be holding the key being entered
+	skipStk []byte
 	// look counts the bytes scanned ahead for sibling filters in this
 	// document; lookMax bounds it, see siblingCheck.
 	look, lookMax int
@@ -73,22 +80,37 @@ type jsonRW struct {
 
 var jsonPool = sync.Pool{New: func() any { return new(jsonRW) }}
 
+// maxNestedJSON bounds how many JSON documents are unpacked from strings of
+// one another: {"a":"{\"b\":\"{...}\"}"} is two levels deep. A string that is
+// nested deeper than this is treated as the plain string it is.
+const maxNestedJSON = 3
+
 // rewriteJSON rewrites src, a single JSON value, for the current side of r.
 // In lenient mode a document that ends early (a truncated capture) is
 // processed as far as it goes. It reports whether anything changed; when
 // nothing changed the returned slice is nil and src should be kept as is.
 func (r *run) rewriteJSON(src []byte, lenient bool, loc locator) ([]byte, bool, error) {
+	return r.rewriteDoc(src, lenient, loc, r.sd.json, r.sd.keyDescent, 0, nil)
+}
+
+// rewriteDoc is rewriteJSON for a document with its own rules: prog and kd
+// are the rules that apply (all of the side's for a body, the ones that start
+// with a recursive descent for a document found inside a string), nest says
+// how many documents enclose it, and prefix, when reporting, is written in
+// front of the "$" of the locations it reports.
+func (r *run) rewriteDoc(src []byte, lenient bool, loc locator, prog []*rule, kd map[string][]int32, nest int, prefix []byte) ([]byte, bool, error) {
 	w := jsonPool.Get().(*jsonRW)
 	w.r, w.src, w.pos = r, src, 0
 	w.lenient, w.changed, w.reporting = lenient, false, r.rep != nil
 	w.loc = loc
 	w.loc.json = nil
-	w.prog = r.sd.json
+	w.prog, w.kd, w.nest = prog, kd, nest
 	w.out = w.out[:0]
 	w.look, w.lookMax = 0, 4*len(src)+(64<<10)
 	w.states, w.active, w.stack = w.states[:0], w.active[:0], w.stack[:0]
 	w.path = w.path[:0]
 	if w.reporting {
+		w.path = append(w.path, prefix...)
 		w.path = append(w.path, '$')
 	}
 	err := w.run()
@@ -103,7 +125,7 @@ func (r *run) rewriteJSON(src []byte, lenient bool, loc locator) ([]byte, bool, 
 }
 
 func (w *jsonRW) release() {
-	w.r, w.src, w.prog, w.loc = nil, nil, nil, locator{}
+	w.r, w.src, w.prog, w.kd, w.loc = nil, nil, nil, nil, locator{}
 	for i := range w.chain {
 		w.chain[i] = nil
 	}
@@ -466,6 +488,16 @@ func (w *jsonRW) stringLeaf(info *childInfo) error {
 	}
 
 	chain := w.leafChain(info)
+	if !partial && w.nest < maxNestedJSON && !selected(chain) && embeddedJSON(val) {
+		if nested, changed, ok := w.nestedDocument(val); ok {
+			if !changed {
+				return w.verbatim(start, end, false)
+			}
+			w.changed = true
+			w.out = appendJSONString(w.out, string(nested))
+			return nil
+		}
+	}
 	var st textStats
 	hasStats := false
 	if len(chain) == 0 {
@@ -502,6 +534,53 @@ func (w *jsonRW) stringLeaf(info *childInfo) error {
 		return errLenientEOF
 	}
 	return nil
+}
+
+// embeddedJSON reports whether the string value val looks like a JSON object
+// or array once the spaces around it are trimmed: queue messages, webhook
+// envelopes and log events carry whole documents as strings.
+func embeddedJSON(val []byte) bool {
+	i, j := 0, len(val)
+	for i < j && isJSONSpace(val[i]) {
+		i++
+	}
+	for j > i && isJSONSpace(val[j-1]) {
+		j--
+	}
+	if j-i < 2 {
+		return false
+	}
+	return val[i] == '{' && val[j-1] == '}' || val[i] == '[' && val[j-1] == ']'
+}
+
+func isJSONSpace(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
+
+// nestedDocument rewrites the JSON document that the string value val holds.
+// Inside it the recursive-descent rules and the detectors apply, the way they
+// do in a body, and so do the regex rules; an absolute path ($.a.b) is
+// relative to the outer document and does not. ok is false when val is not
+// one JSON value (the caller then handles it as the plain string it is, and
+// whatever the attempt reported is dropped). changed reports whether the
+// document differs; out is then its new text, compact.
+func (w *jsonRW) nestedDocument(val []byte) (out []byte, changed, ok bool) {
+	r := w.r
+	if len(r.sd.nested) == 0 && r.c.detMask == 0 && len(r.sd.regex) == 0 {
+		return nil, false, false // nothing could change in it
+	}
+	var prefix []byte
+	mark := 0
+	if r.rep != nil {
+		prefix = append(append(make([]byte, 0, len(w.path)+8), w.path...), " <json> "...)
+		mark = r.rep.mark()
+	}
+	out, changed, err := r.rewriteDoc(val, false, w.loc, r.sd.nested, r.sd.nestedKeyDescent, w.nest+1, prefix)
+	if err != nil {
+		if r.rep != nil {
+			r.rep.rollback(mark)
+		}
+		return nil, false, false
+	}
+	return out, changed, true
 }
 
 // verbatim copies source bytes [start,end) unchanged.

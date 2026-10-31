@@ -2,7 +2,6 @@ package har
 
 import (
 	"bytes"
-	"compress/gzip"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -15,7 +14,9 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
+	"github.com/justinburger/mirage/internal/bodycodec"
 	"github.com/justinburger/mirage/internal/model"
 )
 
@@ -27,12 +28,33 @@ var ErrUnsupported = errors.New("unsupported HAR entry")
 // noResponseError is the Exchange.Error text for entries without a response.
 const noResponseError = "no response in HAR"
 
-// maxInflate bounds how far a gzip-compressed body is expanded: the cap the
-// proxy puts on a captured body (a service's default max_body_bytes). A few
+// maxInflate bounds how far a compressed body is expanded: the cap the proxy
+// puts on a captured body (a service's default max_body_bytes). A few
 // kilobytes of gzip expand a thousandfold, so a larger limit let a small HAR
 // turn into gigabytes of memory and disk. What lies beyond is dropped and the
 // body is flagged truncated, exactly like a capture cut by the proxy.
 const maxInflate = int(model.DefaultMaxBodyBytes)
+
+// minStorable and maxStorable bound the start times that survive being stored
+// as an int64 count of Unix nanoseconds: 1677-09-21 to 2262-04-11.
+var (
+	minStorable = time.Unix(0, math.MinInt64)
+	maxStorable = time.Unix(0, math.MaxInt64)
+)
+
+// StartTimeStorable reports whether t is a start time that can be stored with
+// an exchange: not the zero time (HAR files without a startedDateTime, and
+// the 0001-01-01 some tools write for "unknown"), not the Unix epoch (which
+// the store reads back as unknown) and within the range of an int64 count of
+// Unix nanoseconds, roughly the years 1678 to 2261. Any other time wraps
+// around silently when stored. ToExchange leaves StartedAt as the file has
+// it; importers use this to replace times that fail the test.
+func StartTimeStorable(t time.Time) bool {
+	if t.IsZero() || t.Before(minStorable) || t.After(maxStorable) {
+		return false
+	}
+	return t.UnixNano() != 0
+}
 
 // EntryError reports the entry that could not be converted by ToExchanges.
 type EntryError struct {
@@ -246,18 +268,25 @@ func ensureHeader(h http.Header) http.Header {
 	return h
 }
 
-// takeContentEncoding removes Content-Encoding from h and returns its
-// lower-cased value ("" for none or "identity").
+// takeContentEncoding removes Content-Encoding from h and returns its codings
+// lower-cased, as one list in the order they were applied ("gzip, gzip"); ""
+// for none or only "identity". A list in one header and repeated headers are
+// both read.
 func takeContentEncoding(h http.Header) string {
-	v := strings.ToLower(strings.TrimSpace(h.Get("Content-Encoding")))
-	if v == "" {
+	vals := h.Values("Content-Encoding")
+	if len(vals) == 0 {
 		return ""
 	}
 	h.Del("Content-Encoding")
-	if v == "identity" {
-		return ""
+	var codings []string
+	for _, v := range vals {
+		for c := range strings.SplitSeq(v, ",") {
+			if c = strings.ToLower(strings.TrimSpace(c)); c != "" && c != "identity" {
+				codings = append(codings, c)
+			}
+		}
 	}
-	return v
+	return strings.Join(codings, ", ")
 }
 
 // requestBody returns the request body described by pd and whether it was
@@ -393,30 +422,28 @@ func decodeBase64(s string) ([]byte, error) {
 	return nil, fmt.Errorf("invalid base64: %w", firstErr)
 }
 
-// maybeInflate decompresses a body that is still gzip-compressed even though
-// HAR bodies are normally stored decoded. Anything else, and a stream that
-// does not decompress, is returned as is. At most maxInflate bytes are
-// produced; truncated reports that the stream held more.
+// maybeInflate decompresses a body that is still compressed even though HAR
+// bodies are normally stored decoded: gzip, deflate (zlib, or the raw stream
+// some servers send) and stacks of them such as "gzip, gzip", all decoded by
+// bodycodec exactly as the proxy decodes a capture. Anything else (br, zstd), a
+// stream that does not decompress, and a body that is valid UTF-8 text (the
+// decoded form a browser saved) is returned as is. The one compressed form
+// that can be valid UTF-8, a very short raw deflate stream, is recognised by
+// bodycodec.LooksCompressed. At most maxInflate bytes are produced; truncated
+// reports that the stream held more.
 func maybeInflate(encoding string, body []byte) (out []byte, truncated bool) {
-	if encoding != "gzip" && encoding != "x-gzip" {
+	if len(body) < 2 || (utf8.Valid(body) && !bodycodec.LooksCompressed(encoding, body)) {
 		return body, false
 	}
-	if len(body) < 2 || body[0] != 0x1f || body[1] != 0x8b {
+	h := http.Header{"Content-Encoding": {encoding}}
+	dec, _, cut, _, ok := bodycodec.Decode(h, body, int64(len(body)), false, int64(maxInflate))
+	if !ok {
 		return body, false
 	}
-	zr, err := gzip.NewReader(bytes.NewReader(body))
-	if err != nil {
-		return body, false
+	if len(dec) > maxInflate {
+		return dec[:maxInflate:maxInflate], true
 	}
-	defer zr.Close()
-	out, err = io.ReadAll(io.LimitReader(zr, int64(maxInflate)+1))
-	if err != nil {
-		return body, false
-	}
-	if len(out) > maxInflate {
-		return out[:maxInflate:maxInflate], true
-	}
-	return out, false
+	return dec, cut
 }
 
 // cookieHeader renders request cookies as a Cookie header value.

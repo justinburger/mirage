@@ -34,10 +34,19 @@
 //     Unknown fields, including Chrome's underscore fields, are ignored.
 //   - Bodies in HAR files are stored decoded. When a HAR response carries a
 //     Content-Encoding header, ToExchange moves it into
-//     Response.ContentEncoding and removes the header, which is the shape
-//     the proxy produces. A base64 body that is still gzip-compressed is
-//     decompressed. FromExchange puts the header back so the HAR reads like
-//     the original traffic.
+//     Response.ContentEncoding (lower-cased, a list as "gzip, gzip") and
+//     removes the header, which is the shape the proxy produces. A body that
+//     is still compressed is decompressed with internal/bodycodec, like a
+//     capture: gzip, deflate (zlib or raw) and stacks of them, up to the
+//     proxy's default body cap (what lies beyond is cut and flagged
+//     truncated). A body that is valid UTF-8 text is taken to be decoded
+//     already, since no compressed stream is. A stream that does not
+//     decompress (cut, corrupt) and codings that are not supported (br, zstd)
+//     are left as they are. FromExchange puts the header back so the HAR reads
+//     like the original traffic.
+//   - StartedAt is the file's startedDateTime as it is, even a year 1 or a
+//     year 9999. Those cannot be stored (see StartTimeStorable), so importers
+//     replace them; ops.ImportHAR does.
 //   - Request.Host is the Host header (or the HTTP/2 :authority pseudo
 //     header) when present, otherwise the URL host. The Host header itself is
 //     not kept in Request.Header, as in net/http.

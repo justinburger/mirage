@@ -2,8 +2,8 @@
 import { h } from './dom.js';
 import { api, ApiError } from './api.js';
 import { refreshServices } from './state.js';
-import { openModal, btn, field, formSection, formGrid, textCtl, numCtl, durCtl, selectCtl, switchCtl, segmentedCtl, chipsCtl, linesCtl, sliderCtl, collapsible, errorBox, applyProblems, scrollToFirstError, toastOk, alertBox, modeLabel } from './ui.js';
-import { parseDuration, toGoDuration } from './format.js';
+import { openModal, btn, field, formSection, formGrid, textCtl, numCtl, durCtl, selectCtl, switchCtl, segmentedCtl, chipsCtl, linesCtl, sliderCtl, collapsible, errorBox, applyProblems, scrollToFirstError, toastService, alertBox, modeLabel } from './ui.js';
+import { parseDuration, toGoDuration, fracToPct, pctToFrac } from './format.js';
 
 export const MODES = [
   { value: 'passthrough', label: 'Passthrough', cls: 'm-passthrough', title: 'Proxy to the upstream; metrics and faults still apply, nothing is recorded' },
@@ -73,7 +73,7 @@ export async function openServiceForm({ service = null, onSaved, focus } = {}) {
   });
   const timeout = durCtl({ value: durText(s.timeout) || '60s', placeholder: '60s' });
   const maxBody = numCtl({ value: s.max_body_bytes ?? 1048576, step: 1, unit: 'bytes', placeholder: '1048576' });
-  const sample = numCtl({ value: s.capture_sample > 0 ? Math.round(s.capture_sample * 10000) / 100 : 100, step: 'any', min: 0, max: 100, unit: '%' });
+  const sample = numCtl({ value: s.capture_sample > 0 ? fracToPct(s.capture_sample) : 100, step: 'any', min: 0, max: 100, unit: '%' });
   const capLimit = numCtl({ value: s.max_capture_bytes || 0, step: 1, min: 0, unit: 'bytes', placeholder: '0 = no limit' });
 
   // --- network
@@ -98,7 +98,7 @@ export async function openServiceForm({ service = null, onSaved, focus } = {}) {
   const latFixed = durCtl({ value: durText(latency.fixed), placeholder: 'e.g. 40ms' });
   const latJitter = durCtl({ value: durText(latency.jitter), placeholder: 'e.g. 5ms' });
   const errAmp = sliderCtl({ min: 0.1, max: 100, step: 0.1, value: s.error_amplification || 1, log: true, presets: [1, 2, 5, 10], format: (v) => `${v}×`, numMin: 0, numMax: 1000 });
-  const errFloor = numCtl({ value: (s.error_floor || 0) * 100, step: 0.1, min: 0, max: 100, unit: '%' });
+  const errFloor = numCtl({ value: fracToPct(s.error_floor || 0), step: 0.1, min: 0, max: 100, unit: '%' });
 
   // --- fields (wrappers)
   const F = {
@@ -218,7 +218,7 @@ export async function openServiceForm({ service = null, onSaved, focus } = {}) {
         if (result.newRec) payload.recording_id = createdRecId;
         const saved = editing ? await api.updateService(s.id, payload) : await api.createService(payload);
         await refreshServices().catch(() => {});
-        toastOk(editing ? `Saved ${saved.name}` : `Created ${saved.name}`);
+        toastService(saved, editing ? `Saved ${saved.name}` : `Created ${saved.name}`);
         m.close(saved);
         if (onSaved) onSaved(saved);
       } catch (e) {
@@ -293,7 +293,7 @@ export async function openServiceForm({ service = null, onSaved, focus } = {}) {
       preserve_host: preserveHost.get(), insecure_skip_verify: skipVerify.get(),
       timeout: tmo ? toGoDuration(tmo) : '0s',
       max_body_bytes: mb === null ? 0 : mb,
-      capture_sample: smp >= 100 ? 1 : smp / 100,
+      capture_sample: smp >= 100 ? 1 : pctToFrac(smp, s.capture_sample > 0 ? s.capture_sample : undefined),
       max_capture_bytes: cap === null ? 0 : cap,
       match: {
         query: mQuery.get(), body: mBody.get(), path_templates: mTemplates.get(), selection: mSelection.get(), miss_status: miss || 404,
@@ -306,7 +306,7 @@ export async function openServiceForm({ service = null, onSaved, focus } = {}) {
         jitter: latJitter.get() ? toGoDuration(parseDuration(latJitter.get())) : '0s',
       },
       error_amplification: amp,
-      error_floor: floor === null ? 0 : floor / 100,
+      error_floor: floor === null ? 0 : pctToFrac(floor, s.error_floor),
     };
     if (recordingId) payload.recording_id = recordingId;
     if (anon.get()) payload.profile_id = profile.get();
@@ -337,7 +337,7 @@ export async function switchMode(svc, newMode) {
   if (!needsRecording || (newMode !== 'record' && svc.recording_id)) {
     const updated = await api.setMode(svc.id, { mode: newMode, ...(svc.recording_id && needsRecording ? { recording_id: svc.recording_id } : {}) });
     await refreshServices().catch(() => {});
-    toastOk(`${svc.name} is now in ${modeLabel(newMode)} mode`);
+    toastService(updated, `${svc.name} is now in ${modeLabel(newMode)} mode`);
     return updated;
   }
   return pickRecording(svc, newMode);
@@ -381,7 +381,7 @@ function pickRecording(svc, newMode) {
         try {
           const updated = await api.setMode(svc.id, body);
           await refreshServices().catch(() => {});
-          toastOk(`${svc.name} is now in ${modeLabel(newMode)} mode`);
+          toastService(updated, `${svc.name} is now in ${modeLabel(newMode)} mode`);
           done = true;
           modal.close(updated);
         } catch (e) {

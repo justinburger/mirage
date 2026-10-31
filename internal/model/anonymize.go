@@ -198,6 +198,9 @@ const (
 //	2  postal addresses, customer and cardholder names, a "name" next to an
 //	   e-mail or phone, XML password and token elements, more credential
 //	   query parameters and headers
+//	3  key names compared ignoring case, "_" and "-"; more password, secret
+//	   and token names in JSON, forms and query strings; webhook signature
+//	   and token headers
 const DefaultProfileRev = 3
 
 // defaultProfileDescription is the Description of the built-in profile.
@@ -223,6 +226,7 @@ var defaultRedactHeaders = []string{
 	// Revision 3.
 	"X-Vault-Token", "Private-Token", "X-Hub-Signature", "X-Hub-Signature-256",
 	"X-Id-Token", "X-Refresh-Token", "X-Amz-Signature", "Authentication",
+	"Stripe-Signature", "X-Slack-Signature", "X-Gitlab-Token", "X-Twilio-Signature",
 }
 
 // defaultSiblingNames are the members whose presence next to a "name" member
@@ -335,16 +339,30 @@ func defaultRules() []AnonymizationRule {
 	// Revision 3. Key names are compared ignoring case, "_" and "-" (see
 	// AnonymizationRule), so one entry covers password, Password and
 	// PASSWORD, and access_token covers accessToken and access-token.
+	// Query values are hashed rather than redacted, like the query rules
+	// above, so that requests stay distinct for matching and replay.
 	for _, k := range []string{
 		"passphrase", "new_password", "old_password", "current_password", "user_password",
 		"password_confirmation", "confirm_password", "api_secret", "secret_key", "private_key",
+		"aws_secret_access_key", "db_password", "consumer_secret", "credentials", "credential",
 	} {
 		add("json-"+k, "JSON "+k, TargetJSON, "$.."+k, StrategyRedact, "")
 		add("form-"+k, "Form "+k, TargetForm, k, StrategyRedact, "")
+		add("query-"+k, "Query "+k, TargetQuery, k, StrategyHash, "")
 	}
-	for _, k := range []string{"auth_token", "bearer_token", "jwt", "session", "csrf_token", "xsrf_token", "authorization"} {
+	for _, k := range []string{
+		"auth_token", "bearer_token", "jwt", "session", "csrf_token", "xsrf_token", "authorization",
+		"oauth_token", "session_token", "api_token", "x_api_key", "otp", "bearer",
+	} {
 		add("json-"+k, "JSON "+k, TargetJSON, "$.."+k, StrategyHash, "")
 		add("form-"+k, "Form "+k, TargetForm, k, StrategyHash, "")
+	}
+	// The query names of revision 2 already cover auth_token, jwt,
+	// csrf_token, otp and bearer; session comes from revision 1. "sid" stays
+	// a query name only: in JSON it is as often a resource ID (Twilio) that
+	// later requests send back.
+	for _, k := range []string{"bearer_token", "xsrf_token", "authorization", "oauth_token", "session_token", "api_token", "x_api_key"} {
+		add("query-"+k, "Query "+k, TargetQuery, k, StrategyHash, "")
 	}
 	return rules
 }

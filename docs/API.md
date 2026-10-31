@@ -23,7 +23,8 @@ Timestamps are RFC 3339. Series timestamps (`t`) are Unix milliseconds.
   - 404: an unknown object, or an unknown path under `/api/v1`;
   - 405: a known path with the wrong method (the `Allow` header lists the
     methods that path accepts);
-  - 409: a conflict, for example a duplicate service name or listen address,
+  - 409: a conflict, for example a duplicate service name (compared ignoring
+    case and surrounding spaces, like profile names) or listen address,
     starting a replay that is already running, or deleting something in use;
   - 413: a JSON request body over 10 MiB, or a HAR upload over 1 GiB;
   - 415: a POST, PUT, PATCH or DELETE whose body is not declared as JSON. Send
@@ -42,6 +43,10 @@ Timestamps are RFC 3339. Series timestamps (`t`) are Unix milliseconds.
   `latency` fault has no `status`, and `ServiceStatus.error` appears only
   when there is one. Required fields such as `id`, `name`, `mode`, `status` and
   `created_at` are always present.
+- Messages never name internal packages (`store:`, `ops:`) and name an object
+  once, however many layers the error passed through. That includes
+  `ServiceStatus.error`, also in the live stream: `capture: recording "rec_x":
+  not found`, not `capture: store: store: recording "rec_x": not found`.
 - Unknown JSON fields in request bodies are rejected (400), except read-only
   echo fields, which are accepted and ignored so a fetched object can be PUT
   back: `status`, `fired`, `has_secret`, `created_at`, `updated_at`. The id
@@ -89,6 +94,37 @@ current recording unless it is given `recording_id` or `new_recording_name`
 (which creates an empty recording and points the service at it); the two are
 mutually exclusive, and it is a 400 when the service would still have none.
 
+Service names are unique ignoring case and surrounding spaces (`Payments` and
+` payments ` clash): a duplicate is a 409 on create, update and rename. A
+database that already holds two names differing only in case still opens and
+lists; one of them has to be renamed before it can be saved again.
+
+**Virtualizing an anonymized recording.** A service with `anonymize_capture`
+stores anonymized paths, queries, bodies and headers, so the raw requests of a
+client (an email in the path, a card number in the body) would never match
+what was recorded. In `virtualize` and `hybrid` mode such a service therefore
+anonymizes each incoming request with its `profile_id` (the same way capture
+does: gzip/deflate bodies are decoded first) and looks that up; the request as
+received is tried too, which still matches traffic that is already anonymized,
+such as a replay of the recording. Both forms are tried level by level, most
+specific first (exact, path, template), so a broad template match never hides
+an exact one, and the template level uses the endpoint the capture stored. The
+request itself is never modified (the upstream of a `hybrid` miss gets the raw
+request). Editing the profile, or regenerating its secret, rebuilds the
+virtual index of every service using it; if the rebuild fails the old one
+keeps serving and the error is shown in `status.error` until a later rebuild
+succeeds. Regenerating a secret makes new captures differ from older
+recordings, so requests that matched the older tokens stop matching. A
+service without `anonymize_capture` looks up the request as received, with no
+extra work.
+
+Virtual responses are the recorded ones: a recording without a `Content-Type`
+is served without one (no `text/plain` is invented); the proxy modes do not
+add a `Content-Type` the upstream did not send either. A `HEAD` request
+answered from a recorded `HEAD` exchange carries the `Content-Length` that
+exchange announced, and one answered from a `GET` recording the length that
+`GET` body would be served with.
+
 `Service`:
 
 ```json
@@ -123,10 +159,16 @@ mutually exclusive, and it is a 400 when the service would still have none.
 
 ```json
 {"service_id":"svc_...","running":true,"addr":"[::]:9001","mode":"record","error":"","warning":"",
- "started_at":"...","captured":1520,"capture_dropped":0,"capture_skipped":0,
- "capture_truncated":0,"virtual_hits":0,"virtual_misses":0,"virtual_injected":0,
- "virtual_truncated":0,"indexed_exchanges":0}
+ "started_at":"...","config_updated_at":"...","captured":1520,"capture_dropped":0,
+ "capture_skipped":0,"capture_truncated":0,"virtual_hits":0,"virtual_misses":0,
+ "virtual_injected":0,"virtual_truncated":0,"indexed_exchanges":0}
 ```
+
+`config_updated_at` is the `updated_at` of the configuration last applied to
+the service, also when it is stopped or applying it failed. It changes with
+every saved edit, so a client that follows the `services` stream event can
+tell that its copy of a service is stale even when nothing else in the status
+changed (a rename, say).
 
 `error` says why a service is not running (it could not start, or its listener
 died) or reports a failure found while serving, such as a capture write that
@@ -180,6 +222,14 @@ is still saved and the response is still 2xx (200, or 201 on create), with
 after these calls, not just the HTTP status. Only a clash with another Mirage
 service (name or listen address) is a 409.
 
+Deleting a recording and saving a service that uses it are ordered, so a
+service can never be left enabled on a recording that is gone: whichever
+request gets in first wins. A service save (create, update, `enable`, `mode`)
+that comes after the delete is a 400 (`recording_id "rec_x" does not exist`);
+a delete that comes while a service on that recording is being saved or is
+already enabled is a 409. A very large recording takes a while to purge, and
+service changes wait for it.
+
 ## Recordings and exchanges
 
 | Method | Path | Body / query | Response |
@@ -200,6 +250,49 @@ In a multipart upload `name` and `profile_id` may also be form fields, but the
 upload is streamed, so they are read only when they come **before** the `file`
 part; a field after it is ignored. The query parameters win over form fields.
 Without a name the file's name (without `.har`/`.json`) is used.
+
+**Anonymized copies, exports and imports.** `POST .../anonymize`, an export
+with `profile_id` and an import with `profile_id` all run every exchange
+through the same steps as capture:
+
+- *Compressed bodies are decoded first.* gzip, x-gzip, zlib and raw deflate
+  bodies, also stacked (`gzip, gzip`, `deflate, gzip`), are inflated (up to
+  256 MiB per body) so the profile can see what is inside; the anonymized
+  artifact then holds the plain body without `Content-Encoding`. A stream that
+  was cut by the capture cap yields its readable prefix. A body the engine
+  cannot decode (`br`, `zstd`, a stream that gives nothing) is dropped and
+  marked `truncated`, never kept as it was: it would be raw personal data
+  that anyone can decompress. A HAR import decodes the same codings (up to
+  1 MiB per entry) when it reads the file, whether or not it anonymizes.
+  HAR files normally hold bodies decoded next to the original
+  `Content-Encoding` header, so a body is taken as still compressed only when
+  it looks it: the gzip magic number, a zlib stream, a raw deflate stream that
+  inflates into text (also the rare short one whose bytes are valid UTF-8),
+  or bytes that are not text under any other coding. A cut deflate stream of
+  binary data is not recognised; the profile could not read that data decoded
+  either.
+- *Endpoints are rebuilt from the anonymized path*, so a raw segment
+  (`/ssn/123-45-6789`) never survives in endpoint statistics or matching. An
+  endpoint that came from a service's `endpoint_patterns` is kept when it has
+  no literal segment the anonymizer changed.
+- *An exchange the profile cannot process is left out*, never written in any
+  form. The copy or import still succeeds and its `description` says `Left out
+  N exchanges that could not be anonymized.`; only when every exchange fails
+  is the request an error (and nothing is kept). An export writes the
+  document without them, and fails (the document is left unfinished) only if
+  none could be written.
+- *A HAR import repairs start times that cannot be stored.* An entry whose
+  `startedDateTime` is missing, the zero time, the Unix epoch, or outside the
+  years 1678 to 2261 takes the start time of the previous entry (leading
+  entries wait for the first usable one; the import time is used when there is
+  none), so a timeline replay does not wait for years. The count is in the
+  `description` (`N entries had a missing start time ...`). The store itself
+  rejects a batch with such a time (400, naming the exchanges), so no other
+  path can write one.
+- *Skipped entries.* HAR entries that are not HTTP or HTTPS requests (`data:`
+  URLs and the like) are skipped and counted in the `description`
+  (`Skipped N unsupported entries ...`); any other entry that cannot be
+  converted fails the import with a 400 that names it.
 
 Query parameters of the exchange list (all optional, combined with AND):
 
@@ -296,6 +389,31 @@ Rule `target`: `header | query | cookie | json | form | regex | path`.
 `strategy`: `redact | remove | hash | fake | mask`. `fake`: `auto | email |
 name | phone | uuid | digits | ipv4 | credit_card | string`. `scope`:
 `both | request | response`.
+
+How rules match:
+
+- *Names ignore case, `_` and `-`.* A `header`, `query`, `cookie` or `form`
+  selector (and a multipart part name) and a `$..name` descent in a `json`
+  rule compare names with those characters ignored, so a `password` rule
+  also covers `Password`, `PASSWORD`, `?API_KEY=` for `api-key` and
+  `userData` for `user_data`; `user[password]` in a form also matches by its
+  last bracketed part. Absolute JSONPath (`$.a.b`) and `path`/`regex` rules are
+  unchanged.
+- *The first matching rule wins.* A value is transformed once: when several
+  rules select it the first in the profile applies and later ones leave it
+  alone (a `remove` listed after a `hash` rule that matches the same value does
+  not delete it). A `regex` rule only takes the stretches of text it matches,
+  so a later rule never rewrites what an earlier one wrote, and a selector
+  rule listed after a `regex` rule that took part of a value leaves that value
+  alone.
+- *JSON inside JSON strings is rewritten.* A string leaf that holds a JSON
+  object or array (a queue message, a webhook envelope, a log event) is parsed
+  and rewritten up to three levels deep. Only `$..` descents, `regex` rules and
+  the detectors apply inside it (absolute paths are relative to the outer
+  document), the inner document is written back compactly if something in it
+  changed, and a string that does not parse, or that a rule selects as a
+  whole, is treated as a plain string. Changes inside it are reported with the
+  concrete path, for example `response.body $.payload <json> $.password`.
 
 `opaque_bodies`: `keep` (default) stores bodies the engine cannot inspect
 (binary, still-compressed, binary multipart parts) unchanged; `fill` replaces
@@ -445,6 +563,15 @@ snapshots carries the 20 busiest endpoints.
 `SeriesPoint` =
 `{"t":1761430000000,"requests":1022,"errors":2,"p50":8.1,"p95":30.2,"p99":71.9,"max":180.4,"in_flight":14,"bytes_in":10233,"bytes_out":812331,"corrected_p95":41.0,"corrected_p99":95.2}`
 (`corrected_*` only for replay collectors).
+
+The per-service series are what the dashboard's "all services" view
+aggregates: requests, errors, in-flight and bytes are summed, `p50` is the
+request-weighted mean of the services' p50, and `p95` and `p99` are the
+largest value of any service (a mean of percentiles is not a percentile, and
+would hide a slow service behind a fast busy one). The dashboard labels them
+`p50 (avg)`, `p95 (slowest)` and `p99 (slowest)`, and its p95 tile reads `p95
+(slowest service)` with the service named in its tooltip; the view of a single
+service or replay shows the plain values.
 
 SSE events on `/api/v1/stream` (each `data:` is one JSON document):
 

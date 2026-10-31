@@ -1,18 +1,15 @@
 package virtual
 
 import (
-	"bytes"
-	"compress/gzip"
-	"compress/zlib"
 	"encoding/binary"
 	"encoding/json"
 	"hash/maphash"
-	"io"
 	"net/http"
 	"net/url"
 	"slices"
 	"strings"
 
+	"github.com/justinburger/mirage/internal/bodycodec"
 	"github.com/justinburger/mirage/internal/model"
 )
 
@@ -134,31 +131,16 @@ func (e *Engine) appendBodyKey(dst []byte, body []byte) []byte {
 const maxRequestBody = 32 << 20
 
 // requestBody returns the request body as it would have been recorded: the
-// capture stores request bodies decoded, so a gzip or deflate body is inflated
-// for matching. A body that cannot be decoded is used as is.
+// capture stores request bodies decoded (bodycodec.DecodeExchange), so a gzip
+// or deflate body, stacked codings included, is inflated for matching. A body
+// that cannot be decoded, or is larger than maxRequestBody once decoded, is
+// used as is.
 func (e *Engine) requestBody(r *http.Request, body []byte) []byte {
-	if e.cfg.body == model.BodyIgnore || len(body) == 0 {
+	if e.cfg.body == model.BodyIgnore || len(body) == 0 || len(r.Header["Content-Encoding"]) == 0 {
 		return body
 	}
-	ce := r.Header.Get("Content-Encoding")
-	if ce == "" {
-		return body
-	}
-	var zr io.Reader
-	var err error
-	switch strings.ToLower(strings.TrimSpace(ce)) {
-	case "gzip", "x-gzip":
-		zr, err = gzip.NewReader(bytes.NewReader(body))
-	case "deflate":
-		zr, err = zlib.NewReader(bytes.NewReader(body))
-	default:
-		return body
-	}
-	if err != nil {
-		return body
-	}
-	out, err := io.ReadAll(io.LimitReader(zr, maxRequestBody+1))
-	if err != nil || len(out) > maxRequestBody {
+	out, _, cut, _, ok := bodycodec.Decode(r.Header, body, int64(len(body)), false, maxRequestBody)
+	if !ok || cut {
 		return body
 	}
 	return out

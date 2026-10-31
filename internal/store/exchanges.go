@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/justinburger/mirage/internal/model"
 )
@@ -115,6 +117,42 @@ const (
 	maxPrepareWorkers    = 8
 )
 
+// Bounds of the times the store keeps: Unix nanoseconds in an int64 (the years
+// 1678 to 2262). time.Time.UnixNano is undefined outside them, in practice it
+// wraps around, so a time beyond them would be stored as a different instant.
+var (
+	minStoredTime = time.Unix(0, math.MinInt64)
+	maxStoredTime = time.Unix(0, math.MaxInt64)
+)
+
+// maxTimeProblems caps how many out-of-range exchanges one error names.
+const maxTimeProblems = 5
+
+// checkStartTimes returns a validation error naming the exchanges of the batch
+// whose StartedAt cannot be stored. The zero time means "unknown" and is stored
+// as such.
+func checkStartTimes(exs []*model.Exchange) error {
+	var problems []string
+	bad := 0
+	for i, ex := range exs {
+		t := ex.StartedAt
+		if t.IsZero() || (!t.Before(minStoredTime) && !t.After(maxStoredTime)) {
+			continue
+		}
+		if bad++; bad <= maxTimeProblems {
+			problems = append(problems, fmt.Sprintf("exchanges[%d]: started_at %s is outside the range the store keeps (years 1678 to 2262)",
+				i, t.Format(time.RFC3339Nano)))
+		}
+	}
+	if bad > maxTimeProblems {
+		problems = append(problems, fmt.Sprintf("and %d more exchanges with a started_at out of range", bad-maxTimeProblems))
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	return fmt.Errorf("store: append exchanges: %w", &model.ValidationError{Problems: problems})
+}
+
 // prepareRows validates and prepares a batch, in parallel when the bodies are
 // large enough for compression to dominate, and totals the counter deltas.
 func prepareRows(exs []*model.Exchange) ([]insertRow, batchStats, error) {
@@ -125,6 +163,9 @@ func prepareRows(exs []*model.Exchange) ([]insertRow, batchStats, error) {
 			return nil, st, fmt.Errorf("store: append exchanges: exchange %d is nil", i)
 		}
 		total += len(ex.Request.Body) + len(ex.Response.Body)
+	}
+	if err := checkStartTimes(exs); err != nil {
+		return nil, st, err
 	}
 
 	rows := make([]insertRow, len(exs))
@@ -192,7 +233,11 @@ type batchStats struct {
 // appended exchange is anonymized. A non-empty recording therefore stays
 // anonymized only while every exchange it ever received was. An unknown (or
 // being deleted) recording returns an error wrapping model.ErrNotFound; an
-// empty batch is a no-op.
+// empty batch is a no-op. An exchange whose StartedAt (when not the zero time)
+// lies outside the years 1678 to 2262, which Unix nanoseconds in an int64 cannot
+// hold, is refused with an error wrapping model.ErrValidation before anything
+// is written: the whole batch is rejected, never stored as a wrapped-around
+// instant.
 func (s *SQLite) AppendExchanges(ctx context.Context, recordingID string, exs []*model.Exchange) error {
 	if len(exs) == 0 {
 		return nil

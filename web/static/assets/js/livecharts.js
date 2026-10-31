@@ -30,6 +30,16 @@ export function trafficCharts({ windowMs = 15 * 60000, height = 190 } = {}) {
     yFormat: fmtCompact, tipFormat: (v) => String(Math.round(v)),
   });
   const all = [rps, lat, err, inflight];
+  // Across several services a percentile cannot be rebuilt from the
+  // per-service ones (see series.js aggregateRows): the chart shows the
+  // slowest service's p95 and p99, and says so.
+  const latLabels = { p50: 'p50', p95: 'p95', p99: 'p99' };
+  const latAggregate = {
+    p50: ['p50 (avg)', 'p50 (average over services)'],
+    p95: ['p95 (slowest)', 'p95 (slowest service)'],
+    p99: ['p99 (slowest)', 'p99 (slowest service)'],
+  };
+  let aggregate = false;
   const el = h('div', { class: 'charts-2' },
     card({ body: rps.el }), card({ body: lat.el }), card({ body: err.el }), card({ body: inflight.el }));
   return {
@@ -37,6 +47,12 @@ export function trafficCharts({ windowMs = 15 * 60000, height = 190 } = {}) {
     setRows: (rows) => all.forEach((c) => c.setRows(rows)),
     push: (row) => all.forEach((c) => c.push(row)),
     setWindow: (ms) => all.forEach((c) => c.setWindow(ms)),
+    /** true while the rows combine several services (the dashboard's "All services"). */
+    setAggregate: (on) => {
+      if (on === aggregate) return;
+      aggregate = on;
+      lat.setSeriesLabels(on ? latAggregate : latLabels);
+    },
     destroy: () => all.forEach((c) => c.destroy()),
   };
 }

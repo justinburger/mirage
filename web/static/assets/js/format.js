@@ -50,6 +50,25 @@ export function fmtPct(frac, digits) {
   return '<0.01%';
 }
 
+/**
+ * A fraction as the number a percent field shows: 0.07 -> 7 (not
+ * 7.000000000000001), 0.0001 -> 0.01. Nothing is rounded away that the field
+ * could not hold: 12 significant digits survive.
+ */
+export function fracToPct(frac) {
+  return isNum(frac) ? Number((frac * 100).toPrecision(12)) : frac;
+}
+
+/**
+ * The fraction for a percent field the user may have edited. While the field
+ * still holds what fracToPct(orig) showed, orig itself is returned, so saving
+ * a form never rewrites a stored value the user did not touch.
+ */
+export function pctToFrac(pct, orig) {
+  if (orig != null && pct === fracToPct(orig)) return orig;
+  return Number((pct / 100).toPrecision(12));
+}
+
 export function fmtBytes(n) {
   if (!isNum(n)) return DASH;
   const a = Math.abs(n);

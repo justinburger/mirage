@@ -118,7 +118,8 @@ func (e *Engine) acquire(rep *reporter) *run {
 // done clears the run and returns it to the pool.
 func (r *run) done() {
 	clear(r.chain)
-	*r = run{chain: r.chain[:0]}
+	clear(r.selBuf)
+	*r = run{chain: r.chain[:0], selBuf: r.selBuf[:0], claimBuf: r.claimBuf[:0]}
 	runPool.Put(r)
 }
 

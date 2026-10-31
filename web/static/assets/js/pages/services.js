@@ -6,7 +6,7 @@ import { state, refreshServices, serviceById, statusNotice } from '../state.js';
 import { navigate } from '../router.js';
 import { loadHistory, pointToRow } from '../series.js';
 import { trafficCharts, WINDOWS, savedWindow, saveWindow } from '../livecharts.js';
-import { card, btn, iconBtn, dataTable, modeBadge, emptyState, popMenu, confirmDialog, toastOk, kvList, copyButton, alertBox, segmentedCtl, badge, dot, pageHeader, toastError } from '../ui.js';
+import { card, btn, iconBtn, dataTable, modeBadge, emptyState, popMenu, confirmDialog, toastOk, kvList, copyButton, alertBox, segmentedCtl, badge, dot, pageHeader, toastError, toastService } from '../ui.js';
 import { openServiceForm, switchMode, MODES, MODE_HELP, durText } from '../service-form.js';
 import { fmtRate, fmtPct, fmtMs, fmtInt, fmtBytes, relTime, portOf, DASH, fmtCompact } from '../format.js';
 
@@ -36,15 +36,15 @@ function modeButton(svc) {
 }
 
 async function toggleEnabled(svc) {
-  if (svc.enabled) await api.disableService(svc.id); else await api.enableService(svc.id);
+  const updated = svc.enabled ? await api.disableService(svc.id) : await api.enableService(svc.id);
   await refreshServices();
-  toastOk(`${svc.name} ${svc.enabled ? 'disabled' : 'enabled'}`);
+  toastService(updated, `${svc.name} ${svc.enabled ? 'disabled' : 'enabled'}`);
 }
 
 async function reloadIndex(svc) {
-  await api.reloadService(svc.id);
+  const updated = await api.reloadService(svc.id);
   await refreshServices();
-  toastOk(`Reloaded the virtualization index for ${svc.name}`);
+  toastService(updated, `Reloaded the virtualization index for ${svc.name}`);
 }
 
 export async function deleteService(svc) {
@@ -113,7 +113,9 @@ export async function list(ctx) {
   ctx.on('services', paint);
   ctx.on('stats', paint);
 
-  function openForm(svc) {
+  function openForm(row) {
+    // The table rows carry display-only fields (_m); the form edits the stored service.
+    const svc = row ? serviceById(row.id) || row : null;
     openServiceForm({ service: svc || null, onSaved: (s) => { if (!svc) navigate(`/services/${encodeURIComponent(s.id)}`); } }).then((m) => {
       if (ctx.path === '/services/new') {
         history.replaceState(null, '', '#/services');
@@ -248,7 +250,7 @@ export async function detail(ctx) {
       cell('Requests / s', snap && st.running ? fmtRate(snap.rps) : DASH, snap ? `${fmtCompact(snap.requests)} total` : ''),
     ];
     if (rec) {
-      const sample = svc.capture_sample > 0 && svc.capture_sample < 1 ? ` (${fmtPct(svc.capture_sample, 0)} sampled)` : '';
+      const sample = svc.capture_sample > 0 && svc.capture_sample < 1 ? ` (${fmtPct(svc.capture_sample)} sampled)` : '';
       const capFull = (statusNotice(st) || {}).kind === 'capture-limit';
       cells.push(
         cell('Captured', fmtInt(st.captured), capFull ? 'stopped: capture limit reached' : `exchanges written${sample}`, capFull ? 'warn' : ''),
@@ -313,7 +315,7 @@ export async function detail(ctx) {
           ['Endpoint patterns', tag(svc.endpoint_patterns) || DASH],
           ['Timeout', durText(svc.timeout) || DASH],
           ['Max captured body', svc.max_body_bytes === -1 ? 'bodies not captured' : fmtBytes(svc.max_body_bytes)],
-          ['Capture sampling', svc.capture_sample > 0 && svc.capture_sample < 1 ? `${fmtPct(svc.capture_sample, 0)} of requests` : 'every request'],
+          ['Capture sampling', svc.capture_sample > 0 && svc.capture_sample < 1 ? `${fmtPct(svc.capture_sample)} of requests` : 'every request'],
           ['Capture limit', svc.max_capture_bytes > 0 ? `${fmtBytes(svc.max_capture_bytes)} of bodies` : 'none'],
           ['Preserve Host', svc.preserve_host ? 'yes' : 'no'],
           ['Skip TLS verify', svc.insecure_skip_verify ? 'yes' : 'no'],
@@ -337,8 +339,10 @@ export async function detail(ctx) {
   async function reload() {
     try { svc = await api.service(id); } catch (e) { toastError(e); return; }
     if (!ctx.isActive()) return;
+    seenUpdated = svc.updated_at;
     paintAll();
   }
+  let seenUpdated = svc.updated_at;
   paintAll();
   // Live updates come from the stream: the `services` event carries the live
   // counters of every service once a second and `stats` the traffic series,
@@ -370,17 +374,27 @@ export async function detail(ctx) {
       paintMode();
     } catch (_) { /* the recording may have been deleted meanwhile */ }
   }
+  const reloadOnce = () => {
+    if (reloading) return;
+    reloading = true;
+    reload().finally(() => { reloading = false; });
+  };
   ctx.on('services', () => {
     const cur = serviceById(svc.id);
     if (!cur) return;
+    // `cur` is the list's copy: when the list was fetched again after a change
+    // made elsewhere (another tab, curl) its updated_at differs from ours.
+    const edited = !!cur.updated_at && cur.updated_at !== seenUpdated;
     svc = { ...svc, status: cur.status };
     paintHeader(); paintStatus();
     if (cur.status.captured !== capturedAtFetch && Date.now() - recFetched > 10000) refreshRecording();
-    if (cur.status.mode !== seenMode || cur.status.running !== seenRunning) {
-      seenMode = cur.status.mode; seenRunning = cur.status.running;
-      if (!reloading) { reloading = true; reload().finally(() => { reloading = false; }); }
+    if (edited || cur.status.mode !== seenMode || cur.status.running !== seenRunning) {
+      seenMode = cur.status.mode; seenRunning = cur.status.running; seenUpdated = cur.updated_at;
+      reloadOnce();
     }
   });
+  // After the stream reconnected everything may have changed.
+  ctx.on('resync', reloadOnce);
 
   return root;
 }

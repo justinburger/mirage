@@ -25,6 +25,8 @@ for (const e of out.errors) {
   if (e.kind === 'step') continue;
   if (IGNORE.some((re) => re.test(e.text || ''))) continue;
   if (process.env.IGNORE_HTTP && ((e.kind === 'network' && /^HTTP 4/.test(e.text)) || (e.kind === 'log' && /Failed to load resource: the server responded with a status of 4/.test(e.text)))) continue;
+  // the refused stream of a simulated outage (/__mock/sse-drop, /__mock/restart)
+  if (process.env.IGNORE_HTTP && ((e.kind === 'network' && /^HTTP 503 .*\/api\/v1\/stream/.test(`${e.text} ${e.url || ''}`)) || (e.kind === 'log' && /status of 503 .*\/api\/v1\/stream/.test(`${e.text} ${e.url || ''}`)))) continue;
   bad++; console.log(`ERROR      [${e.kind}] ${e.text} ${e.url || ''}${e.line ? ':' + e.line : ''}`);
 }
 for (const c of out.console) {

@@ -212,6 +212,7 @@ function statusOf(svc) {
   return {
     service_id: svc.id, running, addr: running ? (svc.listen_addr.startsWith(':') ? `[::]${svc.listen_addr}` : svc.listen_addr) : '', mode: svc.mode, ...(error ? { error } : {}), ...(warning ? { warning } : {}),
     ...(running ? { started_at: iso(r.startedAt) } : {}),
+    ...(svc.updated_at ? { config_updated_at: svc.updated_at } : {}),
     captured: Math.round(r.captured), capture_dropped: r.dropped, capture_skipped: Math.round(r.captured * 0.004), virtual_hits: Math.round(r.hits), virtual_misses: Math.round(r.misses),
     virtual_injected: usesIndex ? Math.round(r.hits * Math.min(1, 0.004 * (svc.error_amplification || 1))) : 0,
     indexed_exchanges: running && usesIndex && rec ? rec.exchange_count : 0,
@@ -766,7 +767,7 @@ const allStatuses = () => Array.from(db.services.values()).map(statusOf);
 let lastStatusSig = '';
 function emitServices(force) {
   const list = allStatuses();
-  const sig = JSON.stringify(list.map((s) => [s.service_id, s.running, s.mode, s.error, s.warning, s.addr]));
+  const sig = JSON.stringify(list.map((s) => [s.service_id, s.running, s.mode, s.error, s.warning, s.addr, s.config_updated_at]));
   if (force || sig !== lastStatusSig) { lastStatusSig = sig; broadcast('services', list); }
 }
 
@@ -1198,6 +1199,33 @@ async function handleApi(req, res, url) {
     for (const c of sseClients) c.end();
     sseClients.clear();
     return sendJSON(res, 200, { dropped: true });
+  }
+  // Dev helper: a server restart. Streams drop and are refused for a while, and
+  // a replay that was running is marked failed with the reason the Go server
+  // gives, which no stream event announces (a new stream starts with services only).
+  if (url.pathname === '/__mock/restart' && req.method === 'POST') {
+    sseBlockedUntil = Date.now() + (Number(url.searchParams.get('ms')) || 4000);
+    for (const c of sseClients) c.end();
+    sseClients.clear();
+    const failed = [];
+    for (const job of db.replays.values()) {
+      if (job.status !== 'running') continue;
+      job.status = 'failed'; job.error = 'interrupted: mirage restarted'; job.ended_at = iso(Date.now()); job.summary = replaySummary(job);
+      failed.push(job.id);
+    }
+    return sendJSON(res, 200, { restarted: true, failed });
+  }
+  // Dev helper: rename a service the way a Go PUT that changes only the name
+  // does: no listener restart, so only config_updated_at changes in the
+  // stream. With quiet=1 updated_at stays too, as with a server that predates
+  // config_updated_at: then only a resync shows the new name.
+  // POST /__mock/rename?id=svc_x&name=new-name[&quiet=1]
+  if (url.pathname === '/__mock/rename' && req.method === 'POST') {
+    const svc = db.services.get(url.searchParams.get('id'));
+    if (!svc) return sendJSON(res, 404, { error: 'no such service' });
+    svc.name = url.searchParams.get('name') || svc.name;
+    if (url.searchParams.get('quiet') !== '1') svc.updated_at = iso(Date.now());
+    return sendJSON(res, 200, svcOut(svc));
   }
   if (url.pathname === '/api/v1/stream') {
     if (!authorized(req, url)) return sendJSON(res, 401, { error: 'unauthorized' });

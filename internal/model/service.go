@@ -342,6 +342,12 @@ type ServiceStatus struct {
 	// failures.
 	Warning   string     `json:"warning,omitempty"`
 	StartedAt *time.Time `json:"started_at,omitempty"`
+	// ConfigUpdatedAt is the UpdatedAt of the configuration last applied to
+	// the service (saved, even when applying it failed). It changes with
+	// every saved edit, so a client following the stream can tell that its
+	// copy of the service is stale even when nothing else in the status
+	// changed (a rename, a new upstream on a stopped service).
+	ConfigUpdatedAt *time.Time `json:"config_updated_at,omitempty"`
 	// Captured counts exchanges written to the recording since start.
 	Captured int64 `json:"captured"`
 	// CaptureDropped counts exchanges dropped because the capture queue was

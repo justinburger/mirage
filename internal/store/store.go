@@ -22,15 +22,18 @@
 //     socket, while a specific host and a wildcard on one port, or "localhost"
 //     and 127.0.0.1, are left to the OS to refuse at listen time. Port 0 (an
 //     OS-assigned port) is exempt, so any number of services may use ":0" or
-//     "127.0.0.1:0". The service name is unique as well.
+//     "127.0.0.1:0". The service name is unique as well, ignoring case and
+//     surrounding white space like profile names ("API" and "api" conflict).
 //   - Structured sub-objects (MatchConfig, rules, labels, replay config,
 //     summary, series) may be stored as JSON columns.
 //   - AppendExchanges is the hot write path: one transaction per batch, with
 //     prepared statements. It assigns ID and Seq (continuing the recording's
 //     sequence) to each exchange in place and updates the recording's
 //     counters (ExchangeCount, ErrorCount, Bytes, FirstAt, LastAt,
-//     UpdatedAt) and its Anonymized flag. Target: ≥ 20k exchanges/s with small
-//     bodies on a laptop.
+//     UpdatedAt) and its Anonymized flag. A batch holding an exchange whose
+//     StartedAt is outside the range stored (see Timestamps below) is refused
+//     as a whole with an error wrapping model.ErrValidation. Target: ≥ 20k
+//     exchanges/s with small bodies on a laptop.
 //     Bodies may be compressed (e.g. gzip above a size threshold) as long as
 //     reads return the original bytes.
 //   - Recording.Source and the initial Anonymized value are set by
@@ -109,7 +112,8 @@
 //
 // Timestamps are stored as Unix nanoseconds (the zero time.Time is stored as
 // 0), which limits the representable range to the years 1678-2262, and are
-// returned in UTC.
+// returned in UTC. AppendExchanges refuses an exchange outside that range
+// instead of storing the wrapped-around value time.Time.UnixNano would give.
 //
 // Ordering of lists: services by name, profiles with "default" first and then
 // by name, fault rules by Order then Name, recordings and replay jobs newest
@@ -127,8 +131,9 @@ type Store interface {
 	// Services
 	ListServices(ctx context.Context) ([]model.Service, error)
 	GetService(ctx context.Context, id string) (model.Service, error)
-	// PutService returns an error wrapping model.ErrConflict for a duplicate
-	// name or a listen address another service uses (port 0 is exempt).
+	// PutService returns an error wrapping model.ErrConflict for a name
+	// another service uses (ignoring case and surrounding white space) or a
+	// listen address another service uses (port 0 is exempt).
 	PutService(ctx context.Context, s model.Service) (model.Service, error)
 	DeleteService(ctx context.Context, id string) error
 
@@ -146,6 +151,9 @@ type Store interface {
 	DeleteRecording(ctx context.Context, id string) error
 
 	// Exchanges
+	// AppendExchanges writes a batch in one transaction. An exchange with a
+	// StartedAt outside the years 1678-2262 is refused (model.ErrValidation)
+	// with nothing written.
 	AppendExchanges(ctx context.Context, recordingID string, exs []*model.Exchange) error
 	ListExchanges(ctx context.Context, recordingID string, q model.ExchangeQuery) (items []model.ExchangeSummary, total int64, err error)
 	GetExchange(ctx context.Context, id int64) (*model.Exchange, error)

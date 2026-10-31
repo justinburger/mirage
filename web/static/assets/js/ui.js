@@ -13,8 +13,8 @@ export function toast(message, kind = 'info', { timeout } = {}) {
     toastHost = h('div', { class: 'toasts', 'aria-live': 'polite', 'aria-atomic': 'false' });
     document.body.appendChild(toastHost);
   }
-  const ic = kind === 'error' ? 'alert' : kind === 'success' ? 'check' : 'info';
-  const el = h('div', { class: `toast toast-${kind}`, role: kind === 'error' ? 'alert' : 'status' },
+  const ic = kind === 'error' || kind === 'warn' ? 'alert' : kind === 'success' ? 'check' : 'info';
+  const el = h('div', { class: `toast toast-${kind}`, role: kind === 'error' || kind === 'warn' ? 'alert' : 'status' },
     h('span', { class: 'toast-icon' }, icon(ic, 16)),
     h('div', { class: 'toast-msg' }, message),
     h('button', { type: 'button', class: 'icon-btn toast-x', 'aria-label': 'Dismiss', onclick: () => dismiss() }, icon('x', 14)));
@@ -26,11 +26,29 @@ export function toast(message, kind = 'info', { timeout } = {}) {
   }
   toastHost.appendChild(el);
   while (toastHost.children.length > 4) toastHost.firstChild.remove();
-  timer = setTimeout(dismiss, timeout || (kind === 'error' ? 8000 : 3800));
+  timer = setTimeout(dismiss, timeout || (kind === 'error' || kind === 'warn' ? 8000 : 3800));
   return dismiss;
 }
 export const toastError = (e) => toast(errorText(e), 'error');
 export const toastOk = (m) => toast(m, 'success');
+export const toastWarn = (m) => toast(m, 'warn');
+
+/**
+ * The toast after a service was created, saved, enabled or switched. The API
+ * answers 200 with the service and its status even when the listener could not
+ * start (port in use, bad certificate): that is a warning with the reason, not
+ * a green confirmation. `done` is what happened ("Saved payments").
+ */
+export function toastService(svc, done) {
+  const st = svc && svc.status;
+  if (st && st.error) {
+    // A running service with an error kept its previous settings: the new
+    // ones could not be applied (a busy port, a recording that fails to load).
+    toastWarn(st.running
+      ? `${done}, but the change could not be applied and the service keeps its previous settings: ${st.error}`
+      : `${done}, but it is not running: ${st.error}`);
+  } else toastOk(done);
+}
 
 // ------------------------------------------------------------ buttons
 
@@ -304,9 +322,15 @@ export function errorBox(err) {
 export function statTile({ label, value, sub, tone, spark, hint } = {}) {
   const v = h('div', { class: 'tile-value' }, value == null ? DASH : value);
   const s = h('div', { class: 'tile-sub' }, sub || '');
-  const el = h('div', { class: ['tile', tone && `tone-${tone}`], title: hint }, h('div', { class: 'tile-label' }, label), v, s, spark ? h('div', { class: 'tile-spark' }, spark) : null);
+  const lab = h('div', { class: 'tile-label' }, label);
+  const el = h('div', { class: ['tile', tone && `tone-${tone}`], title: hint }, lab, v, s, spark ? h('div', { class: 'tile-spark' }, spark) : null);
   return {
     el,
+    /** Renames the tile (and sets its hover text when given). */
+    setLabel(text, title) {
+      if (lab.textContent !== text) lab.textContent = text;
+      if (title !== undefined && (el.title || '') !== title) { if (title) el.title = title; else el.removeAttribute('title'); }
+    },
     set(value2, sub2, tone2) {
       v.textContent = value2 == null ? DASH : value2;
       if (sub2 !== undefined) s.textContent = sub2;

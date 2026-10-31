@@ -17,7 +17,7 @@ type rule struct {
 	target model.RuleTarget
 	act    action
 
-	name  string         // header (canonical), cookie, query or form name
+	name  string         // header (canonical), or cookie, query or form name (normalized, see normKey)
 	re    *regexp.Regexp // regex target
 	group bool           // regex has a capture group: only group 1 is replaced
 	// prefix is a literal every match of re starts with ("" if there is
@@ -41,12 +41,19 @@ type sideRules struct {
 	path   []*rule
 	json   []*rule
 	regex  []*rule
-	// keyDescent indexes the keyOnly json rules by member name; the values
-	// are positions in json, ascending. The built-in profile is made of
-	// dozens of such rules, and matching them with a hash lookup per member
-	// instead of one automaton state each keeps the walk cost independent of
-	// their number. nil when there are none.
+	// keyDescent indexes the keyOnly json rules by normalized member name
+	// (see normKey); the values are positions in json, ascending. The
+	// built-in profile is made of dozens of such rules, and matching them
+	// with a hash lookup per member instead of one automaton state each keeps
+	// the walk cost independent of their number. nil when there are none.
 	keyDescent map[string][]int32
+	// nested and nestedKeyDescent are json and keyDescent for a JSON
+	// document embedded in a string leaf of another one: only the rules that
+	// start with a recursive descent ("$..key") can apply inside it, an
+	// absolute path ("$.a.b") is relative to the outer document. Positions in
+	// nestedKeyDescent are positions in nested.
+	nested           []*rule
+	nestedKeyDescent map[string][]int32
 }
 
 func newSideRules() sideRules {
@@ -76,8 +83,18 @@ func (s *sideRules) add(r *rule) {
 			if s.keyDescent == nil {
 				s.keyDescent = map[string][]int32{}
 			}
-			name := r.jp.steps[0].name
+			name := r.jp.steps[0].norm
 			s.keyDescent[name] = append(s.keyDescent[name], int32(len(s.json)-1))
+		}
+		if len(r.jp.steps) > 0 && r.jp.steps[0].descend {
+			s.nested = append(s.nested, r)
+			if r.keyOnly {
+				if s.nestedKeyDescent == nil {
+					s.nestedKeyDescent = map[string][]int32{}
+				}
+				name := r.jp.steps[0].norm
+				s.nestedKeyDescent[name] = append(s.nestedKeyDescent[name], int32(len(s.nested)-1))
+			}
 		}
 	case model.TargetRegex:
 		s.regex = append(s.regex, r)
@@ -174,7 +191,7 @@ func compile(p model.AnonymizationProfile, requireName bool) (*compiled, error) 
 		case model.TargetHeader:
 			cr.name = textproto.CanonicalMIMEHeaderKey(sel)
 		case model.TargetCookie, model.TargetQuery, model.TargetForm:
-			cr.name = sel
+			cr.name = normKey(sel)
 		case model.TargetRegex:
 			re, err := regexp.Compile(r.Selector)
 			if err != nil {

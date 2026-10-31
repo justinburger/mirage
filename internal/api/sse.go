@@ -201,7 +201,12 @@ func (h *hub) appendReplays(ctx context.Context, dst []byte, prev map[string]str
 
 // servicesJSON is the payload of the "services" event: all service statuses.
 func (s *Server) servicesJSON() []byte {
-	payload, err := json.Marshal(nonNil(s.svcs.Statuses()))
+	list := s.svcs.Statuses()
+	statuses := make([]model.ServiceStatus, len(list))
+	for i, st := range list {
+		statuses[i] = publicStatus(st)
+	}
+	payload, err := json.Marshal(statuses)
 	if err != nil {
 		s.log.Error("api: cannot encode services event", "error", err)
 		return []byte("[]")

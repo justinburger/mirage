@@ -127,6 +127,9 @@ type run struct {
 	sd    *sideRules
 	side  string
 	chain []*rule // scratch for merged rule chains
+	// selBuf is scratch for keyedRules; claimBuf for applyChain.
+	selBuf   []*rule
+	claimBuf []claim
 	// mpDepth is how many multipart bodies enclose the body being processed.
 	mpDepth int
 }
@@ -146,9 +149,14 @@ func (r *run) record(loc *locator, source, before, after string) {
 }
 
 // mergeChain returns the rules that apply to one value, in profile order: the
-// selector rules that matched it plus every regex rule of the current side.
-// The result aliases scratch memory and is valid until the next call.
+// selector rule that matched it plus every regex rule of the current side.
+// When several selector rules match the value the first in the profile wins
+// and the others leave it alone, so only that one is kept. The result aliases
+// scratch memory and is valid until the next call.
 func (r *run) mergeChain(sel []*rule) []*rule {
+	if len(sel) > 1 {
+		sel = sel[:1]
+	}
 	rx := r.sd.regex
 	if len(rx) == 0 {
 		return sel
@@ -184,68 +192,141 @@ func selected(chain []*rule) bool {
 	return false
 }
 
-// removes reports whether a selector rule in the chain deletes its target.
+// removes returns the rule that deletes the value when the first selector
+// rule in the chain deletes its target; a remove listed after a rule that
+// transforms the value does not apply (the first rule wins).
 func removes(chain []*rule) *rule {
 	for _, rl := range chain {
-		if rl.target != model.TargetRegex && rl.act.remove() {
-			return rl
+		if rl.target != model.TargetRegex {
+			if rl.act.remove() {
+				return rl
+			}
+			return nil
 		}
 	}
 	return nil
 }
 
-// applyChain runs the rules over s in order. Remove behaves like redact here;
-// callers that can delete check removes first.
+// claim is a stretch of a value, [lo,hi), that a regex rule has taken, with
+// the text it becomes.
+type claim struct {
+	lo, hi int
+	rep    string
+}
+
+// applyChain runs the rules over s in profile order. A value is transformed
+// once: the first selector rule applies to all of it and the rules after it
+// leave it alone, and a regex rule takes only the stretches it matches, so
+// the rules after it (regex rules included) never see its output and cannot
+// transform it a second time. A selector rule listed after a regex rule that
+// took part of the value leaves the value alone too. Remove behaves like
+// redact here; callers that can delete check removes first.
 func (r *run) applyChain(chain []*rule, s string, loc *locator) string {
+	claims := r.claimBuf[:0]
 	for _, rl := range chain {
 		if rl.target == model.TargetRegex {
-			s = r.applyRegex(rl, s, loc)
+			claims = r.claimRegex(rl, s, claims, loc)
+			continue
+		}
+		if len(claims) > 0 {
 			continue
 		}
 		next := r.k.apply(&rl.act, s)
 		r.record(loc, rl.source, s, next)
-		s = next
+		return next
 	}
-	return s
+	out := spliceClaims(s, claims)
+	if cap(claims) <= 64 {
+		clear(claims)
+		r.claimBuf = claims[:0]
+	}
+	return out
 }
 
-// applyRegex replaces every match of the rule's pattern (or its first capture
-// group) with the rule's strategy applied to the matched text.
-func (r *run) applyRegex(rl *rule, s string, loc *locator) string {
-	if s == "" || rl.prefix != "" && !strings.Contains(s, rl.prefix) {
-		return s
+// spliceClaims returns s with the claimed stretches (sorted, disjoint)
+// replaced; s itself when nothing changes.
+func spliceClaims(s string, claims []claim) string {
+	changed := false
+	for i := range claims {
+		if c := &claims[i]; c.rep != s[c.lo:c.hi] {
+			changed = true
+			break
+		}
 	}
-	idx := rl.re.FindAllStringSubmatchIndex(s, -1)
-	if len(idx) == 0 {
+	if !changed {
 		return s
 	}
 	var sb strings.Builder
 	prev := 0
-	changed := false
+	for i := range claims {
+		c := &claims[i]
+		sb.WriteString(s[prev:c.lo])
+		sb.WriteString(c.rep)
+		prev = c.hi
+	}
+	sb.WriteString(s[prev:])
+	return sb.String()
+}
+
+// claimRegex finds the matches of the rule's pattern in s (or of its first
+// capture group) that no earlier rule has claimed and adds them, with the
+// rule's strategy applied, to have (sorted, disjoint). A match that overlaps
+// a stretch an earlier rule took is left alone: that text is already
+// anonymized.
+func (r *run) claimRegex(rl *rule, s string, have []claim, loc *locator) []claim {
+	if s == "" || rl.prefix != "" && !strings.Contains(s, rl.prefix) {
+		return have
+	}
+	idx := rl.re.FindAllStringSubmatchIndex(s, -1)
+	if len(idx) == 0 {
+		return have
+	}
+	var add []claim
+	if len(have) == 0 {
+		add = have // the common case: no earlier claims, append in place
+	}
+	n0 := len(add)
+	h := 0
 	for _, m := range idx {
 		a, z := m[0], m[1]
 		if rl.group {
 			a, z = m[2], m[3]
 		}
-		if a < prev || z <= a { // group did not participate, empty match, overlap
+		if a < 0 || z <= a { // group did not participate, or an empty match
+			continue
+		}
+		for h < len(have) && have[h].hi <= a {
+			h++
+		}
+		if h < len(have) && have[h].lo < z { // overlaps an earlier rule's claim
 			continue
 		}
 		sub := s[a:z]
 		rep := r.k.apply(&rl.act, sub)
-		if rep == sub {
-			continue
-		}
-		changed = true
-		sb.WriteString(s[prev:a])
-		sb.WriteString(rep)
-		prev = z
+		add = append(add, claim{lo: a, hi: z, rep: rep})
 		r.record(loc, rl.source, sub, rep)
 	}
-	if !changed {
-		return s
+	if len(add) == n0 {
+		return have
 	}
-	sb.WriteString(s[prev:])
-	return sb.String()
+	if len(have) == 0 {
+		return add
+	}
+	// Merge the new claims into the earlier ones.
+	out := make([]claim, 0, len(have)+len(add))
+	i, j := 0, 0
+	for i < len(have) && j < len(add) {
+		if have[i].lo < add[j].lo {
+			out = append(out, have[i])
+			i++
+		} else {
+			out = append(out, add[j])
+			j++
+		}
+	}
+	out = append(out, have[i:]...)
+	out = append(out, add[j:]...)
+	return out
 }
 
 // detect replaces every detector match in s. It returns s itself when nothing
@@ -307,8 +388,8 @@ func (r *run) text(s string, loc *locator) string {
 	if s == "" {
 		return s
 	}
-	for _, rl := range r.sd.regex {
-		s = r.applyRegex(rl, s, loc)
+	if len(r.sd.regex) > 0 {
+		s = r.applyChain(r.sd.regex, s, loc)
 	}
 	return r.detect(s, nil, loc)
 }

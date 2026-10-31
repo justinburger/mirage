@@ -139,10 +139,23 @@ func TestJSONContainerMatchAppliesToLeaves(t *testing.T) {
 			[]model.AnonymizationRule{rl(model.TargetJSON, "$.ids", model.StrategyHash)},
 			`{"ids":["a","b"],"z":1}`,
 			`{"ids":["` + hashOf("a") + `","` + hashOf("b") + `"],"z":1}`},
-		{"container match and a deeper rule combine in order",
+		// The first rule in the profile wins; the other leaves the value alone.
+		{"a container rule listed first wins over a deeper rule",
 			[]model.AnonymizationRule{rl(model.TargetJSON, "$.u", model.StrategyHash), rl(model.TargetJSON, "$.u.n", model.StrategyRedact)},
 			`{"u":{"n":"jane","m":"x"}}`,
+			`{"u":{"n":"` + hashOf("jane") + `","m":"` + hashOf("x") + `"}}`},
+		{"a deeper rule listed first wins for its leaf",
+			[]model.AnonymizationRule{rl(model.TargetJSON, "$.u.n", model.StrategyRedact), rl(model.TargetJSON, "$.u", model.StrategyHash)},
+			`{"u":{"n":"jane","m":"x"}}`,
 			`{"u":{"n":"[REDACTED]","m":"` + hashOf("x") + `"}}`},
+		{"a remove listed after a rule that matches the same value does not apply",
+			[]model.AnonymizationRule{rl(model.TargetJSON, "$.u", model.StrategyHash), rl(model.TargetJSON, "$.u.n", model.StrategyRemove)},
+			`{"u":{"n":"jane","m":"x"}}`,
+			`{"u":{"n":"` + hashOf("jane") + `","m":"` + hashOf("x") + `"}}`},
+		{"a remove listed first deletes the member",
+			[]model.AnonymizationRule{rl(model.TargetJSON, "$.u.n", model.StrategyRemove), rl(model.TargetJSON, "$.u", model.StrategyHash)},
+			`{"u":{"n":"jane","m":"x"}}`,
+			`{"u":{"m":"` + hashOf("x") + `"}}`},
 		{"empty containers survive",
 			[]model.AnonymizationRule{rl(model.TargetJSON, "$.a", model.StrategyRedact)},
 			`{"a":{},"b":[],"c":{"d":[]}}`, `{"a":{},"b":[],"c":{"d":[]}}`},
@@ -538,8 +551,21 @@ func TestJSONRegexRulesApplyToLeaves(t *testing.T) {
 		rl(model.TargetJSON, "$.k", model.StrategyMask),
 	))
 	got := anonJSON(t, e, `{"a":"ref ACME-1 and ACME-22","n":12,"k":"ACME-7","ACME-9":1}`)
-	// The regex rule is listed first, so the mask sees "[REDACTED]".
-	want := `{"a":"ref [REDACTED] and [REDACTED]","n":12,"k":"**********","ACME-9":1}`
+	// The regex rule is listed first, so it takes the value and the mask rule
+	// listed after it leaves the marker alone.
+	want := `{"a":"ref [REDACTED] and [REDACTED]","n":12,"k":"[REDACTED]","ACME-9":1}`
+	if got != want {
+		t.Errorf("\n got:  %s\n want: %s", got, want)
+	}
+
+	// Listed the other way round the mask rule takes the whole value and the
+	// regex rule never sees it.
+	e = mustEngine(t, bareProfile(
+		rl(model.TargetJSON, "$.k", model.StrategyMask),
+		rl(model.TargetRegex, `ACME-\d+`, model.StrategyRedact),
+	))
+	got = anonJSON(t, e, `{"a":"ref ACME-1 and ACME-22","n":12,"k":"ACME-7","ACME-9":1}`)
+	want = `{"a":"ref [REDACTED] and [REDACTED]","n":12,"k":"******","ACME-9":1}`
 	if got != want {
 		t.Errorf("\n got:  %s\n want: %s", got, want)
 	}

@@ -12,7 +12,9 @@ import (
 //	$.a.b            member access ($['a']['b'] and $["a"]["b"] also work)
 //	$.a[0]           array element by non-negative index
 //	$.a[*].b  $.*    wildcards over members and elements
-//	$..key           recursive descent: `key` at any depth
+//	$..key           recursive descent: `key` at any depth (member names
+//	                 after ".." are compared ignoring case, "_" and "-":
+//	                 $..api_key also selects apiKey, API-KEY and apikey)
 //	$..*  $..[0]     recursive descent with a wildcard or an index
 //	$..[?(@.a || @.b)].key
 //	                 `key` at any depth, but only in objects that also have a
@@ -40,13 +42,26 @@ const maxJSONPathSteps = 64
 type jpStep struct {
 	// descend makes the step match at any depth below the previous step.
 	descend bool
-	kind    uint8
-	name    string
-	idx     int
+	// fold marks a recursive-descent name step, which matches member names
+	// ignoring case, "_" and "-"; norm is name normalized (see normKey).
+	fold bool
+	kind uint8
+	idx  int32 // parseBracket limits an index to 1<<30
+	name string
+	norm string
+}
+
+// matchFold is matches for a fold step.
+//
+//go:noinline
+func (s *jpStep) matchFold(obj bool, key []byte) bool {
+	return obj && normEqual(key, s.norm)
 }
 
 // matches reports whether the step accepts a child of a container: an object
-// member called key, or element idx of an array.
+// member called key, or element idx of an array. A recursive-descent name step
+// (fold) is matched by matchFold instead: this method stays small, it is on
+// the path of every state of every node.
 func (s *jpStep) matches(obj bool, key []byte, idx int) bool {
 	switch s.kind {
 	case jpWild:
@@ -54,7 +69,7 @@ func (s *jpStep) matches(obj bool, key []byte, idx int) bool {
 	case jpName:
 		return obj && string(key) == s.name
 	default:
-		return !obj && idx == s.idx
+		return !obj && idx == int(s.idx)
 	}
 }
 
@@ -62,8 +77,11 @@ type jsonPath struct {
 	src   string
 	steps []jpStep
 	// siblings, when set, restricts the single step to members of objects
-	// that also have one of these members (the sibling filter).
+	// that also have one of these members (the sibling filter). sibNorm is
+	// siblings normalized (see normKey): member names are compared ignoring
+	// case, "_" and "-".
 	siblings []string
+	sibNorm  []string
 }
 
 func (p *jsonPath) String() string { return p.src }
@@ -129,6 +147,9 @@ func parseJSONPath(sel string) (*jsonPath, error) {
 			i = n
 		default:
 			return nil, fmt.Errorf("JSONPath %q: unexpected character %q at offset %d", sel, p[i], i)
+		}
+		if st.descend && st.kind == jpName {
+			st.fold, st.norm = true, normKey(st.name)
 		}
 		jp.steps = append(jp.steps, st)
 		if len(jp.steps) > maxJSONPathSteps {
@@ -230,7 +251,12 @@ func parseSiblingFilter(sel, p string) (*jsonPath, error) {
 	default:
 		return bad("the filter must be followed by .member")
 	}
-	return &jsonPath{src: sel, steps: []jpStep{st}, siblings: names}, nil
+	st.fold, st.norm = true, normKey(st.name)
+	sibNorm := make([]string, len(names))
+	for i, n := range names {
+		sibNorm[i] = normKey(n)
+	}
+	return &jsonPath{src: sel, steps: []jpStep{st}, siblings: names, sibNorm: sibNorm}, nil
 }
 
 // parseBracket parses "[...]" starting at p[i] == '[' into st and returns the
@@ -291,7 +317,7 @@ func parseBracket(p string, i int, st *jpStep) (int, error) {
 		if err != nil || n < 0 || n > 1<<30 {
 			return 0, fmt.Errorf("invalid index [%s]", body)
 		}
-		st.kind, st.idx = jpIndex, n
+		st.kind, st.idx = jpIndex, int32(n)
 	}
 	return i + j + 1, nil
 }

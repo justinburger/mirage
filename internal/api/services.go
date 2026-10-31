@@ -55,6 +55,16 @@ func (s *Server) statusOf(svc model.Service, known map[string]model.ServiceStatu
 	if st.Mode == "" || !st.Running {
 		st.Mode = svc.Mode
 	}
+	return publicStatus(st)
+}
+
+// publicStatus returns st as it may be shown to clients: the error text loses
+// the internal package prefixes of the errors it was built from ("store:",
+// "ops:", ...), like every other error message the API returns.
+func publicStatus(st model.ServiceStatus) model.ServiceStatus {
+	if st.Error != "" {
+		st.Error = cleanMessage(st.Error)
+	}
 	return st
 }
 
@@ -303,8 +313,13 @@ func (s *Server) reloadService(w http.ResponseWriter, r *http.Request) error {
 }
 
 // saveService validates svc (with reference checks when refs is set), stores it
-// and applies it. The caller holds the service's lock.
+// and applies it. The caller holds the service's lock. The recording the
+// service names cannot be deleted between the reference check and the write
+// (see Server.recordingMu), so a service that passes the check is never saved
+// on a recording that deleteRecording has already declared unused.
 func (s *Server) saveService(ctx context.Context, svc model.Service, refs bool) (ServiceWithStatus, error) {
+	s.recordingMu.RLock()
+	defer s.recordingMu.RUnlock()
 	checked, err := s.checkService(ctx, svc, refs)
 	if err != nil {
 		return ServiceWithStatus{}, err
@@ -367,7 +382,7 @@ func (s *Server) persistService(ctx context.Context, svc model.Service) (Service
 	if applyErr != nil {
 		s.log.Warn("api: service saved but not applied", "service", stored.ID, "name", stored.Name, "error", applyErr)
 		if out.Status.Error == "" {
-			out.Status.Error = applyErr.Error()
+			out.Status.Error = cleanMessage(applyErr.Error())
 		}
 	}
 	return out, nil

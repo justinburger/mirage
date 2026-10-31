@@ -152,6 +152,8 @@ type fakeReplays struct {
 
 	startErr  error
 	createErr error
+	// onStart, when set, runs at the top of Start, before it takes any lock.
+	onStart func()
 }
 
 func newFakeReplays(st store.Store) *fakeReplays {
@@ -185,6 +187,9 @@ func (f *fakeReplays) Create(ctx context.Context, name string, cfg model.ReplayC
 }
 
 func (f *fakeReplays) Start(ctx context.Context, id string) error {
+	if f.onStart != nil {
+		f.onStart()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.startErr != nil {

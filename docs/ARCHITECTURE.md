@@ -35,11 +35,12 @@ error mix. A built-in web UI manages and monitors all of it.
 | `internal/fault` | Fault rules: latency, errors, aborts, hangs, throttling | model |
 | `internal/pathnorm` | Path → endpoint template (`/users/{id}`) | — |
 | `internal/netutil` | `net/http` helpers shared by the HTTP servers (fast graceful shutdown) | — |
-| `internal/har` | HAR 1.2 import/export | model |
-| `internal/virtual` | Recorded-response matching, latency simulation, error amplification | model, store, pathnorm |
-| `internal/proxy` | Service listeners, reverse proxy, capture pipeline | model, store, metrics, fault, anonymize, pathnorm, netutil |
+| `internal/bodycodec` | Decoding of `Content-Encoding` (gzip, deflate, stacks) for capture, anonymization and matching | model |
+| `internal/har` | HAR 1.2 import/export | model, bodycodec |
+| `internal/virtual` | Recorded-response matching, latency simulation, error amplification | model, store, pathnorm, bodycodec |
+| `internal/proxy` | Service listeners, reverse proxy, capture pipeline | model, store, metrics, fault, anonymize, pathnorm, netutil, bodycodec |
 | `internal/replay` | Load generator and replay job manager | model, store, metrics, anonymize, pathnorm |
-| `internal/ops` | Anonymized copies, HAR import/export over the store | model, store, anonymize, har, pathnorm, fault |
+| `internal/ops` | Anonymized copies, HAR import/export over the store | model, store, anonymize, har, pathnorm, fault, bodycodec |
 | `internal/api` | REST API, SSE, auth, static UI | model, store, metrics, fault, anonymize, har, pathnorm, ops |
 | `internal/config` | YAML/JSON config file, applied at start-up | model, store, ops |
 | `internal/app` | Wiring: builds every component, start-up and shutdown | everything |
@@ -146,6 +147,27 @@ interfaces that connect them.
   customer ID or email maps to the same token in every request and response.
   This keeps cache hit ratios, hot keys and request correlation realistic in
   replays.
+- **One way to anonymize an exchange.** Capture (`internal/proxy`) and every
+  artifact made from a stored recording (`ops.AnonymizeExchange`: copies,
+  HAR import and export, `mirage anonymize`) do the same three steps:
+  `bodycodec.PrepareForAnonymization` decodes gzip/deflate bodies (and drops
+  the ones it cannot read, so a `br` body is never stored raw), the
+  `anonymize` engine runs, and the endpoint is rebuilt from the raw and the
+  anonymized path (`pathnorm.AnonymizedEndpoint`). An exchange the engine
+  fails on is left out and counted, never written in any form.
+- **Virtualizing an anonymized recording.** A service with `anonymize_capture`
+  recorded anonymized requests, so a raw client request cannot match them.
+  `app` loads the service's profile (`ops.LoadEngine`) and hands the engine to
+  `virtual.Options.Anonymizer` (an interface, so `virtual` does not import
+  `anonymize`); `virtual.lookup` then probes the index with the anonymized
+  copy of the request and with the request as received, level by level. The
+  proxy rebuilds the virtualizer and the capture anonymizer when the profile
+  changes (`proxy.Manager.ProfileChanged`), keeping the old ones if the
+  rebuild fails.
+- **Deleting a recording is ordered against service saves.** `api.Server`
+  holds `recordingMu` exclusively across "is anything using it?" and the
+  delete, and shared across every service save and replay start, so a service
+  is never enabled on a recording that is being deleted.
 - **Error amplification** exists in two places. In virtualize/hybrid mode
   (`Service.ErrorAmplification`, `ErrorFloor`) it raises the error rate the
   virtual service returns, per endpoint, using real recorded error responses.

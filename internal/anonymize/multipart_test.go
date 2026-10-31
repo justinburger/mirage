@@ -160,6 +160,41 @@ func TestSplitMultipart(t *testing.T) {
 	}
 }
 
+// TestBoundaryOfNonASCII is the regression test for a crash: boundaryOf looked
+// for "boundary=" in a lower-cased copy of the header and sliced the original
+// with that index, but lower-casing changes the length of non-ASCII text (and
+// of invalid UTF-8), so the slice went out of range.
+func TestBoundaryOfNonASCII(t *testing.T) {
+	cases := []struct{ ct, want string }{
+		// U+023A is two bytes, its lower case U+2C65 three.
+		{"multipart/form-data; x=\u023a; boundary=", ""},
+		{"multipart/form-data; x=\u023a; boundary=abc", "abc"},
+		{"multipart/form-data; x=\u023a; Boundary=XyZ; y=1", "XyZ"},
+		// Invalid UTF-8 is replaced by a three-byte U+FFFD when lower-cased.
+		{"multipart/form-data; x=\xff\xfe; boundary=", ""},
+		{"multipart/form-data; x=\xff\xfe; BOUNDARY=a(b)c", "a(b)c"},
+		{"\xff\xff\xff\xffboundary=x", "x"},
+		{"\u0130boundary=x", "x"}, // U+0130 lower-cases to two runes
+		{"boundary=", ""},
+	}
+	for _, c := range cases {
+		if got := boundaryOf(c.ct); got != c.want {
+			t.Errorf("boundaryOf(%q) = %q, want %q", c.ct, got, c.want)
+		}
+	}
+	// And through the engine: the body is malformed multipart, not a panic.
+	e := builtinEngine(t)
+	for _, ct := range []string{
+		"multipart/form-data; x=\u023a; boundary=",
+		"multipart/form-data; x=\xff\xfe; boundary=",
+	} {
+		req := &model.Request{Method: "POST", Path: "/x", Header: http.Header{"Content-Type": {ct}}, Body: []byte("--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv\r\n--b--\r\n")}
+		if err := e.Request(req); err != nil {
+			t.Errorf("Content-Type %q: %v", ct, err)
+		}
+	}
+}
+
 func TestMultipartHelpers(t *testing.T) {
 	boundaries := []struct{ ct, want string }{
 		{"multipart/form-data; boundary=abc", "abc"},

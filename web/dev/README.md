@@ -56,8 +56,16 @@ Environment variables:
 | `MOCK_LATENCY` | `12` | extra milliseconds per API call |
 | `MOCK_QUIET` | empty | `1` silences the request log |
 
-Dev-only helper: `POST /__mock/sse-drop?ms=6000` ends every live stream and
-refuses new ones for a while, to exercise the "Reconnecting" indicator.
+Dev-only helpers:
+
+* `POST /__mock/sse-drop?ms=6000` ends every live stream and refuses new ones
+  for a while, to exercise the "Reconnecting" indicator.
+* `POST /__mock/restart?ms=2500` is a server restart: the same outage, and every
+  replay that was running is marked failed (`interrupted: mirage restarted`)
+  without any stream event announcing it, like the Go server.
+* `POST /__mock/rename?id=svc_x&name=new` renames a service the way a rename-only
+  PUT does on the Go server: no listener restart, so no `ServiceStatus` field
+  changes and nothing is streamed.
 
 `restart-mock.sh` restarts the server in the background (state resets).
 
@@ -74,22 +82,25 @@ or an `.mjs` file whose default export is an array (or a function returning one)
 IGNORE_HTTP=1 node web/dev/run.mjs web/dev/scenarios/interactions.mjs
 ./web/dev/restart-mock.sh
 IGNORE_HTTP=1 node web/dev/run.mjs web/dev/scenarios/interactions2.mjs
+IGNORE_HTTP=1 node web/dev/run.mjs web/dev/scenarios/qa-fixes.mjs  # QA regressions (restart, p95, probability, wrapping, toasts)
 node web/dev/run.mjs web/dev/scenarios/overflow.mjs             # no page-level horizontal overflow: 15 routes x 5 widths
 node web/dev/run.mjs web/dev/scenarios/hover.mjs                # chart tooltip, legend toggle, window switch
 node web/dev/run.mjs web/dev/scenarios/screenshots.mjs --height 1180   # regenerates web/dev/screenshots/*.png
 ```
 
-`IGNORE_HTTP=1` hides the expected 4xx responses of the validation tests.
+`IGNORE_HTTP=1` hides the expected 4xx responses of the validation tests (and the
+503s of the stream while a simulated outage refuses it).
 
 | Scenario | What it covers |
 |---|---|
 | `interactions.mjs` | modals (Escape, backdrop, focus, inert), invalid and conflicting service creation, mode switching, disable and delete with confirmation, HAR import, exchange drawer and anonymization preview, anonymized copy, replay form validation and start/stop/clone, fault toggle and preset, profile creation with the test panel, theme toggle |
 | `interactions2.mjs` | editing a service (PUT), creating a recording from the service form, 409 handling for recordings and profiles, regenerate-secret flow, editing and deleting faults, dashboard scope and window, HAR export, settings (token, theme) |
 | `review-fixes.mjs` | regressions from the UI review: Edit as new never posts a masked `***` secret (and says which one to re-enter), a running service at its capture limit is an amber notice and not "could not start", the compare view plots corrected latency and diffs seed and headers, the service form follows the mode (Virtualization open and first, Capture folded) and opens sections that hold an error, replay chart legends show the target while running and the whole run afterwards. Changes mock data: restart the mock after it |
+| `qa-fixes.mjs` | regressions from the QA run: after a stream outage the services, replays and info are fetched again (a replay the restarted server marked failed stops showing Running; a service disabled, renamed or edited elsewhere updates its rows and page; returning to a tab that was hidden refetches), the "all services" p95 tile and chart show the slowest service's p95 and say so, a fault probability keeps its precision and is never rewritten untouched (same for error floor and capture sampling), 200-character names, long paths, headers and bodies wrap in tables, pages and the drawer (1440 and 390 px), `#/services/%` is "not found" and not a URIError, a service that saved but could not start gets a warning toast. Run with `IGNORE_HTTP=1`; `QA_CONTINUE=1` lists every failing check instead of stopping at the first. Creates and removes its own data (about a minute) |
 | `overflow.mjs` | page-level horizontal overflow at 1440, 1280, 1024, 768 and 390 px |
 | `hover.mjs` | crosshair and tooltip, legend toggle, 5/15/60 minute window |
 | `reconnect.mjs` | live indicator through a stream outage (`/__mock/sse-drop`); the 503s it logs are expected |
-| `auth.mjs` | 401 token prompt, wrong token, stored token, `access_token` on export links. Needs `PORT=8487 MOCK_TOKEN=s3cret node web/dev/mock-server.mjs` |
+| `auth.mjs` | 401 token prompt, wrong token, stored token, `access_token` on export links. Needs `PORT=8487 MOCK_TOKEN=s3cret node web/dev/mock-server.mjs` and `IGNORE_HTTP=1` (the 401s are the point) |
 | `empty.mjs` | first-run empty states. Needs `PORT=8486 MOCK_EMPTY=1 node web/dev/mock-server.mjs` |
 | `screenshots.mjs` | the README screenshots (run right after a restart so the "running" replay is mid-flight) |
 
@@ -118,7 +129,7 @@ web/static/assets/app.css      design tokens (dark/light) and all components
 web/static/assets/js/
   dom.js        h()/svg() helpers; never innerHTML for data
   api.js        fetch wrapper, ApiError(problems), token, access_token URLs
-  sse.js        EventSource with backoff; state.js pub/sub + shared state
+  sse.js        EventSource with backoff, refetch after a gap; state.js pub/sub + shared state
   series.js     per-collector time-series buffers (history + live points)
   router.js     hash router with lazy page modules
   chart.js      canvas TimeChart, sparkline, status bar, ramp preview

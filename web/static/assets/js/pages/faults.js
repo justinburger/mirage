@@ -4,7 +4,7 @@ import { icon } from '../icons.js';
 import { api, ApiError } from '../api.js';
 import { state, refreshServices } from '../state.js';
 import { card, btn, iconBtn, dataTable, emptyState, confirmDialog, toastOk, badge, field, formSection, formGrid, textCtl, textareaCtl, selectCtl, switchCtl, segmentedCtl, numCtl, durCtl, kvCtl, chipsCtl, sliderCtl, openModal, errorBox, alertBox, applyProblems, scrollToFirstError, pageHeader, toastError } from '../ui.js';
-import { fmtInt, fmtPct, fmtBytes, fmtDur, toGoDuration, DASH } from '../format.js';
+import { fmtInt, fmtPct, fmtBytes, fmtDur, toGoDuration, fracToPct, pctToFrac, DASH } from '../format.js';
 import { durText } from '../service-form.js';
 
 const TYPES = [
@@ -126,7 +126,7 @@ export async function openFaultForm({ rule = null, preset = null, onSaved } = {}
   const methodBtns = h('div', { class: 'row', style: 'gap:6px' }, ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].map((m) => h('button', { type: 'button', class: 'preset', onclick: () => { const cur = methods.get(); methods.set(cur.includes(m) ? cur.filter((x) => x !== m) : [...cur, m]); } }, m)));
   const path = textCtl({ value: r.path_pattern || '', placeholder: '/v1/charges/**', mono: true });
   const headers = kvCtl({ value: r.headers || {}, keyPlaceholder: 'Header', valuePlaceholder: 'exact value', addLabel: 'Add header match' });
-  const prob = sliderCtl({ min: 0, max: 100, step: 0.5, value: Math.round((r.probability ?? 0.1) * 1000) / 10, presets: [1, 5, 10, 25, 50, 100], format: (v) => `${v}%`, unit: '%', numMin: 0, numMax: 100 });
+  const prob = sliderCtl({ min: 0, max: 100, step: 0.5, value: fracToPct(r.probability ?? 0.1), presets: [1, 5, 10, 25, 50, 100], format: (v) => `${v}%`, unit: '%', numMin: 0, numMax: 100 });
   const order = numCtl({ value: r.order ?? 0, step: 1 });
   const type = segmentedCtl(TYPES, { value: r.type || 'error', label: 'Fault type' });
   // type specific
@@ -183,7 +183,7 @@ export async function openFaultForm({ rule = null, preset = null, onSaved } = {}
       const payload = {
         ...(editing ? { id: rule.id } : {}),
         name: name.get().trim(), enabled: enabled.get(), order: order.get() || 0, service_id: scope.get(),
-        methods: methods.get().map((m) => m.toUpperCase()), path_pattern: path.get().trim(), headers: headers.get(), probability: (p || 0) / 100, type: t,
+        methods: methods.get().map((m) => m.toUpperCase()), path_pattern: path.get().trim(), headers: headers.get(), probability: pctToFrac(p || 0, editing ? rule.probability : undefined), type: t,
       };
       if (t === 'latency') {
         if (!delay.valid() || !jitter.valid()) bail('delay', 'Use durations like 250ms.');

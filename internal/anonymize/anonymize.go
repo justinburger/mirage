@@ -14,7 +14,14 @@
 //  1. RedactHeaders: listed headers get hash tokens; an auth scheme prefix
 //     ("Bearer ", "Basic ", "Token ") is preserved. Cookie / Set-Cookie are
 //     handled per cookie (names and attributes kept, values hashed).
-//  2. Rules, in order, filtered by Scope and Enabled.
+//  2. Rules, in order, filtered by Scope and Enabled. A value is transformed
+//     once: when several rules match the same value the first in the profile
+//     wins and the later ones leave it alone (a remove listed after a hash
+//     rule that matches the same value does not delete it). A regex rule takes
+//     only the stretches of text it matches, so a later rule never rewrites
+//     what an earlier one wrote, and a selector rule (header, query, cookie,
+//     form, json, path) listed after a regex rule that took part of the value
+//     leaves the value alone too.
 //  3. Detectors over every remaining textual value: JSON string leaves (and
 //     numbers for credit_card/phone/ssn detectors when they look like one),
 //     form values, query values, header values (except redacted ones),
@@ -28,7 +35,14 @@
 // not to be JSON is processed as text (a form falls back to its form
 // fields). Vendor types (application/vnd.*) are not assumed to be binary:
 // they are sniffed, except the few known binary families. NDJSON is handled line
-// by line. Form bodies are rewritten field by field. Other textual bodies get
+// by line. A JSON string that itself holds a JSON object or array (the
+// envelope of a queue message, a webhook or a log event) is parsed and
+// rewritten like a body, to a depth of three: the recursive-descent rules
+// ($..key), the regex rules and the detectors apply inside it, absolute paths
+// ($.a.b) do not (they are relative to the outer document), and the document
+// is written back compactly as a string only if something in it changed. A
+// string that does not parse is the plain string it was; a string a rule
+// selects is replaced whole and not opened. Form bodies are rewritten field by field. Other textual bodies get
 // regex rules and detectors. When a body changes, BodySize is updated and any
 // Content-Length header is fixed. A truncated body (BodyTruncated) is
 // processed best-effort: JSON is rewritten as far as it goes, everything else
@@ -133,9 +147,16 @@
 //     returned as an error, and the caller must then discard the exchange.
 //   - Engine.Profile returns the profile without its secret (Secret empty,
 //     HasSecret set), as model.AnonymizationProfile.Redacted does.
-//   - Rule keys (JSON member names, query and form names, part names) match
-//     exactly, including case: the built-in profile lists the usual spellings
-//     (password, accessToken, access_token, ...) rather than matching loosely.
+//   - Key names in query, cookie and form selectors (and multipart part
+//     names) and in JSONPath recursive descent ("$..api_key", including the
+//     members named in a sibling filter) are compared ignoring ASCII case and
+//     the characters "_" and "-": api_key matches apiKey, API-KEY and apikey.
+//     A form or query name like "user[password]" also matches by its last
+//     bracketed part. Absolute JSONPath members ($.a.b) and header names
+//     (case-insensitive already) keep their exact matching. The built-in
+//     profile lists both access_token and accessToken, which now select the
+//     same values: the first rule wins, so a token is hashed once and "same
+//     value, same token everywhere" holds.
 //   - A new part body, filled or not, never contains a line starting with the
 //     part's own delimiter, so a short boundary cannot be hit by chance.
 package anonymize

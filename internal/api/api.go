@@ -31,7 +31,9 @@
 //     replay ran, a state conflict rather than a bad request, is a 409 when
 //     started or cloned.
 //   - Messages never carry the names of internal packages ("store:", "ops:"),
-//     and an object named by several layers of an error is named once.
+//     and an object named by several layers of an error is named once. That
+//     includes the error of a service status (status.error, also in the live
+//     stream), which the controller built from such errors.
 //   - A request body must be declared as JSON (Content-Type application/json
 //     or a +json type; the HAR import also takes multipart/form-data): any
 //     other type, or none, is a 415. See Authentication for why.
@@ -62,6 +64,11 @@
 //
 // A recording cannot be deleted (409) while an enabled service in a mode that
 // uses recordings points at it, or a replay job on it is pending or running.
+// The check and the delete are atomic with respect to saving a service and
+// starting a replay: a request that enables or re-points a service at a
+// recording that a concurrent delete is removing waits for it and is then
+// refused (400, the recording no longer exists), and a delete that arrives
+// while a service is being saved on the recording is refused (409).
 // A profile cannot be deleted (409) if it is "default" or any service or
 // replay job references it. Deleting a service deletes the fault rules scoped
 // to it (they could never fire again), and a fault rule cannot be saved for a
@@ -214,6 +221,19 @@ type Server struct {
 	svcLocks  keyedMutex
 	faultMu   sync.Mutex
 	profileMu sync.Mutex
+
+	// recordingMu orders the deletion of a recording against everything that
+	// can make a service (or a replay) start using one. deleteRecording holds
+	// it exclusively across "is anything using it?" and the delete, and every
+	// service save (saveService) and replay start holds it shared across its
+	// own "does the recording exist?" check and the write that follows.
+	// Without it an enable could pass its check just before the delete, and
+	// the delete its check just before the enable's write, leaving an enabled
+	// service on a recording that is gone. Shared holders do not exclude each
+	// other (services are serialised by svcLocks, per service); the lock is
+	// always taken after the service lock, and nothing is acquired under it
+	// except the store and the controller, so it cannot deadlock.
+	recordingMu sync.RWMutex
 
 	// importLimit caps the size of a HAR upload (a field so tests can lower it).
 	importLimit int64

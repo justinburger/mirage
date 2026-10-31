@@ -154,9 +154,13 @@ func (m *Manager) Reload(ctx context.Context, id string) error {
 	return s.reloadVirtualizer(ctx)
 }
 
-// ProfileChanged reloads the anonymizer of every service using profileID. A
-// service whose profile cannot be loaded keeps its previous anonymizer; the
-// errors are joined.
+// ProfileChanged applies a changed anonymization profile to every running
+// service that uses profileID with anonymize_capture on: its capture
+// anonymizer is reloaded (record and hybrid) and its virtualizer is rebuilt
+// (virtualize and hybrid), because the virtualizer matches requests in their
+// anonymized form, with the profile's anonymizer. A service whose profile
+// cannot be loaded keeps its previous anonymizer and virtualizer; the errors
+// are joined.
 func (m *Manager) ProfileChanged(ctx context.Context, profileID string) error {
 	if profileID == "" {
 		profileID = model.DefaultProfileID
@@ -176,8 +180,8 @@ func (m *Manager) ProfileChanged(ctx context.Context, profileID string) error {
 	for _, s := range all {
 		s.lifeMu.Lock()
 		if !s.removed {
-			if st := s.state.Load(); st != nil && st.anon != nil && effectiveProfileID(st.svc) == profileID {
-				if err := s.reloadAnonymizer(ctx); err != nil {
+			if st := s.state.Load(); st != nil && st.svc.AnonymizeCapture && effectiveProfileID(st.svc) == profileID {
+				if err := s.reloadProfile(ctx); err != nil {
 					errs = append(errs, fmt.Errorf("service %s: %w", s.id, err))
 				}
 			}

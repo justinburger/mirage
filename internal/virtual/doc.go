@@ -75,9 +75,34 @@
 //   - If the recorded response had ContentEncoding "gzip" and the request
 //     accepts gzip, serve it gzip-compressed with Content-Encoding: gzip,
 //     compressing each exchange's body once and caching the result.
+//   - A recorded response without a Content-Type is served without one: the
+//     header key is set with no values, which keeps net/http from sniffing a
+//     "text/plain; charset=utf-8" the upstream never sent.
 //   - Add "X-Mirage-Match: exact|path|template" and, for amplified errors,
 //     "X-Mirage-Injected: error".
-//   - HEAD requests get headers only.
+//   - HEAD requests get headers only. Their Content-Length is the one the
+//     recorded HEAD exchange announced (its body is empty, so it cannot be
+//     recomputed), or, when the HEAD is answered from a GET recording, the
+//     length of the body that GET would be served with (gzip included). A
+//     recorded HEAD without a usable Content-Length answers with 0.
+//
+// Anonymized recordings. A recording captured with anonymize_capture stores
+// anonymized paths, queries, bodies and headers, so the raw requests of a
+// client (an email in the path, a card number in the body) cannot match it.
+// With Options.Anonymizer set, Lookup builds an anonymized copy of the
+// request (method, escaped path, raw query, cloned headers, a copy of the
+// body, gzip/deflate decoded and a body still encoded dropped like the capture
+// does with bodycodec.PrepareForAnonymization), runs the Anonymizer on the
+// copy, and computes the match keys from it. The request as received is
+// probed as well, because traffic that is already anonymized (a replay of the
+// recording) changes again when anonymized a second time. Levels are walked
+// from the most specific down (exact, path, template), the anonymized form
+// before the request as received at each, so a broad template match never
+// hides an exact one. The template key is the endpoint the capture stored,
+// pathnorm.Normalizer.AnonymizedEndpoint(method, raw path, anonymized path).
+// The caller's request and body are never modified, and a request the
+// anonymizer leaves unchanged is probed once. With a nil Anonymizer the lookup
+// is the plain one, with no extra work.
 //
 // Misses: Serve returns false and writes nothing; WriteMiss writes
 // Match.MissStatus with a JSON body explaining the miss
@@ -129,7 +154,9 @@
 //     "exact", body is "ignore" and no headers are matched) it is not indexed
 //     twice, and such matches are reported as "exact".
 //   - A HEAD request without a recorded HEAD exchange is answered from the GET
-//     recording, headers only.
+//     recording, headers only. The request body of a lookup is decoded with
+//     bodycodec (gzip, deflate and stacked codings such as "gzip, gzip"), like
+//     the capture stores it.
 //   - Sequential cursors live on the index entry of the key the candidates
 //     were found under and advance on every hit there. Under a subset filter
 //     the cursor selects among the candidates that pass the filter.

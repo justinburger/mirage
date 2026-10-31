@@ -10,6 +10,9 @@ import { fmtRate, fmtPct, fmtMs, fmtInt, fmtCompact, DASH } from '../format.js';
 import { replaceQuery } from '../router.js';
 
 const WIN_KEY = 'mirage_dash_window';
+// Across all services the tile and the latency chart show the slowest
+// service's p95 (percentiles of different services cannot be averaged).
+const P95_LABEL = (scope) => (scope === 'all' ? 'p95 (slowest service)' : 'p95 latency');
 
 export default async function dashboard(ctx) {
   ctx.setCrumbs([{ label: 'Dashboard' }]);
@@ -85,7 +88,7 @@ function buildLive(ctx, root) {
   // --- tiles
   const tRps = statTile({ label: 'Requests / s', value: DASH, sub: ' ', spark: null });
   const tErr = statTile({ label: 'Error rate', value: DASH, sub: ' ' });
-  const tP95 = statTile({ label: 'p95 latency', value: DASH, sub: ' ' });
+  const tP95 = statTile({ label: P95_LABEL(scope), value: DASH, sub: ' ' });
   const tSvc = statTile({ label: 'Active services', value: DASH, sub: ' ' });
   const tRep = statTile({ label: 'Running replays', value: DASH, sub: ' ' });
   const sparkRps = sparkline([], { width: 90, height: 28, color: 'c1' });
@@ -94,6 +97,7 @@ function buildLive(ctx, root) {
 
   // --- charts
   const charts = trafficCharts({ windowMs });
+  charts.setAggregate(scope === 'all');
   root.appendChild(charts.el);
   cleanups.push(() => charts.destroy());
 
@@ -141,25 +145,27 @@ function buildLive(ctx, root) {
   }
 
   function aggregateTiles() {
-    let rps = 0, errW = 0, p95Sum = 0, p95W = 0, active = 0;
+    let rps = 0, errW = 0, p95 = 0, slowest = '', active = 0;
     const snaps = [];
+    const names = new Map();
     if (scope === 'all') {
       for (const s of state.services) {
         const sn = state.snapshots[`service:${s.id}`];
-        if (sn && s.status.running) snaps.push(sn);
+        if (sn && s.status.running) { snaps.push(sn); names.set(sn, s.name); }
       }
     } else if (state.snapshots[scope]) snaps.push(state.snapshots[scope]);
     for (const sn of snaps) {
       rps += sn.rps || 0;
       errW += (sn.rps10 || 0) * (sn.error_rate10 || 0);
-      const w = sn.recent ? sn.recent.count : 0;
-      p95Sum += (sn.recent ? sn.recent.p95 : 0) * w;
-      p95W += w;
+      // Percentiles do not combine: a request-weighted mean of p95s is not a
+      // p95. Across services the tile shows the slowest service's p95.
+      const v = sn.recent && sn.recent.count > 0 ? sn.recent.p95 : 0;
+      if (v > p95) { p95 = v; slowest = names.get(sn) || ''; }
     }
     const rps10 = snaps.reduce((a, s) => a + (s.rps10 || 0), 0);
     const errRate = rps10 > 0 ? errW / rps10 : 0;
     active = state.services.filter((s) => s.status.running).length;
-    return { rps, errRate, p95: p95W > 0 ? p95Sum / p95W : 0, has: snaps.length > 0, active };
+    return { rps, errRate, p95, slowest, has: snaps.length > 0, active };
   }
 
   function paintTiles() {
@@ -167,6 +173,7 @@ function buildLive(ctx, root) {
     tRps.set(t.has ? fmtRate(t.rps) : DASH, scope === 'all' ? `across ${fmtInt(state.services.filter((s) => s.status.running).length)} running services` : 'selected collector');
     tErr.set(t.has ? fmtPct(t.errRate) : DASH, t.has ? 'last 10 seconds' : ' ', !t.has ? '' : t.errRate > 0.05 ? 'err' : t.errRate > 0.01 ? 'warn' : 'ok');
     tP95.set(t.has ? fmtMs(t.p95) : DASH, t.has ? 'last 10 seconds' : ' ', '');
+    tP95.setLabel(P95_LABEL(scope), scope === 'all' ? `p95 latency of the slowest service${t.slowest ? `: ${t.slowest}` : ''}. Percentiles of different services cannot be averaged.` : '');
     const running = state.services.filter((s) => s.status.running).length;
     // A listener that failed is an error; a running service that reports a note (capture limit reached) is only a warning.
     const kinds = state.services.map((s) => (statusNotice(s.status) || {}).kind);
@@ -260,8 +267,10 @@ function buildLive(ctx, root) {
     scope = v;
     replaceQuery(v === 'all' ? {} : { scope: v });
     rowsBuf = [];
+    charts.setAggregate(scope === 'all');
     charts.setRows([]);
     loadScope();
+    paintTiles();
   });
   winSeg.onChange((v) => { windowMs = v; saveWindow(WIN_KEY, v); charts.setWindow(v); });
 

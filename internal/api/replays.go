@@ -211,6 +211,10 @@ func (s *Server) missingReplayReference(ctx context.Context, cfg model.ReplayCon
 // replay, and saying so now (409) beats a 2xx "running" that turns "failed" a
 // moment later.
 func (s *Server) startJob(ctx context.Context, job model.ReplayJob) error {
+	// A recording that passes the check below must not be deleted before the
+	// job shows up as running (see Server.recordingMu).
+	s.recordingMu.RLock()
+	defer s.recordingMu.RUnlock()
 	rec, err := s.deps.Store.GetRecording(ctx, job.Config.RecordingID)
 	switch {
 	case errors.Is(err, model.ErrNotFound):

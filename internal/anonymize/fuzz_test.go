@@ -98,6 +98,13 @@ func FuzzExchange(f *testing.F) {
 		{"/up", "", "X", "y", "multipart/form-data", "--bb\r\n\r\nno boundary jane@acme.io", false, 4},
 		{"/up", "", "Content-Encoding", "gzip", "image/png", "\x89PNG\r\n\x1a\n\x00\x00", false, 4},
 		{"/up", "", "X", "y", "multipart/form-data; boundary=\"a b\"", "--a b\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\nx\r\n--a b--", false, 4},
+		// Content types whose lower-cased copy has another length than the original.
+		{"/up", "", "X", "y", "multipart/form-data; x=\u023a; boundary=bb", "--bb\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nhunter2\r\n--bb--", false, 1},
+		{"/up", "", "X", "y", "multipart/form-data; x=\xff\xfe; BOUNDARY=", "--bb\r\n\r\nx", false, 4},
+		// JSON documents inside JSON strings, valid, cut and too deep.
+		{"/", "", "A", "B", "application/json", `{"p":"{\"email\":\"a@b.co\",\"secret\":1,\"n\":[\"{\\\"email\\\":\\\"x@y.zz\\\"}\"]}","q":"[1,{"}`, false, 1},
+		{"/", "", "A", "B", "application/json", `{"p":"{\"user\":{\"name\":\"Jane\",\"id\":1}}","r":"{\"a\":\"{\\\"b\\\":\\\"{\\\\\\\"c\\\\\\\":\\\\\\\"{}\\\\\\\"}\\\"}\"}"}`, false, 3},
+		{"/", "", "A", "B", "application/json", `{"p":"{\"email\":\"a@b.co\"}","q":"{\"secret\":\"x\"`, true, 1},
 	}
 	for _, s := range seeds {
 		f.Add(s.path, s.query, s.hname, s.hval, s.ct, []byte(s.body), s.truncated, s.mode)

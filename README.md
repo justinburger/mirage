@@ -28,6 +28,10 @@ load test at a multiple of its original rate or error mix.
   header, query, cookie, form, regex and path rules). `hash` and `fake` are
   keyed by the profile secret, so the same customer keeps the same fake
   identity in every request and response and cache hit ratios stay realistic.
+  Names match ignoring case, `_` and `-` (a `password` rule covers `Password`
+  and `user[password]`), the first matching rule wins, JSON inside JSON strings
+  is rewritten too, and compressed bodies are decoded first so the profile sees
+  what is inside.
 - **CI friendly.** `mirage replay` is a headless load test with a live progress
   line, a summary table, a JSON result and exit codes for error-rate and p99
   thresholds.
@@ -70,6 +74,12 @@ Docker: `docker build -t mirage . && docker run --rm -p 8484:8484 -v mirage-data
 | ![Replay](docs/screenshots/replay.png) **Replays.** Live and final results, service time next to corrected latency; [a saturated sender](docs/screenshots/replay-saturated.png) is called out. | ![New replay](docs/screenshots/replay-new.png) **New replay.** Timeline, rate (with stages) or max, with a live plan of what will be sent. |
 | ![Anonymization](docs/screenshots/profiles.png) **Anonymization.** Detectors and rules with a live test against a recorded exchange. | ![Faults](docs/screenshots/faults.png) **Faults.** Latency, errors, aborts, hangs and throttling, per service or global. |
 
+The dashboard's "all services" view sums requests and errors, shows the
+request-weighted mean for p50 and the **slowest service's** value for p95 and
+p99 (labelled `p95 (slowest service)`, with the service named on hover): a
+mean of percentiles is not a percentile and would hide a slow service behind a
+fast busy one.
+
 ## Service modes
 
 | Mode | What happens to a request |
@@ -81,8 +91,14 @@ Docker: `docker build -t mirage . && docker run --rm -p 8484:8484 -v mirage-data
 
 Matching falls back from *exact* (method, path, query, body, chosen headers)
 to *path* to *template* (`GET /users/7` answers with the recording of
-`GET /users/42`). Recording and replay never slow traffic down: capture is a
-bounded queue that drops (and counts) when the disk cannot keep up.
+`GET /users/42`). A service that records with `anonymize_capture` stores
+anonymized requests, so in `virtualize` and `hybrid` mode it anonymizes each
+incoming request with the same profile before it looks it up: a client that
+sends `jane@acme.io` in the path or body still gets the response recorded for
+that customer (a request that is already anonymized, such as a replay of the
+recording, matches too). Editing the profile rebuilds the index of the
+services that use it. Recording and replay never slow traffic down: capture is
+a bounded queue that drops (and counts) when the disk cannot keep up.
 
 ## Commands
 
@@ -139,7 +155,11 @@ Thresholds
 ```
 
 Exit status: `0` success, `1` a threshold was exceeded or the run failed,
-`2` bad command line, `130` interrupted. The source is a stored recording
+`2` bad command line (including a `--max-p99` that is not a positive duration,
+a `--max-error-rate` that is not a number, a NaN or infinite `--rate`,
+`--speed`, `--error-amplification` or stage rate, and a line break in a
+`--header`; options are checked before the recording is opened), `130`
+interrupted. The source is a stored recording
 (`--data`, `--recording` by id or name) or a HAR file (`--har`, read into
 memory). Load shapes: `--speed`, `--max-gap`, `--amplify` (timeline),
 `--rate` or repeated `--stage 30s:100 --stage 2m:1000:hold` (rate; `:hold`
@@ -160,6 +180,16 @@ mirage export    --data mirage.db --recording checkout --out checkout.har --prof
 `anonymize` streams a HAR file without a database and prints how many values
 each rule or detector changed. Put `secret:` in the profile file for output
 that is identical from run to run.
+
+Anonymized copies, exports and imports decode gzip and deflate bodies before
+the profile runs, so the output holds plain bodies; a body they cannot decode
+(`br`, `zstd`) is dropped and marked truncated instead of being kept raw. An
+exchange the profile cannot process is left out and counted (a "left out" row
+and a warning line, `failed` in the JSON; the command fails only when every
+exchange failed), and a HAR entry with a missing or impossible start time (zero,
+the Unix epoch, outside the years 1678 to 2261) takes the time of its
+neighbour, so a timeline replay does not wait for years. Entries that are not
+HTTP requests (`data:` URLs) are skipped and counted.
 
 ## Admin API and metrics
 

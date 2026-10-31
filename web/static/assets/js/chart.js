@@ -106,6 +106,22 @@ export class TimeChart {
 
   setTitle(t) { this.titleEl.firstChild.nodeValue = t; }
 
+  /**
+   * Renames series by key: {p95: 'p95 (slowest)'}, or {p95: ['p95 (slowest)', 'p95, slowest service']}
+   * for a short legend label and a longer tooltip label.
+   */
+  setSeriesLabels(labels) {
+    for (const s of this.series) {
+      const l = labels[s.key];
+      if (l == null) continue;
+      s.label = Array.isArray(l) ? l[0] : l;
+      s.tipLabel = Array.isArray(l) ? l[1] : undefined;
+    }
+    this.buildLegend();
+    this.updateLegendValues();
+    this.requestDraw();
+  }
+
   /** Small explanatory text next to the title. */
   setHint(text) {
     let hint = this.titleEl.querySelector('.chart-hint');
@@ -413,7 +429,7 @@ export class TimeChart {
       items.push(h('div', { class: 'tip-row' },
         h('span', { class: 'tip-key', style: { background: `var(--${s.color})` } }),
         h('span', { class: 'tip-val' }, v == null ? '–' : (s.format || this.o.tipFormat || this.o.yFormat)(v)),
-        h('span', { class: 'tip-label' }, s.label)));
+        h('span', { class: 'tip-label' }, s.tipLabel || s.label)));
     }
     tip.replaceChildren(...items);
     tip.hidden = false;

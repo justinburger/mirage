@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http/httputil"
 	"reflect"
@@ -40,9 +41,10 @@ type service struct {
 	addr      string
 	mode      model.Mode
 	startedAt time.Time
-	opErr     string // last failed Apply or Reload; cleared by the next success
-	rtErr     string // last runtime problem (store failure, failed anonymization); cleared by Apply
-	rtWarn    string // a runtime note that leaves the service working (capture limit); cleared by Apply
+	cfgAt     time.Time // UpdatedAt of the configuration last given to apply
+	opErr     string    // last failed Apply or Reload; cleared by the next success
+	rtErr     string    // last runtime problem (store failure, failed anonymization); cleared by Apply
+	rtWarn    string    // a runtime note that leaves the service working (capture limit); cleared by Apply
 
 	captured   atomic.Int64
 	dropped    atomic.Int64
@@ -69,6 +71,9 @@ func listenerChanged(old, next model.Service) bool {
 // when its own socket had to be released to bind the new one).
 func (s *service) apply(ctx context.Context, svc model.Service) error {
 	m := s.m
+	s.statMu.Lock()
+	s.cfgAt = svc.UpdatedAt
+	s.statMu.Unlock()
 	if !svc.Enabled {
 		s.cfg = svc
 		s.stop()
@@ -212,15 +217,9 @@ func (s *service) reloadVirtualizer(ctx context.Context) error {
 	if st == nil || !needsVirtualizer(st.mode) {
 		return nil
 	}
-	if s.m.deps.Virtualizers == nil {
-		return s.fail(fmt.Errorf("proxy: no virtualizer factory configured"))
-	}
-	v, err := s.m.deps.Virtualizers(ctx, st.svc, st.norm)
+	v, err := s.buildVirtualizer(ctx, st)
 	if err != nil {
-		return s.fail(fmt.Errorf("build virtualizer: %w", err))
-	}
-	if v == nil {
-		return s.fail(fmt.Errorf("build virtualizer: factory returned nil"))
+		return s.fail(err)
 	}
 	next := st.derive()
 	next.virt = v
@@ -232,22 +231,63 @@ func (s *service) reloadVirtualizer(ctx context.Context) error {
 	return nil
 }
 
-// reloadAnonymizer rebuilds the anonymizer from the stored profile. lifeMu is
-// held.
-func (s *service) reloadAnonymizer(ctx context.Context) error {
+// reloadProfile rebuilds what embeds the service's anonymization profile after
+// the profile changed: the capture anonymizer (record and hybrid modes) and
+// the virtualizer, whose engine anonymizes incoming requests with the same
+// profile to match them against the anonymized recording (virtualize and
+// hybrid modes). Both are replaced in one step. Anything that cannot be
+// rebuilt keeps its previous version and the errors are joined. lifeMu is held.
+func (s *service) reloadProfile(ctx context.Context) error {
 	st := s.state.Load()
-	if st == nil || st.anon == nil {
+	if st == nil || !st.svc.AnonymizeCapture {
 		return nil
 	}
-	eng, err := s.m.loadAnonymizer(ctx, st.svc)
-	if err != nil {
+	next := st.derive()
+	var errs []error
+	changed, rebuilt := false, false
+	if st.anon != nil {
+		if eng, err := s.m.loadAnonymizer(ctx, st.svc); err != nil {
+			errs = append(errs, err)
+		} else {
+			next.anon, changed = eng, true
+		}
+	}
+	if needsVirtualizer(st.mode) {
+		if v, err := s.buildVirtualizer(ctx, st); err != nil {
+			errs = append(errs, err)
+		} else {
+			next.virt, changed, rebuilt = v, true, true
+		}
+	}
+	if changed {
+		s.state.Store(next)
+		s.m.retire(st, next)
+	}
+	if err := errors.Join(errs...); err != nil {
 		return s.fail(err)
 	}
-	next := st.derive()
-	next.anon = eng
-	s.state.Store(next)
-	s.m.retire(st, next)
+	if rebuilt {
+		s.statMu.Lock()
+		s.opErr = ""
+		s.statMu.Unlock()
+	}
 	return nil
+}
+
+// buildVirtualizer asks the factory for a new virtualizer for the service
+// state st.
+func (s *service) buildVirtualizer(ctx context.Context, st *serviceState) (Virtualizer, error) {
+	if s.m.deps.Virtualizers == nil {
+		return nil, errors.New("proxy: no virtualizer factory configured")
+	}
+	v, err := s.m.deps.Virtualizers(ctx, st.svc, st.norm)
+	if err != nil {
+		return nil, fmt.Errorf("build virtualizer: %w", err)
+	}
+	if v == nil {
+		return nil, errors.New("build virtualizer: factory returned nil")
+	}
+	return v, nil
 }
 
 // status returns the runtime status of the service.
@@ -269,6 +309,10 @@ func (s *service) status() model.ServiceStatus {
 	if s.running && !s.startedAt.IsZero() {
 		t := s.startedAt
 		out.StartedAt = &t
+	}
+	if !s.cfgAt.IsZero() {
+		t := s.cfgAt
+		out.ConfigUpdatedAt = &t
 	}
 	s.statMu.RUnlock()
 	out.Captured = s.captured.Load()

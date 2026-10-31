@@ -15,6 +15,7 @@ import (
 	"github.com/justinburger/mirage/internal/har"
 	"github.com/justinburger/mirage/internal/model"
 	"github.com/justinburger/mirage/internal/ops"
+	"github.com/justinburger/mirage/internal/pathnorm"
 	"github.com/justinburger/mirage/internal/store"
 	"github.com/justinburger/mirage/internal/version"
 )
@@ -25,7 +26,11 @@ type anonReport struct {
 	exchangesChanged int64
 	values           int64
 	skipped          int64
-	bySource         map[string]int64
+	// failed counts the exchanges the engine could not anonymize. They are
+	// left out of the output, never written in any form.
+	failed   int64
+	firstErr error
+	bySource map[string]int64
 }
 
 func newAnonReport() *anonReport { return &anonReport{bySource: map[string]int64{}} }
@@ -39,6 +44,14 @@ func (r *anonReport) add(changes []model.AnonChange) {
 	for _, c := range changes {
 		r.values++
 		r.bySource[sourceLabel(c.Source)]++
+	}
+}
+
+// fail records an exchange that could not be anonymized.
+func (r *anonReport) fail(err error) {
+	r.failed++
+	if r.firstErr == nil {
+		r.firstErr = err
 	}
 }
 
@@ -64,7 +77,13 @@ func (r *anonReport) print(w io.Writer, prof model.AnonymizationProfile, extra .
 	if r.skipped > 0 {
 		fmt.Fprintf(tw, "  entries skipped\t%s (not HTTP or HTTPS requests)\n", fmtInt(r.skipped))
 	}
+	if r.failed > 0 {
+		fmt.Fprintf(tw, "  left out\t%s (could not be anonymized, so they were not written)\n", fmtInt(r.failed))
+	}
 	tw.Flush()
+	if r.firstErr != nil {
+		fmt.Fprintf(w, "  first failure: %v\n", r.firstErr)
+	}
 	if len(r.bySource) > 0 {
 		const top = 15
 		fmt.Fprintln(w, "  by source:")
@@ -219,7 +238,8 @@ func runAnonymize(ctx context.Context, args []string, s streams) int {
 			fmt.Fprintf(s.err, "mirage anonymize: %v\n", err)
 			return exitFail
 		}
-		out, err := ops.CopyAnonymizedReport(ctx, st, src.ID, eng, name, nil, rep.add)
+		out, stats, err := ops.CopyAnonymizedStats(ctx, st, src.ID, eng, name, nil, rep.add)
+		rep.failed, rep.firstErr = stats.Failed, stats.FirstError
 		if err != nil {
 			fmt.Fprintf(s.err, "mirage anonymize: %v\n", err)
 			return exitFail
@@ -236,6 +256,7 @@ func runAnonymize(ctx context.Context, args []string, s streams) int {
 			"exchanges_changed": rep.exchangesChanged,
 			"values_changed":    rep.values,
 			"skipped":           rep.skipped,
+			"failed":            rep.failed,
 			"by_source":         rep.bySource,
 		})
 		return exitOK
@@ -248,9 +269,12 @@ func runAnonymize(ctx context.Context, args []string, s streams) int {
 }
 
 // anonymizeHARFile streams a HAR file through the engine into another HAR
-// file without a database, so memory use does not depend on its size. It
-// returns the number of bytes written.
-func anonymizeHARFile(ctx context.Context, s streams, inPath, outPath string, eng *anonymize.Engine, rep *anonReport) (int64, error) {
+// file without a database, so memory use does not depend on its size. Every
+// entry goes through ops.AnonymizeExchange, so compressed bodies are decoded
+// or dropped, never copied raw. An entry that cannot be anonymized is left
+// out and counted in rep; the run fails only when no entry could be
+// anonymized. It returns the number of bytes written.
+func anonymizeHARFile(ctx context.Context, s streams, inPath, outPath string, eng ops.Anonymizer, rep *anonReport) (int64, error) {
 	var in io.Reader = s.in
 	if inPath != "-" {
 		f, err := os.Open(inPath)
@@ -281,9 +305,11 @@ func anonymizeHARFile(ctx context.Context, s streams, inPath, outPath string, en
 				}
 				return fmt.Errorf("entry %d: %w", index, err)
 			}
-			changes, err := eng.ExchangeWithReport(ex)
+			changes, err := ops.AnonymizeExchange(eng, ex, pathnorm.Default, true)
 			if err != nil {
-				return fmt.Errorf("entry %d (%s %s): %w", index, ex.Request.Method, ex.Request.Path, err)
+				// Never write what the anonymizer could not process.
+				rep.fail(fmt.Errorf("entry %d: %w", index, err))
+				return nil
 			}
 			rep.add(changes)
 			return enc.Write(ex)
@@ -293,6 +319,10 @@ func anonymizeHARFile(ctx context.Context, s streams, inPath, outPath string, en
 				return fmt.Errorf("read %s: %w", inPath, err)
 			}
 			return err
+		}
+		if rep.failed > 0 && rep.exchanges == 0 {
+			// Not even an empty HAR is written: it would look like a success.
+			return fmt.Errorf("none of the %d entries of %s could be anonymized, so nothing was written (first failure: %w)", rep.failed, inPath, rep.firstErr)
 		}
 		if err := enc.Close(); err != nil {
 			return err

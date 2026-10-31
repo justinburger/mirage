@@ -214,3 +214,147 @@ func TestConcurrentListenAddrRace(t *testing.T) {
 		}
 	})
 }
+
+// TestServiceNamesAreUniqueIgnoringCase: like profile names, service names are
+// compared ignoring case and surrounding white space, not byte for byte.
+func TestServiceNamesAreUniqueIgnoringCase(t *testing.T) {
+	backends(t, func(t *testing.T, s *SQLite) {
+		api, err := s.PutService(ctx(), model.Service{Name: "API", ListenAddr: ":0"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cafe, err := s.PutService(ctx(), model.Service{Name: "Ünï Café", ListenAddr: ":0"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		names := func() []string {
+			list, err := s.ListServices(ctx())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out []string
+			for _, svc := range list {
+				out = append(out, svc.Name)
+			}
+			return out
+		}
+
+		cases := []struct {
+			name     string
+			svc      model.Service
+			conflict bool
+		}{
+			{"lower case", model.Service{Name: "api"}, true},
+			{"mixed case", model.Service{Name: "Api"}, true},
+			{"padded with white space", model.Service{Name: "  api\t"}, true},
+			{"non-ASCII letters", model.Service{Name: "üNÏ cAFÉ"}, true},
+			{"rename onto another service, other case", model.Service{ID: cafe.ID, Name: "aPi"}, true},
+			{"different name", model.Service{Name: "API 2"}, false},
+			{"prefix of another name", model.Service{Name: "AP"}, false},
+			{"own name in another case", model.Service{ID: api.ID, Name: "api"}, false},
+			{"own name unchanged", model.Service{ID: api.ID, Name: "API"}, false},
+		}
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				c.svc.ListenAddr = ":0"
+				snapshot := names()
+				_, err := s.PutService(ctx(), c.svc)
+				if c.conflict {
+					if !errors.Is(err, model.ErrConflict) {
+						t.Fatalf("err = %v, want ErrConflict", err)
+					}
+					if !strings.Contains(err.Error(), "name") {
+						t.Errorf("error %q does not mention the name", err)
+					}
+					if got := names(); fmt.Sprint(got) != fmt.Sprint(snapshot) {
+						t.Errorf("a refused put changed the services: %v -> %v", snapshot, got)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("err = %v, want success", err)
+				}
+			})
+		}
+
+		// A refused rename leaves the service as it was; a delete frees the name.
+		if got, _ := s.GetService(ctx(), cafe.ID); got.Name != "Ünï Café" {
+			t.Errorf("refused rename modified the stored name: %q", got.Name)
+		}
+		if err := s.DeleteService(ctx(), cafe.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.PutService(ctx(), model.Service{Name: "ünï café", ListenAddr: ":0"}); err != nil {
+			t.Errorf("name of a deleted service is still taken: %v", err)
+		}
+	})
+}
+
+// TestConcurrentServiceNameRace: of many simultaneous puts of one name (in
+// different cases) exactly one wins.
+func TestConcurrentServiceNameRace(t *testing.T) {
+	backends(t, func(t *testing.T, s *SQLite) {
+		const n = 12
+		var (
+			wg  sync.WaitGroup
+			mu  sync.Mutex
+			won int
+		)
+		for i := range n {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				name := "Contested"
+				if i%2 == 1 {
+					name = "CONTESTED"
+				}
+				_, err := s.PutService(ctx(), model.Service{Name: name, ListenAddr: ":0"})
+				mu.Lock()
+				defer mu.Unlock()
+				switch {
+				case err == nil:
+					won++
+				case !errors.Is(err, model.ErrConflict):
+					t.Errorf("put %d: %v", i, err)
+				}
+			}()
+		}
+		wg.Wait()
+		if won != 1 {
+			t.Errorf("%d concurrent puts of one name succeeded, want 1", won)
+		}
+	})
+}
+
+// A database written before names were compared ignoring case may hold two that
+// differ only in case. It still opens and lists both; one of them has to be
+// renamed before it can be saved again.
+func TestServiceNamesDifferingInCaseInAnOlderDatabase(t *testing.T) {
+	s := openMem(t)
+	a, err := s.PutService(ctx(), model.Service{Name: "api", ListenAddr: ":0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.PutService(ctx(), model.Service{Name: "other", ListenAddr: ":0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The older release's UNIQUE constraint compared bytes, so this was allowed.
+	if _, err := s.wdb.Exec(`UPDATE services SET name = 'API', data = json_set(data, '$.name', 'API') WHERE id = ?`, b.ID); err != nil {
+		t.Fatal(err)
+	}
+	list, err := s.ListServices(ctx())
+	if err != nil || len(list) != 2 {
+		t.Fatalf("ListServices = %d services, %v", len(list), err)
+	}
+	if _, err := s.PutService(ctx(), a); !errors.Is(err, model.ErrConflict) {
+		t.Errorf("saving a service whose name another one shares in other case: %v, want ErrConflict", err)
+	}
+	b.Name = "api 2"
+	if _, err := s.PutService(ctx(), b); err != nil {
+		t.Fatalf("renaming one of the two: %v", err)
+	}
+	if _, err := s.PutService(ctx(), a); err != nil {
+		t.Errorf("saving the other one after the rename: %v", err)
+	}
+}

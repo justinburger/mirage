@@ -127,11 +127,31 @@ func (s *service) modifyResponse(res *http.Response) error {
 		rs.rw.status, rs.rw.wrote = res.StatusCode, true
 		return nil
 	}
+	suppressSniffing(rs.rw.Header(), res.Header)
 	if rs.capture {
 		rs.respTee = &respTee{src: res.Body, buf: newCapBuf(rs.st.bodyCap)}
 		res.Body = rs.respTee
 	}
 	return nil
+}
+
+// suppressSniffing keeps net/http from inventing a Content-Type for a
+// response the upstream sent none for. When the header map of the client's
+// ResponseWriter has no Content-Type key, net/http sniffs the body and adds
+// "text/plain; charset=utf-8" or similar, which clients then see although the
+// upstream never sent it. A key with no values stops that and writes nothing.
+//
+// It must be set on the client's header map, not on upstream (res.Header):
+// httputil.ReverseProxy copies upstream into dst value by value, so an empty
+// entry there never reaches dst, and the captured response headers (a clone of
+// res.Header) must stay what the upstream sent.
+func suppressSniffing(dst, upstream http.Header) {
+	if _, sent := upstream["Content-Type"]; sent {
+		return
+	}
+	if _, set := dst["Content-Type"]; !set {
+		dst["Content-Type"] = nil
+	}
 }
 
 // errorHandler answers an upstream failure: 502, or 504 for a timeout, with
