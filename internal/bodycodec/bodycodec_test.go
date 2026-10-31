@@ -264,3 +264,111 @@ func TestLooksCompressedSparesDecodedBodies(t *testing.T) {
 		t.Fatalf("%d of %d random binary bodies taken for deflate streams", binaryHits, n)
 	}
 }
+
+// cutRaw returns the raw deflate stream of b cut after keep bytes.
+func cutRaw(t testing.TB, b []byte, keep int) []byte {
+	t.Helper()
+	full := rawDeflate(t, b)
+	if keep >= len(full) {
+		t.Fatalf("stream is only %d bytes", len(full))
+	}
+	return full[:keep]
+}
+
+// latin1Doc is a long JSON document in ISO-8859-1 ("Jos\xe9") with control
+// characters: neither valid UTF-8 nor printable.
+func latin1Doc() []byte {
+	var doc strings.Builder
+	doc.WriteString("\x1b[1m{\"name\":\"Jos\xe9\",\"email\":\"alice.secret@example.com\",\"items\":[")
+	for i := range 3000 {
+		fmt.Fprintf(&doc, `{"id":%d,"sku":"%x"},`, i, uint32(i)*2654435761)
+	}
+	doc.WriteString("{}]}")
+	return []byte(doc.String())
+}
+
+// MayBeCompressed catches what the stricter LooksCompressed lets through
+// (the verifier's evasions), and still leaves decoded text alone.
+func TestMayBeCompressed(t *testing.T) {
+	zlibDict := func() []byte { // a zlib stream with a preset dictionary
+		var buf bytes.Buffer
+		w, _ := zlib.NewWriterLevelDict(&buf, zlib.DefaultCompression, []byte("dictionary"))
+		w.Write(plain)
+		w.Close()
+		return buf.Bytes()
+	}
+	for _, tc := range []struct {
+		name, ce string
+		body     []byte
+	}{
+		{"cut raw deflate of ISO-8859-1 text", "deflate", cutRaw(t, latin1Doc(), 2000)},
+		{"cut zlib of ISO-8859-1 text", "deflate", zl(t, latin1Doc())[:2000]},
+		{"tiny UTF-8 stream of a control character and an SSN", "deflate", []byte("c,.\xce\xb3517\xd4\xb50\xd0\xb5424\x02\x00")},
+		{"tiny UTF-8 stream of repeated digits", "deflate", []byte("35E\x00\x13 P0E\x13\x00\x00")},
+		{"tiny UTF-8 stream with a trailing newline", "deflate", append(append([]byte(nil), utf8Deflate...), '\n')},
+		{"cut gzip, deflate stack", "gzip, deflate", cutRaw(t, gz(t, latin1Doc()), 2000)},
+		{"cut deflate, deflate stack", "deflate, deflate", cutRaw(t, rawDeflate(t, latin1Doc()), 2000)},
+		{"zlib with a preset dictionary", "deflate", zlibDict()},
+	} {
+		if !MayBeCompressed(tc.ce, tc.body) {
+			t.Errorf("%s: MayBeCompressed = false", tc.name)
+		}
+	}
+
+	rng := uint64(7)
+	next := func() byte {
+		rng ^= rng << 13
+		rng ^= rng >> 7
+		rng ^= rng << 17
+		return byte(rng)
+	}
+	words := []string{`{"id":`, `"name":"`, `Ada`, `", `, `[1,2,3]`, `true`, `null`, `}`, ` `, `<p>`, `hello`, `=`, `&`, "\n", `+`, `.`, `%`, `0`, `ok`, `x^`}
+	const n = 100000
+	textHits := 0
+	for i := range n {
+		var b []byte
+		for size := 1 + i%300; len(b) < size; {
+			b = append(b, words[int(next())%len(words)]...)
+		}
+		if MayBeCompressed("deflate", b) {
+			textHits++
+		}
+	}
+	if textHits > n/10000 {
+		t.Errorf("%d of %d decoded text bodies taken for deflate streams", textHits, n)
+	}
+}
+
+// A raw deflate stream must use the whole body: random bytes that happen to
+// form a stream ending early are not decoded into noise.
+func TestDecodeRawDeflateMustUseTheWholeBody(t *testing.T) {
+	h := http.Header{"Content-Encoding": {"deflate"}}
+	with := append(rawDeflate(t, plain), "trailing"...)
+	if _, _, _, _, ok := Decode(h, with, int64(len(with)), false, 1<<20); ok {
+		t.Error("a stream with data after its end was decoded")
+	}
+	if out, _, _, _, ok := Decode(h, rawDeflate(t, plain), 100, false, 1<<20); !ok || !bytes.Equal(out, plain) {
+		t.Error("a whole stream was not decoded")
+	}
+	rng := uint64(99)
+	hits := 0
+	const n = 50000
+	for i := range n {
+		b := make([]byte, 30+i%200)
+		for j := range b {
+			rng ^= rng << 13
+			rng ^= rng >> 7
+			rng ^= rng << 17
+			b[j] = byte(rng)
+		}
+		if b[0]&0x0f == 8 { // keep to raw deflate; a zlib header has a checksum
+			continue
+		}
+		if _, _, _, _, ok := Decode(h, b, int64(len(b)), false, 1<<20); ok {
+			hits++
+		}
+	}
+	if hits > n/10000 {
+		t.Errorf("%d of %d random bodies decoded as raw deflate", hits, n)
+	}
+}

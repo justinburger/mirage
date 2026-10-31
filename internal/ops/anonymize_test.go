@@ -124,6 +124,19 @@ func cutDeflateOf(t testing.TB, zlibHeader bool) []byte {
 	return append([]byte(nil), buf.Bytes()[:cut]...)
 }
 
+// latin1JSON is a long ISO-8859-1 document with the personal data at the
+// front: not valid UTF-8, so a cut deflate stream of it does not inflate
+// into UTF-8 text.
+func latin1JSON() []byte {
+	var b bytes.Buffer
+	fmt.Fprintf(&b, "{\"name\":\"Jos\xe9\",\"email\":%q,\"password\":%q,\"items\":[", piiEmail, piiPass)
+	for i := 0; i < 3000; i++ {
+		fmt.Fprintf(&b, `{"id":%d,"sku":"%x"},`, i, uint32(i)*2654435761)
+	}
+	b.WriteString(`{}]}`)
+	return b.Bytes()
+}
+
 // brLike is a body that claims to be brotli: no decoder in the standard
 // library can read it, and it is not text.
 func brLike() []byte {
@@ -150,6 +163,8 @@ func encodedCases() []encodedCase {
 		{name: "cut gzip", enc: "gzip", body: func(t testing.TB) []byte { return cutGzipOf(t) }, cut: true},
 		{name: "cut zlib deflate", enc: "deflate", body: func(t testing.TB) []byte { return cutDeflateOf(t, true) }, cut: true},
 		{name: "cut raw deflate", enc: "deflate", body: func(t testing.TB) []byte { return cutDeflateOf(t, false) }, cut: true},
+		{name: "cut raw deflate of ISO-8859-1", enc: "deflate", body: func(t testing.TB) []byte { return rawDeflateOf(t, latin1JSON())[:2000] }, cut: true},
+		{name: "cut gzip, deflate stack", enc: "gzip, deflate", body: func(t testing.TB) []byte { return rawDeflateOf(t, gzipOf(t, latin1JSON()))[:2000] }, cut: true},
 		// Larger than the 1 MiB a capture keeps, so a proxy that decodes
 		// only up to its cap stores it still compressed.
 		{name: "large gzip", enc: "gzip", body: func(t testing.TB) []byte { return gzipOf(t, largeJSON()) }},

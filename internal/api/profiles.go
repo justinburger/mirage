@@ -9,6 +9,7 @@ import (
 
 	"github.com/justinburger/mirage/internal/anonymize"
 	"github.com/justinburger/mirage/internal/model"
+	"github.com/justinburger/mirage/internal/ops"
 )
 
 // profileBody is the request body for creating or replacing a profile.
@@ -218,7 +219,9 @@ func (s *Server) previewAnonymization(w http.ResponseWriter, r *http.Request) er
 	} else if ex, err = in.Exchange.Exchange(); err != nil {
 		return invalid(fmt.Sprintf("exchange body is not valid base64: %v", err))
 	}
-	changes, err := eng.ExchangeWithReport(ex)
+	// The same steps as a copy or export, so the preview shows what one
+	// would store: compressed bodies decoded (or dropped), then the rules.
+	changes, err := ops.AnonymizeExchange(eng, ex, nil, true)
 	if err != nil {
 		return fmt.Errorf("anonymize preview: %w", err)
 	}

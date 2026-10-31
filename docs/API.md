@@ -265,12 +265,15 @@ through the same steps as capture:
   that anyone can decompress. A HAR import decodes the same codings (up to
   1 MiB per entry) when it reads the file, whether or not it anonymizes.
   HAR files normally hold bodies decoded next to the original
-  `Content-Encoding` header, so a body is taken as still compressed only when
-  it looks it: the gzip magic number, a zlib stream, a raw deflate stream that
-  inflates into text (also the rare short one whose bytes are valid UTF-8),
-  or bytes that are not text under any other coding. A cut deflate stream of
-  binary data is not recognised; the profile could not read that data decoded
-  either.
+  `Content-Encoding` header, so reading one decodes a body only when it is
+  plainly compressed: the gzip magic number, a zlib stream, or a raw deflate
+  stream that uses the whole body. Anonymizing errs the other way: a body
+  recorded as decoded that may still be compressed (under `deflate`, a zlib
+  header or a stream that uses the whole body, complete or cut; under `br`
+  or `zstd`, bytes that are not valid UTF-8) is decoded or dropped, so a
+  decoded binary body under such a coding can occasionally be lost from the
+  anonymized artifact. A body that was decoded is anonymized like any other,
+  text in a legacy charset such as ISO-8859-1 included.
 - *Endpoints are rebuilt from the anonymized path*, so a raw segment
   (`/ssn/123-45-6789`) never survives in endpoint statistics or matching. An
   endpoint that came from a service's `endpoint_patterns` is kept when it has

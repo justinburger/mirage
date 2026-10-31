@@ -221,10 +221,14 @@ func classifyMedia(mt string, b []byte, truncated bool) bodyKind {
 	return kindText
 }
 
-// stillCompressed reports whether the stored body is compressed bytes. The
-// proxy stores decoded bodies and records the original encoding in
-// ContentEncoding; a body whose Content-Encoding header survives, or whose
-// bytes are plainly compressed, could not be decoded and is left alone.
+// stillCompressed reports whether the stored body is compressed bytes: its
+// Content-Encoding header survived (the body could not be decoded), or it
+// starts with a gzip or zstd magic number although ContentEncoding says it was
+// decoded. Anything else under ContentEncoding is decoded content and goes
+// through the rules like any other body; that includes text in a legacy
+// charset such as ISO-8859-1, which is not valid UTF-8. Every caller that
+// stores the result decodes bodies first and drops what is still compressed
+// (bodycodec.PrepareForAnonymization), so the engine never needs to guess.
 func stillCompressed(h http.Header, contentEncoding string, b []byte) bool {
 	if v := strings.TrimSpace(getHeader(h, "Content-Encoding")); v != "" && !strings.EqualFold(v, "identity") {
 		return true
@@ -232,17 +236,13 @@ func stillCompressed(h http.Header, contentEncoding string, b []byte) bool {
 	if ce := strings.TrimSpace(contentEncoding); ce == "" || strings.EqualFold(ce, "identity") {
 		return false
 	}
-	if len(b) >= 2 {
-		switch {
-		case b[0] == 0x1f && b[1] == 0x8b: // gzip
-			return true
-		case b[0]&0x0f == 8 && (uint(b[0])<<8|uint(b[1]))%31 == 0: // zlib / deflate
-			return true
-		case len(b) >= 4 && b[0] == 0x28 && b[1] == 0xb5 && b[2] == 0x2f && b[3] == 0xfd: // zstd
-			return true
-		}
+	switch {
+	case len(b) >= 2 && b[0] == 0x1f && b[1] == 0x8b: // gzip
+		return true
+	case len(b) >= 4 && b[0] == 0x28 && b[1] == 0xb5 && b[2] == 0x2f && b[3] == 0xfd: // zstd
+		return true
 	}
-	return looksBinary(b, false)
+	return false
 }
 
 // body anonymizes one body and keeps BodySize and Content-Length consistent.

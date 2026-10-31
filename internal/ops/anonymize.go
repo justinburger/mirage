@@ -91,15 +91,15 @@ func AnonymizeExchange(eng Anonymizer, ex *model.Exchange, n *pathnorm.Normalize
 // into ContentEncoding on import and the body is expected to be decoded
 // already; but a stream that was cut, or a coding the decoder does not know
 // (br, zstd), stays as it came, compressed, with no header to say so. If the
-// bytes look like that (bodycodec.LooksCompressed), the header is put back, so
-// that PrepareForAnonymization decodes or drops the body instead of storing it
-// as readable.
+// bytes may be that (bodycodec.MayBeCompressed, which errs on the side of
+// compressed), the header is put back, so that PrepareForAnonymization decodes
+// or drops the body instead of storing it as readable.
 func reinstateEncoding(h *http.Header, body []byte, contentEncoding *string) {
 	ce := *contentEncoding
 	if ce == "" || len(body) == 0 || len(h.Values("Content-Encoding")) > 0 {
 		return
 	}
-	if !bodycodec.LooksCompressed(ce, body) {
+	if !bodycodec.MayBeCompressed(ce, body) {
 		return
 	}
 	if *h == nil {

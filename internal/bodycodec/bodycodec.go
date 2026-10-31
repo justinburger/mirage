@@ -18,6 +18,7 @@ import (
 	"compress/gzip"
 	"compress/zlib"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -126,19 +127,13 @@ func LooksCompressed(ce string, body []byte) bool {
 	if len(body) == 0 {
 		return false
 	}
-	outer := ""
-	for c := range strings.SplitSeq(ce, ",") {
-		if c = strings.ToLower(strings.TrimSpace(c)); c != "" && c != "identity" {
-			outer = c
-		}
-	}
-	switch outer {
+	switch outerCoding(ce) {
 	case "":
 		return false
 	case "gzip", "x-gzip":
 		return len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b
 	case "deflate":
-		out, complete, rest, isZlib := inflateProbe(body)
+		out, complete, _, rest, isZlib := inflateProbe(body)
 		switch {
 		case len(out) == 0:
 			return false
@@ -168,16 +163,17 @@ func zlibHeader(body []byte) bool {
 // inflateProbe inflates at most looksCompressedProbe bytes of body: as a zlib
 // stream when it starts with a zlib header, else as a raw deflate stream.
 // complete reports a stream that ended cleanly (for zlib, with a matching
-// checksum) and rest the bytes of body after its end. flate reads a
+// checksum), cut one that ran out of input part way (the body was cut), and
+// rest the bytes of body after the end of the stream. flate reads a
 // bytes.Reader byte by byte (it is an io.ByteReader), so what the reader has
 // left is exactly what the stream did not use.
-func inflateProbe(body []byte) (out []byte, complete bool, rest int, isZlib bool) {
+func inflateProbe(body []byte) (out []byte, complete, cut bool, rest int, isZlib bool) {
 	br := bytes.NewReader(body)
 	var r io.ReadCloser
 	if isZlib = zlibHeader(body); isZlib {
 		zr, err := zlib.NewReader(br)
 		if err != nil {
-			return nil, false, 0, true
+			return nil, false, false, 0, true
 		}
 		r = zr
 	} else {
@@ -185,7 +181,58 @@ func inflateProbe(body []byte) (out []byte, complete bool, rest int, isZlib bool
 	}
 	defer r.Close()
 	out, err := readDecoded(r, int64(len(body))*4, looksCompressedProbe)
-	return out, err == nil && len(out) < looksCompressedProbe, br.Len(), isZlib
+	full := len(out) >= looksCompressedProbe
+	return out, err == nil && !full, errors.Is(err, io.ErrUnexpectedEOF), br.Len(), isZlib
+}
+
+// MayBeCompressed is LooksCompressed for deciding that a body must not be
+// stored as readable data, as an anonymized artifact would: it errs the other
+// way. Wrongly taking a decoded body for a compressed one only costs that
+// body (it is decoded into noise or dropped); wrongly taking compressed
+// personal data for decoded content keeps it, recoverable by anyone who
+// inflates it. On top of LooksCompressed, under a deflate coding it accepts
+//
+//   - any zlib header (a preset dictionary included) on bytes that are not
+//     valid UTF-8, and
+//   - a zlib or raw deflate stream that uses the whole body, whatever it
+//     inflates into: complete (followed by nothing but white space) or, for
+//     bytes that are not valid UTF-8, cut short by the end of the body. That
+//     covers text in a legacy charset or with control characters, and a cut
+//     stack such as "gzip, deflate", whose inner stream is not text.
+//
+// A short decoded text body is rarely a complete deflate stream by accident
+// (about one in 100,000); random binary data more often looks like a cut one.
+func MayBeCompressed(ce string, body []byte) bool {
+	if LooksCompressed(ce, body) {
+		return true
+	}
+	if len(body) == 0 || outerCoding(ce) != "deflate" {
+		return false
+	}
+	text := utf8.Valid(body)
+	if !text && len(body) >= 2 && body[0]&0x0f == 8 && body[0]>>4 <= 7 && (uint16(body[0])<<8|uint16(body[1]))%31 == 0 {
+		return true // a zlib header; a preset dictionary is allowed here
+	}
+	out, complete, cut, rest, _ := inflateProbe(body)
+	if len(out) == 0 {
+		return false
+	}
+	if complete {
+		return rest == 0 || len(bytes.TrimSpace(body[len(body)-rest:])) == 0
+	}
+	return cut && !text && rest == 0
+}
+
+// outerCoding returns the last coding applied in ce, lower-cased ("" when
+// there is none).
+func outerCoding(ce string) string {
+	outer := ""
+	for c := range strings.SplitSeq(ce, ",") {
+		if c = strings.ToLower(strings.TrimSpace(c)); c != "" && c != "identity" {
+			outer = c
+		}
+	}
+	return outer
 }
 
 // textPrefix reports whether b reads as text: valid UTF-8 once a rune cut at
@@ -339,14 +386,24 @@ func decodeCore(h http.Header, body []byte, size int64, truncated bool, limit in
 	return out, newSize, newTruncated, enc, true
 }
 
-// decodeOne undoes one coding, reading at most limit+1 bytes.
+// errTrailingData reports a raw deflate stream that ended before the body did.
+var errTrailingData = errors.New("bodycodec: data after the end of the deflate stream")
+
+// decodeOne undoes one coding, reading at most limit+1 bytes. A raw deflate
+// stream must use the whole body: it has no header or checksum, and a few
+// random bytes form a valid stream that ends early about once in 200 tries,
+// so a stream that leaves bytes over is not taken for one.
 func decodeOne(coding string, body []byte, truncated bool, limit int64) ([]byte, error) {
-	zr, release, err := newDecoder(coding, body)
+	zr, rest, release, err := newDecoder(coding, body)
 	if err != nil {
 		return nil, err
 	}
 	defer release()
-	return readDecoded(zr, decodedSizeHint(coding, body, truncated, limit), limit+1)
+	out, err := readDecoded(zr, decodedSizeHint(coding, body, truncated, limit), limit+1)
+	if err == nil && rest != nil && int64(len(out)) <= limit && rest() > 0 {
+		err = errTrailingData
+	}
+	return out, err
 }
 
 // decodedSizeHint guesses the decoded length of body, to size the output
@@ -400,30 +457,33 @@ func readDecoded(r io.Reader, hint, limit int64) ([]byte, error) {
 
 // newDecoder returns a reader over the decoded form of body and a function
 // that releases it. HTTP "deflate" is the zlib format, but some servers send
-// a raw deflate stream, so both are accepted.
-func newDecoder(coding string, body []byte) (io.Reader, func(), error) {
+// a raw deflate stream, so both are accepted; for a raw stream rest reports
+// how many bytes of body the stream has not used (flate reads a bytes.Reader
+// byte by byte, as an io.ByteReader), and is nil otherwise.
+func newDecoder(coding string, body []byte) (r io.Reader, rest func() int, release func(), err error) {
 	if coding == "gzip" {
 		var zr *gzip.Reader
 		if v := gzipReaders.Get(); v != nil {
 			zr = v.(*gzip.Reader)
 			if err := zr.Reset(bytes.NewReader(body)); err != nil {
 				gzipReaders.Put(zr)
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 		} else {
 			var err error
 			if zr, err = gzip.NewReader(bytes.NewReader(body)); err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 		}
-		return zr, func() { _ = zr.Close(); gzipReaders.Put(zr) }, nil
+		return zr, nil, func() { _ = zr.Close(); gzipReaders.Put(zr) }, nil
 	}
 	if zlibHeader(body) {
 		zr, err := zlib.NewReader(bytes.NewReader(body))
 		if err == nil {
-			return zr, func() { _ = zr.Close() }, nil
+			return zr, nil, func() { _ = zr.Close() }, nil
 		}
 	}
-	fr := flate.NewReader(bytes.NewReader(body))
-	return fr, func() { _ = fr.Close() }, nil
+	br := bytes.NewReader(body)
+	fr := flate.NewReader(br)
+	return fr, br.Len, func() { _ = fr.Close() }, nil
 }
