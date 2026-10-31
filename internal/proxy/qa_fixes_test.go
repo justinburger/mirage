@@ -341,39 +341,54 @@ func TestStatusCarriesConfigUpdatedAt(t *testing.T) {
 // full duplex mode: the proxy will close the connection rather than drain
 // the rest of the body, and a keep-alive client must not reuse it. A small
 // remainder, or a body read to its end, keeps the connection.
+//
+// The large uploads are 64 MiB, far more than the socket buffers between the
+// client, the proxy and the upstream can hold, so most of the body is still
+// unread when the answer comes on any machine.
 func TestEarlyAnswerToALargeUploadAnnouncesTheClose(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/read" {
 			_, _ = io.Copy(io.Discard, r.Body)
+		} else {
+			// Answer at once: without full duplex net/http would first try
+			// to drain part of a chunked body.
+			_ = http.NewResponseController(w).EnableFullDuplex()
 		}
 		http.Error(w, "no", http.StatusUnauthorized)
 	}))
 	t.Cleanup(up.Close)
+	big := make([]byte, 64<<20)
 	for _, mode := range []model.Mode{model.ModePassthrough, model.ModeRecord} {
 		e := newEnv(t)
 		base := e.start(e.service(up.URL, mode))
 		for _, tc := range []struct {
+			name      string
 			path      string
-			size      int
+			body      []byte
+			chunked   bool
 			wantClose bool
 		}{
-			{"/early", 2 << 20, true},
-			{"/early", 10 << 10, false},
-			{"/read", 2 << 20, false},
+			{"64 MiB, answered early", "/early", big, false, true},
+			{"64 MiB chunked, answered early", "/early", big, true, true},
+			{"10 KiB, answered early", "/early", big[:10<<10], false, false},
+			{"2 MiB, read to the end", "/read", big[:2<<20], false, false},
 		} {
-			for i := range 20 {
-				req, _ := http.NewRequest("POST", base+tc.path, bytes.NewReader(make([]byte, tc.size)))
+			for range 3 {
+				req, _ := http.NewRequest("POST", base+tc.path, bytes.NewReader(tc.body))
+				if tc.chunked {
+					req.ContentLength = -1
+				}
 				res, err := http.DefaultClient.Do(req)
 				if err != nil {
-					t.Fatalf("%s %s %d bytes, request %d: %v", mode, tc.path, tc.size, i, err)
+					t.Fatalf("%s, %s: %v", mode, tc.name, err)
 				}
 				_, _ = io.Copy(io.Discard, res.Body)
 				res.Body.Close()
 				if res.StatusCode != http.StatusUnauthorized {
-					t.Fatalf("%s %s: status %d", mode, tc.path, res.StatusCode)
+					t.Fatalf("%s, %s: status %d", mode, tc.name, res.StatusCode)
 				}
 				if res.Close != tc.wantClose {
-					t.Errorf("%s %s %d bytes: Connection: close announced = %v, want %v", mode, tc.path, tc.size, res.Close, tc.wantClose)
+					t.Errorf("%s, %s: Connection: close announced = %v, want %v", mode, tc.name, res.Close, tc.wantClose)
 					break
 				}
 			}
