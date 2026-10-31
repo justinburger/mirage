@@ -1,6 +1,7 @@
 package model
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -117,9 +118,14 @@ func TestUpgradeDefaultProfile(t *testing.T) {
 	if _, ok := byID["rule_mine"]; !ok {
 		t.Error("the upgrade dropped a user rule")
 	}
-	for _, r := range cur.Rules {
-		if _, ok := byID[r.ID]; !ok {
-			t.Errorf("built-in rule %s was not added", r.ID)
+	rules, revs := defaultRulesByRev()
+	for i, r := range rules {
+		_, ok := byID[r.ID]
+		switch {
+		case revs[i] > 1 && !ok:
+			t.Errorf("revision %d rule %s was not added", revs[i], r.ID)
+		case revs[i] == 1 && ok && r.ID != "def-json-password" && r.ID != "def-json-first_name" && r.ID != "def-query-token":
+			t.Errorf("revision 1 rule %s, which the user deleted, was added back", r.ID)
 		}
 	}
 	if up.Rules[0].ID != "def-json-password" || up.Rules[len(up.Rules)-1].ID == "rule_mine" && len(up.Rules) == len(old.Rules) {
@@ -129,9 +135,15 @@ func TestUpgradeDefaultProfile(t *testing.T) {
 	for _, h := range up.RedactHeaders {
 		have[strings.ToLower(h)]++
 	}
-	for _, h := range cur.RedactHeaders {
-		if have[strings.ToLower(h)] != 1 {
-			t.Errorf("header %s appears %d times after the upgrade", h, have[strings.ToLower(h)])
+	for rev, hs := range defaultRedactHeadersByRev {
+		for _, h := range hs {
+			want := 1
+			if rev == 1 && !slices.ContainsFunc(old.RedactHeaders, func(x string) bool { return strings.EqualFold(x, h) }) {
+				want = 0 // a revision 1 header the user deleted stays deleted
+			}
+			if have[strings.ToLower(h)] != want {
+				t.Errorf("revision %d header %s appears %d times after the upgrade, want %d", rev, h, have[strings.ToLower(h)], want)
+			}
 		}
 	}
 	if up.RedactHeaders[1] != "cookie" {
@@ -154,5 +166,50 @@ func TestUpgradeDefaultProfile(t *testing.T) {
 	old.Description = "my own text"
 	if up, _ := UpgradeDefaultProfile(old, 1); up.Description != "my own text" {
 		t.Errorf("an edited description was replaced: %q", up.Description)
+	}
+}
+
+// An upgrade from revision 2 adds the revision 3 rules and headers and leaves
+// out the revision 1 and 2 ones the user deleted.
+func TestUpgradeDefaultProfileKeepsDeletions(t *testing.T) {
+	rules, revs := defaultRulesByRev()
+	old := DefaultAnonymizationProfile()
+	old.Rules, old.RedactHeaders = nil, nil
+	deleted := map[string]bool{"def-json-session_id": true, "def-json-city": true}
+	for i, r := range rules {
+		if revs[i] <= 2 && !deleted[r.ID] {
+			old.Rules = append(old.Rules, r)
+		}
+	}
+	for _, h := range slices.Concat(defaultRedactHeadersByRev[1], defaultRedactHeadersByRev[2]) {
+		if h != "X-Forwarded-For" && h != "Cf-Connecting-Ip" {
+			old.RedactHeaders = append(old.RedactHeaders, h)
+		}
+	}
+	up, changed := UpgradeDefaultProfile(old, 2)
+	if !changed {
+		t.Fatal("changed = false for a revision 2 profile")
+	}
+	got := map[string]bool{}
+	for _, r := range up.Rules {
+		got[r.ID] = true
+	}
+	for i, r := range rules {
+		if want := revs[i] == 3 || !deleted[r.ID]; got[r.ID] != want {
+			t.Errorf("rule %s (revision %d): present %v, want %v", r.ID, revs[i], got[r.ID], want)
+		}
+	}
+	for _, h := range []string{"X-Forwarded-For", "Cf-Connecting-Ip"} {
+		if slices.Contains(up.RedactHeaders, h) {
+			t.Errorf("deleted header %s was added back", h)
+		}
+	}
+	for _, h := range defaultRedactHeadersByRev[3] {
+		if !slices.Contains(up.RedactHeaders, h) {
+			t.Errorf("revision 3 header %s was not added", h)
+		}
+	}
+	if len(up.Rules) != len(old.Rules)+len(slices.DeleteFunc(slices.Clone(revs), func(r int) bool { return r != 3 })) {
+		t.Errorf("rules: %d after the upgrade, %d before", len(up.Rules), len(old.Rules))
 	}
 }

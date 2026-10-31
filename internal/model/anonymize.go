@@ -213,21 +213,28 @@ const defaultProfileDescription = "Hashes auth headers, session cookies and comm
 // UpgradeDefaultProfile replaces it only while the stored text still equals it.
 const defaultProfileDescriptionRev1 = "Hashes auth headers, session cookies and common credential fields (passwords, tokens, API keys), fakes person names, and replaces detected PII (emails, cards, SSNs, phone numbers, IPs, JWTs, AWS keys, IBANs) with consistent fake values."
 
-// defaultRedactHeaders are the headers whose values the built-in profile
-// always replaces with hash tokens.
-var defaultRedactHeaders = []string{
-	"Authorization", "Proxy-Authorization", "Cookie", "Set-Cookie",
-	"X-Api-Key", "X-Auth-Token", "X-Access-Token", "X-Csrf-Token",
-	"X-Forwarded-For", "X-Real-Ip", "Forwarded",
-	// Revision 2.
-	"Api-Key", "Apikey", "X-Apikey", "X-Api-Token", "X-Auth-Key", "X-Goog-Api-Key",
-	"X-Amz-Security-Token", "X-Session-Id", "X-Session-Token",
-	"X-Xsrf-Token", "X-Csrftoken", "True-Client-Ip", "Cf-Connecting-Ip",
-	// Revision 3.
-	"X-Vault-Token", "Private-Token", "X-Hub-Signature", "X-Hub-Signature-256",
-	"X-Id-Token", "X-Refresh-Token", "X-Amz-Signature", "Authentication",
-	"Stripe-Signature", "X-Slack-Signature", "X-Gitlab-Token", "X-Twilio-Signature",
+// defaultRedactHeadersByRev are the headers whose values the built-in
+// profile always replaces with hash tokens, by the revision that added them.
+var defaultRedactHeadersByRev = [][]string{
+	1: {
+		"Authorization", "Proxy-Authorization", "Cookie", "Set-Cookie",
+		"X-Api-Key", "X-Auth-Token", "X-Access-Token", "X-Csrf-Token",
+		"X-Forwarded-For", "X-Real-Ip", "Forwarded",
+	},
+	2: {
+		"Api-Key", "Apikey", "X-Apikey", "X-Api-Token", "X-Auth-Key", "X-Goog-Api-Key",
+		"X-Amz-Security-Token", "X-Session-Id", "X-Session-Token",
+		"X-Xsrf-Token", "X-Csrftoken", "True-Client-Ip", "Cf-Connecting-Ip",
+	},
+	3: {
+		"X-Vault-Token", "Private-Token", "X-Hub-Signature", "X-Hub-Signature-256",
+		"X-Id-Token", "X-Refresh-Token", "X-Amz-Signature", "Authentication",
+		"Stripe-Signature", "X-Slack-Signature", "X-Gitlab-Token", "X-Twilio-Signature",
+	},
 }
+
+// defaultRedactHeaders is every revision's headers, in order.
+var defaultRedactHeaders = slices.Concat(defaultRedactHeadersByRev...)
 
 // defaultSiblingNames are the members whose presence next to a "name" member
 // marks it as a person's name rather than a product, file or endpoint name.
@@ -241,9 +248,20 @@ var defaultSiblingNames = []string{
 // profile. IDs are stable so later releases can recognise them
 // (UpgradeDefaultProfile matches on them).
 func defaultRules() []AnonymizationRule {
-	var rules []AnonymizationRule
+	rules, _ := defaultRulesByRev()
+	return rules
+}
+
+// defaultRulesByRev returns the built-in rules and, for each, the revision
+// that added it.
+func defaultRulesByRev() (rules []AnonymizationRule, revs []int) {
+	rev := 1
+	addRule := func(r AnonymizationRule) {
+		rules = append(rules, r)
+		revs = append(revs, rev)
+	}
 	add := func(id, name string, t RuleTarget, sel string, st Strategy, fake FakeKind) {
-		rules = append(rules, AnonymizationRule{
+		addRule(AnonymizationRule{
 			ID: "def-" + id, Name: name, Enabled: true, Target: t,
 			Selector: sel, Scope: ScopeBoth, Strategy: st, Fake: fake,
 		})
@@ -268,6 +286,7 @@ func defaultRules() []AnonymizationRule {
 	}
 
 	// Revision 2.
+	rev = 2
 
 	// Names that are unambiguous: nothing but people carry them.
 	for _, k := range []string{
@@ -323,22 +342,21 @@ func defaultRules() []AnonymizationRule {
 	// Credentials in XML or SOAP bodies (and any other text): the element's
 	// content is replaced. The patterns start with a literal "<", so a value
 	// without one is rejected by a byte search.
-	rules = append(rules,
-		AnonymizationRule{
-			ID: "def-regex-xml-secret", Name: "XML password element", Enabled: true, Target: TargetRegex,
-			Selector: `<(?:[\w.-]+:)?(?:[Pp]assword|[Pp]asswd|[Ss]ecret|[Cc]lient[_-]?[Ss]ecret|PIN|CVV|CVC)>([^<]+)</`,
-			Scope:    ScopeBoth, Strategy: StrategyRedact,
-		},
-		AnonymizationRule{
-			ID: "def-regex-xml-token", Name: "XML token element", Enabled: true, Target: TargetRegex,
-			Selector: `<(?:[\w.-]+:)?(?:[Aa]ccess_?[Tt]oken|[Rr]efresh_?[Tt]oken|[Ii]d_?[Tt]oken|[Aa]pi_?[Kk]ey|[Tt]oken|[Ss]ession_?[Ii]d)>([^<]+)</`,
-			Scope:    ScopeBoth, Strategy: StrategyHash,
-		},
-	)
+	addRule(AnonymizationRule{
+		ID: "def-regex-xml-secret", Name: "XML password element", Enabled: true, Target: TargetRegex,
+		Selector: `<(?:[\w.-]+:)?(?:[Pp]assword|[Pp]asswd|[Ss]ecret|[Cc]lient[_-]?[Ss]ecret|PIN|CVV|CVC)>([^<]+)</`,
+		Scope:    ScopeBoth, Strategy: StrategyRedact,
+	})
+	addRule(AnonymizationRule{
+		ID: "def-regex-xml-token", Name: "XML token element", Enabled: true, Target: TargetRegex,
+		Selector: `<(?:[\w.-]+:)?(?:[Aa]ccess_?[Tt]oken|[Rr]efresh_?[Tt]oken|[Ii]d_?[Tt]oken|[Aa]pi_?[Kk]ey|[Tt]oken|[Ss]ession_?[Ii]d)>([^<]+)</`,
+		Scope:    ScopeBoth, Strategy: StrategyHash,
+	})
 
 	// Revision 3. Key names are compared ignoring case, "_" and "-" (see
 	// AnonymizationRule), so one entry covers password, Password and
 	// PASSWORD, and access_token covers accessToken and access-token.
+	rev = 3
 	// Query values are hashed rather than redacted, like the query rules
 	// above, so that requests stay distinct for matching and replay.
 	for _, k := range []string{
@@ -364,13 +382,15 @@ func defaultRules() []AnonymizationRule {
 	for _, k := range []string{"bearer_token", "xsrf_token", "authorization", "oauth_token", "session_token", "api_token", "x_api_key"} {
 		add("query-"+k, "Query "+k, TargetQuery, k, StrategyHash, "")
 	}
-	return rules
+	return rules, revs
 }
 
 // UpgradeDefaultProfile brings a stored copy of the built-in profile, written
 // by a release whose DefaultProfileRev was fromRev, up to the current
-// revision. Rules and headers the current release defines and the stored
-// profile lacks are added (rules matched by ID, headers ignoring case);
+// revision. Rules and headers added by a later revision than fromRev that the
+// stored profile lacks are added (rules matched by ID, headers ignoring case),
+// after everything already there. Rules and headers of revision fromRev or
+// earlier that the profile lacks were deleted by the user and stay deleted;
 // everything already there, including rules the user edited or switched off,
 // is left as it is, and the description is replaced only while it is still
 // the text the old revision shipped. changed reports whether p differs.
@@ -378,29 +398,31 @@ func UpgradeDefaultProfile(p AnonymizationProfile, fromRev int) (out Anonymizati
 	if fromRev >= DefaultProfileRev {
 		return p, false
 	}
-	cur := DefaultAnonymizationProfile()
 	have := make(map[string]bool, len(p.Rules))
 	for _, r := range p.Rules {
 		have[r.ID] = true
 	}
 	rules := append([]AnonymizationRule(nil), p.Rules...)
-	for _, r := range cur.Rules {
-		if !have[r.ID] {
+	defRules, revs := defaultRulesByRev()
+	for i, r := range defRules {
+		if revs[i] > fromRev && !have[r.ID] {
 			rules = append(rules, r)
 			changed = true
 		}
 	}
 	p.Rules = rules
 	hdrs := append([]string(nil), p.RedactHeaders...)
-	for _, h := range cur.RedactHeaders {
-		if !slices.ContainsFunc(hdrs, func(x string) bool { return strings.EqualFold(strings.TrimSpace(x), h) }) {
-			hdrs = append(hdrs, h)
-			changed = true
+	for rev := max(fromRev+1, 1); rev < len(defaultRedactHeadersByRev); rev++ {
+		for _, h := range defaultRedactHeadersByRev[rev] {
+			if !slices.ContainsFunc(hdrs, func(x string) bool { return strings.EqualFold(strings.TrimSpace(x), h) }) {
+				hdrs = append(hdrs, h)
+				changed = true
+			}
 		}
 	}
 	p.RedactHeaders = hdrs
 	if p.Description == defaultProfileDescriptionRev1 {
-		p.Description = cur.Description
+		p.Description = defaultProfileDescription
 		changed = true
 	}
 	return p, changed

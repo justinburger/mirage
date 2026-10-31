@@ -415,6 +415,11 @@ How rules match:
   whole, is treated as a plain string. Changes inside it are reported with the
   concrete path, for example `response.body $.payload <json> $.password`.
 
+When a release extends the built-in `default` profile, a database opened by
+it gains the new rules and headers, appended after the ones it has. Rules you
+edited, switched off or deleted, and headers you removed, stay as you left
+them.
+
 `opaque_bodies`: `keep` (default) stores bodies the engine cannot inspect
 (binary, still-compressed, binary multipart parts) unchanged; `fill` replaces
 them with deterministic filler of the same length. Regenerating a secret
