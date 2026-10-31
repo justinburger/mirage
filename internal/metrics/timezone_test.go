@@ -2,9 +2,12 @@ package metrics
 
 import (
 	"encoding/json"
+	"os"
+	"os/exec"
 	"regexp"
 	"testing"
 	"time"
+	_ "time/tzdata" // the child's TZ must load on any machine
 
 	"github.com/justinburger/mirage/internal/model"
 )
@@ -12,14 +15,24 @@ import (
 // zoneRE matches an RFC 3339 timestamp that ends in "Z".
 var zoneRE = regexp.MustCompile(`^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$`)
 
-// withLocalZone runs fn with time.Local set to a zone that is not UTC, the
-// situation of a server on a developer laptop.
+// withLocalZone runs fn in a child test process whose local zone is not
+// UTC, the situation of a server on a developer laptop. Setting time.Local in
+// this process instead would race with every goroutine that reads the clock
+// (timers of other tests), which the race detector reports.
 func withLocalZone(t *testing.T, fn func()) {
 	t.Helper()
-	old := time.Local
-	time.Local = time.FixedZone("PDT", -7*3600)
-	defer func() { time.Local = old }()
-	fn()
+	if os.Getenv("MIRAGE_TZ_CHILD") == "1" {
+		if _, off := time.Now().Zone(); off == 0 {
+			t.Fatalf("the child's local zone %v is UTC; the test needs another", time.Local)
+		}
+		fn()
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^"+t.Name()+"$", "-test.count=1")
+	cmd.Env = append(os.Environ(), "MIRAGE_TZ_CHILD=1", "TZ=Asia/Kolkata")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("child test in a non-UTC zone failed: %v\n%s", err, out)
+	}
 }
 
 // TestTimestampsAreUTC: every timestamp the metrics package hands out is in

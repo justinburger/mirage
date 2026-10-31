@@ -76,6 +76,12 @@ type Manager struct {
 	// store (Start, finishing, Delete, Recover) so a finishing or starting
 	// job can never resurrect a deleted one.
 	txMu sync.Mutex
+	// deleting counts the Delete calls in progress per job, guarded by txMu.
+	// Delete releases txMu while it waits for a running job to stop, and
+	// Start refuses a job in this map: otherwise a Start landing in that gap
+	// would register a new run that saves the job again after its row was
+	// deleted.
+	deleting map[string]int
 
 	mu      sync.Mutex // guards the fields below
 	runs    map[string]*liveRun
@@ -99,7 +105,7 @@ func NewManager(deps Deps) *Manager {
 	return &Manager{
 		st: deps.Store, reg: deps.Metrics, log: log, onChange: deps.OnChange,
 		root: root, cancel: cancel,
-		runs: map[string]*liveRun{}, removal: map[string]removal{},
+		runs: map[string]*liveRun{}, removal: map[string]removal{}, deleting: map[string]int{},
 		collectorTTL: collectorTTL, finalWait: finalSeriesWait,
 	}
 }
@@ -236,6 +242,9 @@ func (m *Manager) start(ctx context.Context, id string) (model.ReplayJob, func()
 	}
 	if running {
 		return model.ReplayJob{}, nil, fmt.Errorf("replay %s is already running: %w", id, model.ErrConflict)
+	}
+	if m.deleting[id] > 0 {
+		return model.ReplayJob{}, nil, fmt.Errorf("replay %s is being deleted: %w", id, model.ErrNotFound)
 	}
 	job, err := m.st.GetReplayJob(ctx, id)
 	if err != nil {
@@ -495,6 +504,7 @@ func (m *Manager) Running() []model.ReplayJob {
 // saved) and dropping its collector at once.
 func (m *Manager) Delete(ctx context.Context, id string) error {
 	m.txMu.Lock()
+	m.deleting[id]++ // Start refuses the job from here on
 	lr := m.lookup(id)
 	if lr != nil {
 		lr.deleted.Store(true)
@@ -505,18 +515,30 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 		select {
 		case <-lr.done:
 		case <-ctx.Done():
+			// The run still deletes the row when it finishes (save).
+			m.txMu.Lock()
+			m.doneDeleting(id)
+			m.txMu.Unlock()
 			return ctx.Err()
 		}
 	}
 
 	m.txMu.Lock()
 	defer m.txMu.Unlock()
+	defer m.doneDeleting(id)
 	err := m.st.DeleteReplayJob(ctx, id)
 	if lr != nil && errors.Is(err, model.ErrNotFound) {
 		err = nil // the finishing job already removed it
 	}
 	m.dropCollector(id)
 	return err
+}
+
+// doneDeleting ends one Delete of id. txMu must be held.
+func (m *Manager) doneDeleting(id string) {
+	if m.deleting[id]--; m.deleting[id] <= 0 {
+		delete(m.deleting, id)
+	}
 }
 
 // Recover marks jobs a previous process left running as failed.
